@@ -1,152 +1,114 @@
-// End-to-end smoke test for the PR-3 + PR-4a perps stack on LitVM (chain 4441).
+// Funding smoke test for the PR-4b perps stack on LitVM (chain 4441).
 //
-// Runs one full trade against the deployed contracts:
-//   1. mint + approve mUSD collateral to the PositionManager,
-//   2. open a BTC long (100 mUSD collateral, 2x leverage) with a fresh signed
-//      RedStone price injected into the calldata, and print the entry price,
-//   3. close it with a fresh payload, and print the exit price, realized P&L,
-//      the borrow fee charged, and the trader's payout.
+// One key, two-sided book: opens an unequal BTC long + short (long-heavy) from
+// the deployer, holds for real time so peer-to-peer funding accrues, then closes
+// both — the long should PAY funding, the short should RECEIVE it, and the pool
+// keeps the rounding dust (long paid >= short received). Because one wallet holds
+// both sides, its funding nets to ~0 (it pays itself), minus the dust + borrow fees.
 //
-// Uses RedStone's pull model exactly like scripts/read-price.mjs:
-// `WrapperBuilder.usingDataService` (DataServiceWrapper, from
-// @redstone-finance/evm-connector) fetches a freshly signed price package from
-// the `redstone-main-demo` data service and appends it to the open/close call's
-// calldata, where the on-chain MainDemoConsumerBase verifies signer + timestamp.
-//
-// Usage:
-//   node scripts/smoke-perps.mjs <POSITION_MANAGER_ADDRESS> <MUSD_ADDRESS> [RPC_URL]
-//
-// or via env (CLI args take precedence):
-//   POSITION_MANAGER_ADDRESS=0x... MUSD_ADDRESS=0x... LITVM_RPC_URL=https://... \
-//   DEPLOYER_PRIVATE_KEY=0x... node scripts/smoke-perps.mjs
-//
-// The trader key is read from DEPLOYER_PRIVATE_KEY (testnet key only).
-// Requires `npm install` (ethers v5 + @redstone-finance/* are in package.json).
+// Usage: node scripts/smoke-perps.mjs
+//   (reads POSITION_MANAGER_ADDRESS, MUSD_ADDRESS, LITVM_RPC_URL, DEPLOYER_PRIVATE_KEY)
 
 import { ethers } from "ethers";
 import { WrapperBuilder } from "@redstone-finance/evm-connector";
 
-// redstone-main-demo single authorised signer (matches MainDemoConsumerBase).
 const DEMO_SIGNER = "0x0C39486f770B26F5527BBBf942726537986Cd7eb";
 const DATA_SERVICE_ID = process.env.REDSTONE_DATA_SERVICE || "redstone-main-demo";
 const FEED = "BTC";
 
-// Trade parameters.
-const COLLATERAL = ethers.utils.parseUnits("100", 18); // 100 mUSD (18 dp)
+// long notional 4x the short -> 60% skew -> funding pinned at the ~3%/day cap.
+const LONG_COLL = ethers.utils.parseUnits("200", 18);
+const SHORT_COLL = ethers.utils.parseUnits("50", 18);
 const LEVERAGE = 2;
-const IS_LONG = true;
+const HOLD_SECONDS = 60;
 
-// Minimal ABIs — only the methods / events we touch.
 const ERC20_ABI = [
   "function mint(address to, uint256 amount)",
   "function approve(address spender, uint256 amount) returns (bool)",
   "function balanceOf(address owner) view returns (uint256)",
 ];
 
-const POSITION_MANAGER_ABI = [
+const PM_ABI = [
   "function openPosition(bytes32 market, bool isLong, uint256 collateral, uint256 leverage)",
   "function closePosition(bytes32 market, bool isLong)",
   "event PositionOpened(address indexed owner, bytes32 indexed market, bool isLong, uint256 collateral, uint256 sizeUsd, uint256 entryPrice)",
-  "event PositionClosed(address indexed owner, bytes32 indexed market, bool isLong, uint256 exitPrice, bool profit, uint256 pnl, uint256 borrowFee, uint256 payout)",
+  "event PositionClosed(address indexed owner, bytes32 indexed market, bool isLong, uint256 exitPrice, bool profit, uint256 pnl, uint256 borrowFee, int256 funding, uint256 payout)",
 ];
 
-// Wrap a signer-connected contract so each call carries a fresh RedStone payload.
-function wrapWithPayload(contract) {
-  return WrapperBuilder.wrap(contract).usingDataService({
+const wrap = (c) =>
+  WrapperBuilder.wrap(c).usingDataService({
     dataServiceId: DATA_SERVICE_ID,
     dataPackagesIds: [FEED],
     uniqueSignersCount: 1,
     authorizedSigners: [DEMO_SIGNER],
   });
-}
 
-// Find the first decoded log of `name` emitted by `contract` in a receipt.
 function findEvent(contract, receipt, name) {
   for (const log of receipt.logs) {
     if (log.address.toLowerCase() !== contract.address.toLowerCase()) continue;
     let parsed;
-    try {
-      parsed = contract.interface.parseLog(log);
-    } catch {
-      continue;
-    }
+    try { parsed = contract.interface.parseLog(log); } catch { continue; }
     if (parsed.name === name) return parsed.args;
   }
   throw new Error(`event ${name} not found in tx ${receipt.transactionHash}`);
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const f18 = (v) => ethers.utils.formatUnits(v, 18);
+const f8 = (v) => ethers.utils.formatUnits(v, 8);
+
 async function main() {
-  const pmAddress = process.argv[2] || process.env.POSITION_MANAGER_ADDRESS;
-  const musdAddress = process.argv[3] || process.env.MUSD_ADDRESS;
-  const rpcUrl = process.argv[4] || process.env.LITVM_RPC_URL;
-  const privateKey = process.env.DEPLOYER_PRIVATE_KEY;
+  const pm = process.env.POSITION_MANAGER_ADDRESS;
+  const musd = process.env.MUSD_ADDRESS;
+  const rpc = process.env.LITVM_RPC_URL;
+  const pk = process.env.DEPLOYER_PRIVATE_KEY;
+  for (const [k, v] of Object.entries({ POSITION_MANAGER_ADDRESS: pm, MUSD_ADDRESS: musd, LITVM_RPC_URL: rpc, DEPLOYER_PRIVATE_KEY: pk }))
+    if (!v) throw new Error(`missing env ${k}`);
 
-  if (!pmAddress) {
-    throw new Error(
-      "missing PositionManager address: pass as arg 1 or set POSITION_MANAGER_ADDRESS"
-    );
-  }
-  if (!musdAddress) {
-    throw new Error("missing mUSD address: pass as arg 2 or set MUSD_ADDRESS");
-  }
-  if (!rpcUrl) {
-    throw new Error("missing RPC url: pass as arg 3 or set LITVM_RPC_URL");
-  }
-  if (!privateKey) {
-    throw new Error("missing trader key: set DEPLOYER_PRIVATE_KEY");
-  }
-
-  const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
-  const trader = new ethers.Wallet(privateKey, provider);
+  const provider = new ethers.providers.JsonRpcProvider(rpc);
+  const trader = new ethers.Wallet(pk, provider);
   const market = ethers.utils.formatBytes32String(FEED);
-
-  const musd = new ethers.Contract(musdAddress, ERC20_ABI, trader);
-  const pm = new ethers.Contract(pmAddress, POSITION_MANAGER_ABI, trader);
+  const token = new ethers.Contract(musd, ERC20_ABI, trader);
+  const mgr = new ethers.Contract(pm, PM_ABI, trader);
 
   console.log(`trader:          ${trader.address}`);
-  console.log(`PositionManager: ${pmAddress}`);
-  console.log(`mUSD:            ${musdAddress}`);
-  console.log(`market:          ${FEED}  collateral: 100 mUSD  leverage: ${LEVERAGE}x  ${IS_LONG ? "LONG" : "SHORT"}`);
-  console.log("");
+  console.log(`PositionManager: ${pm}\n`);
 
-  // 1. Mint + approve collateral to the PositionManager (no payload needed).
+  const need = LONG_COLL.add(SHORT_COLL);
   console.log("minting + approving collateral...");
-  await (await musd.mint(trader.address, COLLATERAL)).wait();
-  await (await musd.approve(pmAddress, COLLATERAL)).wait();
+  await (await token.mint(trader.address, need)).wait();
+  await (await token.approve(pm, need)).wait();
+  const balStart = await token.balanceOf(trader.address);
 
-  const balBefore = await musd.balanceOf(trader.address);
+  console.log(`opening LONG  ${f18(LONG_COLL)} mUSD @ ${LEVERAGE}x ...`);
+  const oL = findEvent(mgr, await (await wrap(mgr).openPosition(market, true, LONG_COLL, LEVERAGE)).wait(), "PositionOpened");
+  console.log(`  long size:  ${f18(oL.sizeUsd)} USD  entry ${f8(oL.entryPrice)}`);
+  console.log(`opening SHORT ${f18(SHORT_COLL)} mUSD @ ${LEVERAGE}x ...`);
+  const oS = findEvent(mgr, await (await wrap(mgr).openPosition(market, false, SHORT_COLL, LEVERAGE)).wait(), "PositionOpened");
+  console.log(`  short size: ${f18(oS.sizeUsd)} USD  entry ${f8(oS.entryPrice)}\n`);
 
-  // 2. Open the position with a fresh signed price injected into calldata.
-  console.log("opening position...");
-  const pmWithPayload = wrapWithPayload(pm);
-  const openReceipt = await (
-    await pmWithPayload.openPosition(market, IS_LONG, COLLATERAL, LEVERAGE)
-  ).wait();
-  const opened = findEvent(pm, openReceipt, "PositionOpened");
-  console.log(`  entry price: ${ethers.utils.formatUnits(opened.entryPrice, 8)} USD`);
-  console.log(`  size:        ${ethers.utils.formatUnits(opened.sizeUsd, 18)} USD`);
+  console.log(`book is long-heavy (long ${f18(oL.sizeUsd)} vs short ${f18(oS.sizeUsd)} USD) -> longs pay`);
+  console.log(`holding ${HOLD_SECONDS}s for funding to accrue...\n`);
+  await sleep(HOLD_SECONDS * 1000);
 
-  // 3. Close it with a fresh payload (new wrapper -> new package fetch).
-  console.log("closing position...");
-  const closeReceipt = await (
-    await wrapWithPayload(pm).closePosition(market, IS_LONG)
-  ).wait();
-  const closed = findEvent(pm, closeReceipt, "PositionClosed");
+  console.log("closing LONG...");
+  const cL = findEvent(mgr, await (await wrap(mgr).closePosition(market, true)).wait(), "PositionClosed");
+  console.log("closing SHORT...");
+  const cS = findEvent(mgr, await (await wrap(mgr).closePosition(market, false)).wait(), "PositionClosed");
+  const balEnd = await token.balanceOf(trader.address);
 
-  const balAfter = await musd.balanceOf(trader.address);
-  const pnl = ethers.utils.formatUnits(closed.pnl, 18);
-  const sign = closed.profit ? "+" : "-";
+  const paid = cL.funding;            // expect > 0
+  const received = cS.funding.mul(-1); // cS.funding expect < 0 -> received > 0
+  const dust = paid.sub(received);
 
-  console.log(`  exit price:  ${ethers.utils.formatUnits(closed.exitPrice, 8)} USD`);
-  console.log(`  realized P&L: ${sign}${pnl} mUSD (${closed.profit ? "profit" : "loss"})`);
-  console.log(`  borrow fee:  ${ethers.utils.formatUnits(closed.borrowFee, 18)} mUSD`);
-  console.log(`  payout:      ${ethers.utils.formatUnits(closed.payout, 18)} mUSD`);
-  console.log(`  trader balance delta (close - open window): ${ethers.utils.formatUnits(balAfter.sub(balBefore), 18)} mUSD`);
+  console.log("\n--- funding result ---------------------------------------");
+  console.log(`  long  borrowFee ${f18(cL.borrowFee)}  funding ${f18(cL.funding)} mUSD  ${cL.funding.gt(0) ? "(paid)" : "(received)"}`);
+  console.log(`  short borrowFee ${f18(cS.borrowFee)}  funding ${f18(cS.funding)} mUSD  ${cS.funding.lt(0) ? "(received)" : "(paid)"}`);
+  console.log(`  long paid ${f18(paid)}  vs  short received ${f18(received)}`);
+  console.log(`  pool dust (paid - received): ${f18(dust)} mUSD  ${dust.gte(0) ? "OK (>= 0, pool favored)" : "!! NEGATIVE"}`);
+  console.log(`  net trader balance delta: ${f18(balEnd.sub(balStart))} mUSD`);
   console.log("");
-  console.log("smoke test complete.");
+  console.log(cL.funding.gt(0) && cS.funding.lt(0) && dust.gte(0) ? "funding smoke PASSED." : "funding smoke FAILED — check signs/dust.");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main().catch((e) => { console.error(e); process.exit(1); });
