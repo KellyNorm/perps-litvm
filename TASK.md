@@ -20,7 +20,7 @@ Claude Code: read `CLAUDE.md`, then this file. Work **ONLY** on the task marked 
 
 ---
 
-## PR-1 — Oracle smoke test  **[CURRENT]**
+## PR-1 — Oracle smoke test  **[DONE]**
 Goal: prove the RedStone pull flow works on LitVM before any perps logic exists.
 - Scaffold the Foundry project + finalize remappings for RedStone + OpenZeppelin.
 - A minimal contract extending `MainDemoConsumerBase` exposing `getPrice(bytes32 feedId)` returning the verified value from tx calldata.
@@ -30,7 +30,7 @@ Goal: prove the RedStone pull flow works on LitVM before any perps logic exists.
 
 **Acceptance:** test passes; contract deployed to testnet; JS script prints a live BTC price read from the deployed contract.
 
-## PR-2 — Liquidity pool (LP vault)
+## PR-2 — Liquidity pool (LP vault)  **[CURRENT]**
 LPs deposit collateral, mint an LP token, withdraw. The pool is the trader counterparty.
 - ERC20 LP token; deposit / withdraw; pool accounting; reentrancy-guarded.
 
