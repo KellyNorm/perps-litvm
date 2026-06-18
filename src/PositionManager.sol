@@ -161,6 +161,25 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
     ///         skew and is linear below it.
     uint256 public constant FUNDING_COEFF = 694_444_444_444;
 
+    // --- two-step deferred execution (PR-6b) -----------------------------
+
+    /// @notice Flat fee (asset units, 18 dp) escrowed at request time and paid to
+    ///         the keeper that fills the request. Refunded to the owner on any
+    ///         cancel (slippage miss or owner reclaim) — the keeper earns it ONLY
+    ///         on a successful fill.
+    uint256 public constant EXECUTION_FEE = 0.5e18;
+
+    /// @notice Minimum seconds that must elapse between a request and its
+    ///         execution. The executor's price must postdate this floor, which is
+    ///         what makes the fill price unknowable to the trader at request time
+    ///         (the front-running / MEV protection).
+    uint256 public constant MIN_EXECUTION_DELAY = 3;
+
+    /// @notice Seconds after a request before its owner may reclaim it via
+    ///         {cancelRequest}. Gives keepers a window to fill before the owner can
+    ///         pull the escrow back.
+    uint256 public constant CANCEL_DELAY = 180;
+
     // --- supported markets (RedStone feed ids) ---------------------------
 
     /// @notice Supported market feed id for BTC.
@@ -273,6 +292,63 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
     ///         (asset units). Read by the pool to gate withdrawals.
     uint256 public totalReserved;
 
+    // --- two-step deferred execution state (PR-6b) -----------------------
+
+    /// @notice Whether a queued request opens a new position or closes an
+    ///         existing one.
+    enum RequestKind {
+        Open,
+        Close
+    }
+
+    /**
+     * @notice A queued open/close awaiting a keeper fill at a post-request price.
+     * @dev    ESCROW INVARIANT: every wei pulled in at request time leaves as
+     *         exactly one of — position collateral (fill), owner refund (cancel),
+     *         or keeper fee (fill). The execution fee flows to the keeper ONLY on a
+     *         fill; on ANY cancel (slippage miss or owner reclaim) the full escrow
+     *         (collateral + fee for opens, fee for closes) refunds to the owner.
+     * @param  owner            Trader who queued the request and owns the escrow.
+     * @param  market           Market feed id (MARKET_BTC or MARKET_ETH).
+     * @param  isLong           Direction of the position to open/close.
+     * @param  kind             Open or Close.
+     * @param  collateral       Collateral escrowed (Open only; 0 for Close).
+     * @param  leverage         Leverage multiplier (Open only; 0 for Close).
+     * @param  acceptablePrice  Directional slippage bound (1e8); see {_withinSlippage}.
+     * @param  executionFee     Keeper fee escrowed at request ({EXECUTION_FEE}).
+     * @param  requestTimestamp `block.timestamp` when the request was queued.
+     * @param  active           True until the request is filled or cancelled.
+     */
+    struct Request {
+        address owner;
+        bytes32 market;
+        bool isLong;
+        RequestKind kind;
+        uint256 collateral;
+        uint256 leverage;
+        uint256 acceptablePrice;
+        uint256 executionFee;
+        uint256 requestTimestamp;
+        bool active;
+    }
+
+    /// @notice Queued requests by id.
+    mapping(uint256 => Request) public requests;
+
+    /// @notice Monotonic id assigned to the next request.
+    uint256 public nextRequestId;
+
+    /// @notice Whether a position key already has a live close request, so a
+    ///         position cannot be double-queued for close.
+    mapping(bytes32 => bool) public closePending;
+
+    /// @dev Set ONLY for the duration of {executeRequest}'s oracle read to the
+    ///      request's earliest-execution timestamp; the {validateTimestamp}
+    ///      override rejects any price stamped before it (replay/freshness guard).
+    ///      Always 0 on the direct open/close and liquidate paths, so their
+    ///      timestamp validation is completely unaffected.
+    uint256 private _minExecutionTimestamp;
+
     // --- errors ----------------------------------------------------------
 
     error MarketNotSupported(bytes32 market);
@@ -285,6 +361,15 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
     error PriceTooStale(uint256 priceTimestampSeconds, uint256 blockTimestamp);
     error PriceFromFuture(uint256 priceTimestampSeconds, uint256 blockTimestamp);
     error NotLiquidatable(uint256 equity, uint256 maintenance);
+
+    // two-step deferred execution (PR-6b)
+    error RequestNotActive();
+    error TooEarlyToExecute(uint256 nowTs, uint256 earliest);
+    error TooEarlyToCancel(uint256 nowTs, uint256 earliest);
+    error NotRequestOwner();
+    error PriceBeforeRequest(uint256 priceTs, uint256 minTs);
+    error InvalidAcceptablePrice();
+    error CloseAlreadyPending();
 
     // --- events ----------------------------------------------------------
 
@@ -340,6 +425,35 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         address indexed liquidator
     );
 
+    // two-step deferred execution (PR-6b)
+
+    event OpenRequested(
+        uint256 indexed requestId,
+        address indexed owner,
+        bytes32 indexed market,
+        bool isLong,
+        uint256 collateral,
+        uint256 leverage,
+        uint256 acceptablePrice,
+        uint256 executionFee
+    );
+
+    event CloseRequested(
+        uint256 indexed requestId,
+        address indexed owner,
+        bytes32 indexed market,
+        bool isLong,
+        uint256 acceptablePrice,
+        uint256 executionFee
+    );
+
+    event RequestExecuted(uint256 indexed requestId, address indexed keeper, uint256 executionPrice);
+
+    /// @dev `slippage` is true when the executor cancels on a bound miss; false on
+    ///      an owner reclaim via {cancelRequest}. Either way the full escrow
+    ///      refunds to the owner.
+    event RequestCancelled(uint256 indexed requestId, address indexed owner, bool slippage);
+
     /**
      * @param pool_ The deployed {LiquidityPool} counterparty.
      * @dev   Reads the pool's asset and pre-approves the pool to pull absorbed
@@ -371,6 +485,13 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         } else if (receivedSeconds - block.timestamp > MAX_PRICE_AGE) {
             revert PriceFromFuture(receivedSeconds, block.timestamp);
         }
+
+        // Deferred-execution freshness/replay guard (PR-6b): reject any price
+        // stamped before the request's earliest-execution floor. This fires ONLY
+        // while {executeRequest} has the slot set; it is 0 on the direct
+        // open/close and liquidate paths, so those are completely unaffected.
+        uint256 minTs = _minExecutionTimestamp;
+        if (minTs != 0 && receivedSeconds < minTs) revert PriceBeforeRequest(receivedSeconds, minTs);
     }
 
     // --- trading ---------------------------------------------------------
@@ -713,6 +834,219 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         s.liquidatorBonus = Math.min(Math.mulDiv(collateral, LIQUIDATION_FEE_BPS, BPS_DENOMINATOR), remaining);
         s.ownerRefund = remaining - s.liquidatorBonus;
         s.badDebt = netOwedToPool > collateral ? netOwedToPool - collateral : 0;
+    }
+
+    // --- two-step deferred execution (PR-6b) -----------------------------
+
+    /**
+     * @notice Queue a deferred OPEN. The collateral and the {EXECUTION_FEE} are
+     *         escrowed here now; a keeper fills it later at a price relayed
+     *         on-chain at execution (front-running protection — the trader does
+     *         not pick the fill price).
+     * @dev    Purely additive: the direct {openPosition} path is unchanged. CEI:
+     *         validate -> record request (state) -> pull escrow (interaction).
+     *         `nonReentrant`. Param checks mirror {openPosition} so a bad request
+     *         fails fast before any escrow moves.
+     *
+     *         ESCROW INVARIANT: the `collateral + EXECUTION_FEE` pulled here leaves
+     *         only as position collateral + keeper fee (fill) or a full owner
+     *         refund (cancel). See {Request}.
+     * @param  market          Market feed id (MARKET_BTC or MARKET_ETH).
+     * @param  isLong          True for long, false for short.
+     * @param  collateral      Collateral to post (asset units, >= MIN_COLLATERAL).
+     * @param  leverage        Leverage multiplier in [MIN_LEVERAGE, MAX_LEVERAGE].
+     * @param  acceptablePrice Directional slippage bound (1e8); see {_withinSlippage}.
+     * @return requestId       Id of the queued request.
+     */
+    function requestOpen(bytes32 market, bool isLong, uint256 collateral, uint256 leverage, uint256 acceptablePrice)
+        external
+        nonReentrant
+        returns (uint256 requestId)
+    {
+        _requireSupportedMarket(market);
+        if (collateral < MIN_COLLATERAL) revert CollateralTooLow(collateral, MIN_COLLATERAL);
+        if (leverage < MIN_LEVERAGE || leverage > MAX_LEVERAGE) revert LeverageOutOfRange(leverage);
+        if (acceptablePrice == 0) revert InvalidAcceptablePrice();
+        if (positions[_positionKey(msg.sender, market, isLong)].sizeUsd != 0) revert PositionAlreadyOpen();
+
+        // Effects.
+        requestId = nextRequestId++;
+        requests[requestId] = Request({
+            owner: msg.sender,
+            market: market,
+            isLong: isLong,
+            kind: RequestKind.Open,
+            collateral: collateral,
+            leverage: leverage,
+            acceptablePrice: acceptablePrice,
+            executionFee: EXECUTION_FEE,
+            requestTimestamp: block.timestamp,
+            active: true
+        });
+
+        // Interaction LAST (CEI).
+        asset.safeTransferFrom(msg.sender, address(this), collateral + EXECUTION_FEE);
+
+        emit OpenRequested(requestId, msg.sender, market, isLong, collateral, leverage, acceptablePrice, EXECUTION_FEE);
+    }
+
+    /**
+     * @notice Queue a deferred CLOSE of the caller's open position. Only the
+     *         {EXECUTION_FEE} is escrowed (the collateral is already held against
+     *         the open position). A keeper fills it later at a post-request price.
+     * @dev    Purely additive: the direct {closePosition} path is unchanged. CEI:
+     *         validate -> mark pending & record request (state) -> pull fee
+     *         (interaction). `nonReentrant`. One live close request per position
+     *         key at a time.
+     * @param  market          Market feed id.
+     * @param  isLong          Direction of the position to close.
+     * @param  acceptablePrice Directional slippage bound (1e8); see {_withinSlippage}.
+     * @return requestId       Id of the queued request.
+     */
+    function requestClose(bytes32 market, bool isLong, uint256 acceptablePrice)
+        external
+        nonReentrant
+        returns (uint256 requestId)
+    {
+        if (acceptablePrice == 0) revert InvalidAcceptablePrice();
+        bytes32 key = _positionKey(msg.sender, market, isLong);
+        if (positions[key].sizeUsd == 0) revert NoOpenPosition();
+        if (closePending[key]) revert CloseAlreadyPending();
+
+        // Effects.
+        closePending[key] = true;
+        requestId = nextRequestId++;
+        requests[requestId] = Request({
+            owner: msg.sender,
+            market: market,
+            isLong: isLong,
+            kind: RequestKind.Close,
+            collateral: 0,
+            leverage: 0,
+            acceptablePrice: acceptablePrice,
+            executionFee: EXECUTION_FEE,
+            requestTimestamp: block.timestamp,
+            active: true
+        });
+
+        // Interaction LAST (CEI).
+        asset.safeTransferFrom(msg.sender, address(this), EXECUTION_FEE);
+
+        emit CloseRequested(requestId, msg.sender, market, isLong, acceptablePrice, EXECUTION_FEE);
+    }
+
+    /**
+     * @notice Keeper-fill a queued request at a fresh post-request price. The
+     *         caller MUST append a fresh signed RedStone payload for the request's
+     *         market. On a successful fill the keeper earns the escrowed
+     *         {EXECUTION_FEE}; on a slippage miss the request is cancelled and the
+     *         full escrow refunds to the owner (keeper paid nothing).
+     * @dev    The fill price must postdate `requestTimestamp + MIN_EXECUTION_DELAY`
+     *         — enforced both by the `block.timestamp` floor (the keeper cannot
+     *         execute too early) and by the {validateTimestamp} override via
+     *         `_minExecutionTimestamp` (the price itself must be stamped after the
+     *         floor, not merely fresh). `nonReentrant`; the internal cores run
+     *         under this guard (so they must NOT add their own).
+     *
+     *         If {_openPosition} reverts at fill time (e.g. utilization full or the
+     *         position already open), the whole tx reverts and the request stays
+     *         active; the owner reclaims after {CANCEL_DELAY}. That is intended —
+     *         there is deliberately no pre-check here.
+     * @param  requestId Id of the request to fill.
+     */
+    function executeRequest(uint256 requestId) external nonReentrant {
+        Request memory r = requests[requestId];
+        if (!r.active) revert RequestNotActive();
+
+        uint256 earliest = r.requestTimestamp + MIN_EXECUTION_DELAY;
+        if (block.timestamp < earliest) revert TooEarlyToExecute(block.timestamp, earliest);
+
+        // Freshness/replay guard: the price must be stamped at/after `earliest`.
+        // Scoped strictly around the oracle read so only this path is affected.
+        _minExecutionTimestamp = earliest;
+        uint256 price = getOracleNumericValueFromTxMsg(r.market);
+        _minExecutionTimestamp = 0;
+        if (price == 0) revert InvalidPrice();
+
+        // Effect first (CEI): the request is consumed regardless of the outcome.
+        requests[requestId].active = false;
+
+        bytes32 key = _positionKey(r.owner, r.market, r.isLong);
+
+        if (!_withinSlippage(r.kind, r.isLong, price, r.acceptablePrice)) {
+            // Slippage miss: cancel + full refund to the owner, keeper unpaid.
+            if (r.kind == RequestKind.Close) {
+                closePending[key] = false;
+                asset.safeTransfer(r.owner, r.executionFee);
+            } else {
+                asset.safeTransfer(r.owner, r.collateral + r.executionFee);
+            }
+            emit RequestCancelled(requestId, r.owner, true);
+            return;
+        }
+
+        // Fill.
+        if (r.kind == RequestKind.Open) {
+            // Collateral was pre-escrowed at request time -> pullCollateral=false.
+            _openPosition(r.owner, r.market, r.isLong, r.collateral, r.leverage, price, false);
+        } else {
+            closePending[key] = false;
+            _closePosition(r.owner, r.market, r.isLong, price);
+        }
+
+        // Keeper earns the fee ONLY on a successful fill.
+        asset.safeTransfer(msg.sender, r.executionFee);
+
+        emit RequestExecuted(requestId, msg.sender, price);
+    }
+
+    /**
+     * @notice Owner-reclaim a stale request after {CANCEL_DELAY}, refunding the
+     *         full escrow. The keeper is paid nothing (this is not a fill).
+     * @dev    CEI: validate -> deactivate (state) -> refund (interaction).
+     *         `nonReentrant`. Only the request owner may reclaim, and only once
+     *         the cancel window has passed.
+     * @param  requestId Id of the request to reclaim.
+     */
+    function cancelRequest(uint256 requestId) external nonReentrant {
+        Request memory r = requests[requestId];
+        if (!r.active) revert RequestNotActive();
+        if (msg.sender != r.owner) revert NotRequestOwner();
+        uint256 earliest = r.requestTimestamp + CANCEL_DELAY;
+        if (block.timestamp < earliest) revert TooEarlyToCancel(block.timestamp, earliest);
+
+        // Effect.
+        requests[requestId].active = false;
+
+        // Interaction: full escrow back to the owner.
+        if (r.kind == RequestKind.Close) {
+            closePending[_positionKey(r.owner, r.market, r.isLong)] = false;
+            asset.safeTransfer(r.owner, r.executionFee);
+        } else {
+            asset.safeTransfer(r.owner, r.collateral + r.executionFee);
+        }
+
+        emit RequestCancelled(requestId, r.owner, false);
+    }
+
+    /**
+     * @dev Directional slippage test for a fill at `price` against the request's
+     *      `acceptable` bound (both 1e8). A long wants to BUY low / SELL high, a
+     *      short the reverse:
+     *        - Open  long:  fill `price <= acceptable` (entry not above the cap).
+     *        - Open  short: fill `price >= acceptable` (entry not below the floor).
+     *        - Close long:  fill `price >= acceptable` (exit not below the floor).
+     *        - Close short: fill `price <= acceptable` (exit not above the cap).
+     */
+    function _withinSlippage(RequestKind kind, bool isLong, uint256 price, uint256 acceptable)
+        internal
+        pure
+        returns (bool)
+    {
+        if (kind == RequestKind.Open) {
+            return isLong ? price <= acceptable : price >= acceptable;
+        }
+        return isLong ? price >= acceptable : price <= acceptable;
     }
 
     // --- views -----------------------------------------------------------
