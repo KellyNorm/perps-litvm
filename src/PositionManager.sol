@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {SignedMath} from "@openzeppelin/contracts/utils/math/SignedMath.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {MainDemoConsumerBase} from "@redstone-finance/evm-connector/contracts/data-services/MainDemoConsumerBase.sol";
 
@@ -15,23 +16,22 @@ import {LiquidityPool} from "./LiquidityPool.sol";
  *         open and close leveraged long/short positions against the
  *         {LiquidityPool}, which is the sole counterparty. Entry and exit marks
  *         come from the RedStone Pull-Model oracle: the caller appends a fresh
-
+ *
  *         signed price payload to the transaction calldata, and this contract
  *         (via {MainDemoConsumerBase}) verifies the signer(s) and the package
  *         timestamp before using the value.
  *
- * @dev    SCOPE (PR-3 + PR-4a + PR-5): open/close of one full position per
- *         (owner, market, direction); P&L settled against the pool; LP-share
+ * @dev    SCOPE (PR-3 + PR-4a + PR-4b + PR-5): open/close of one full position
+ *         per (owner, market, direction); P&L settled against the pool; LP-share
  *         valuation via a cached aggregate mark; reserved-liquidity solvency;
  *         a time-based borrow fee (PR-4a) charged on notional, accrued O(1) via
  *         a per-market cumulative index and deducted from payout at close;
- *         permissionless liquidation (PR-5) of positions that breach the
- *         maintenance margin, with residual bad-debt accounting when a loss
- *         (plus accrued fee) exceeds the trader's collateral.
+ *         peer-to-peer funding (PR-4b) between longs and shorts; permissionless
+ *         liquidation (PR-5) of positions that breach the maintenance margin,
+ *         with residual bad-debt accounting when a loss (plus accrued fee and
+ *         funding) exceeds the trader's collateral.
  *
  *         OUT OF SCOPE — deferred to later PRs:
- *         - Funding rate between longs & shorts (PR-4b, sequenced AFTER PR-5 so
- *           liquidations can bound a funding payer who outruns its collateral).
  *         - Two-step deferred execution / front-running protection (PR-6). This
  *           contract reads the price in the SAME transaction as the action.
  *         - Payload-aware LP deposit/withdraw to close the share-price fairness
@@ -55,6 +55,23 @@ import {LiquidityPool} from "./LiquidityPool.sol";
  *         the shortfall is recognized as residual bad debt rather than reverting,
  *         keeping the engine solvent under gap moves. As with the borrow fee this
  *         is a pure settlement against the pool — no value is pre-credited.
+ *
+ *         FUNDING (PR-4b): true peer-to-peer funding moves value between longs
+ *         and shorts to balance open-interest skew; the pool is a pure
+ *         pass-through clearinghouse and is never a net payer or receiver.
+ *         Funding accrues ONLY while BOTH sides hold open interest — a one-sided
+ *         book accrues nothing (and one-sided gaps are never retro-charged,
+ *         because the accrual timestamp always advances). It mirrors the borrow
+ *         fee's O(1) index, but as a SIGNED per-side cumulative index: the heavy
+ *         side's index rises (its positions OWE) while the light side's falls (its
+ *         positions are OWED), with the total charged to the heavy side
+ *         distributed across the light side's smaller notional. The per-second
+ *         rate is proportional to skew (`FUNDING_COEFF · |skew|`) and clamped at
+ *         {MAX_FUNDING_RATE_PER_SECOND} (reached at 50% skew). A position
+ *         snapshots its side's index at open; the funding settled at close or
+ *         liquidation is `sizeUsd · (indexNow − indexAtOpen)`, signed. All
+ *         rounding favors the pool (a payer's charge rounds up, a receiver's
+ *         credit rounds down), so the dust the pool clears is always ≥ 0.
  *
  *         COLLATERAL CUSTODY: trader collateral is held by THIS contract, never
  *         by the pool, so it is never counted as LP NAV. On close the pool pays
@@ -129,6 +146,21 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
     ///         Flat (utilization-independent) so the index advance is exact.
     uint256 public constant BORROW_RATE_PER_SECOND = 3_170_979_198;
 
+    /// @dev Fixed-point scale for the signed per-side funding indices
+    ///      (accumulated `Σ rate·dt`, a dimensionless fraction of notional).
+    uint256 private constant FUNDING_PRECISION = 1e18;
+
+    /// @notice Cap on the funding rate per second, scaled by {FUNDING_PRECISION}.
+    ///         `0.03 / 86_400 · 1e18 ≈ 3.47e11`, i.e. ~3%/day on notional at the
+    ///         clamp. Bounds how fast a crowded-side position bleeds funding.
+    uint256 public constant MAX_FUNDING_RATE_PER_SECOND = 347_222_222_222;
+
+    /// @notice Slope mapping skew to the funding rate: `rate = FUNDING_COEFF ·
+    ///         |skew|`, scaled by {FUNDING_PRECISION}. Set to `2 ·
+    ///         MAX_FUNDING_RATE_PER_SECOND` so the rate reaches its clamp at 50%
+    ///         skew and is linear below it.
+    uint256 public constant FUNDING_COEFF = 694_444_444_444;
+
     // --- supported markets (RedStone feed ids) ---------------------------
 
     /// @notice Supported market feed id for BTC.
@@ -158,6 +190,11 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      * @param  entryCumBorrowRate Borrow-fee index ({MarketState.cumBorrowRate})
      *                    snapshotted at open; the fee owed at close is
      *                    `sizeUsd · (cumBorrowRate − entryCumBorrowRate)`.
+     * @param  entryCumFunding This side's signed funding index
+     *                    ({MarketState.longCumFunding}/{shortCumFunding})
+     *                    snapshotted at open; the funding settled at close is
+     *                    `sizeUsd · (sideCumFunding − entryCumFunding)` (signed:
+     *                    positive ⇒ the position owes, negative ⇒ it is owed).
      */
     struct Position {
         address owner;
@@ -167,6 +204,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         uint256 sizeUsd;
         uint256 entryPrice;
         uint256 entryCumBorrowRate;
+        int256 entryCumFunding;
     }
 
     /**
@@ -185,6 +223,15 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      *                       {FEE_PRECISION}. Monotonically non-decreasing.
      * @param  lastBorrowAccrual Timestamp the index last advanced; 0 until the
      *                       market's first touch.
+     * @param  longCumFunding  Signed cumulative funding index for the LONG side
+     *                       (scaled by {FUNDING_PRECISION}): rises when longs are
+     *                       the heavy side (they pay), falls when longs are light
+     *                       (they receive).
+     * @param  shortCumFunding Signed cumulative funding index for the SHORT side,
+     *                       symmetric to {longCumFunding}.
+     * @param  lastFundingAccrual Timestamp the funding indices last advanced; 0
+     *                       until the market's first touch. Always advances on
+     *                       accrual so one-sided gaps are never retro-charged.
      */
     struct MarketState {
         uint256 longSizeUsd;
@@ -194,6 +241,21 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         uint256 lastMarkPrice;
         uint256 cumBorrowRate;
         uint256 lastBorrowAccrual;
+        int256 longCumFunding;
+        int256 shortCumFunding;
+        uint256 lastFundingAccrual;
+    }
+
+    /**
+     * @dev Transient (memory-only) result of splitting a liquidated position's
+     *      collateral. Packed into a struct so {_settleLiquidation}'s event emit
+     *      stays within the EVM stack limit. See {_splitLiquidation}.
+     */
+    struct LiquidationSplit {
+        uint256 toPool;
+        uint256 liquidatorBonus;
+        uint256 ownerRefund;
+        uint256 badDebt;
     }
 
     /// @notice Open positions keyed by keccak256(owner, market, isLong).
@@ -243,6 +305,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         bool profit,
         uint256 pnl,
         uint256 borrowFee,
+        int256 funding,
         uint256 payout
     );
 
@@ -257,6 +320,9 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      *         claim and the bounty.
      * @param  badDebt Net owed beyond the position's collateral that the pool
      *         could not collect (0 unless deeply underwater).
+     * @param  funding Signed funding settled at liquidation (positive ⇒ the
+     *         position owed funding, negative ⇒ it was owed funding); folded into
+     *         the pool's net claim.
      */
     event PositionLiquidated(
         address indexed owner,
@@ -266,6 +332,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         bool profit,
         uint256 pnl,
         uint256 borrowFee,
+        int256 funding,
         uint256 toPool,
         uint256 liquidatorBonus,
         uint256 ownerRefund,
@@ -339,9 +406,12 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
             revert ExceedsUtilization();
         }
 
-        // Effects. Accrue the borrow index to now so the position's entry
-        // snapshot excludes fees that accrued before it existed.
+        // Effects. Accrue both indices to now (over the PRE-trade skew, before
+        // this position joins the book) so the entry snapshots exclude fees and
+        // funding that accrued before it existed.
         uint256 entryCumBorrowRate = _accrueBorrow(market);
+        _accrueFunding(market);
+        int256 entryCumFunding = isLong ? markets[market].longCumFunding : markets[market].shortCumFunding;
         positions[key] = Position({
             owner: msg.sender,
             market: market,
@@ -349,7 +419,8 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
             collateral: collateral,
             sizeUsd: sizeUsd,
             entryPrice: entryPrice,
-            entryCumBorrowRate: entryCumBorrowRate
+            entryCumBorrowRate: entryCumBorrowRate,
+            entryCumFunding: entryCumFunding
         });
         _updateMarket(market, isLong, sizeUsd, entryPrice, entryPrice, true);
         totalReserved += reserve;
@@ -395,51 +466,58 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
 
         (bool profit, uint256 pnl) = _computePnl(pos, exitPrice);
 
-        // Effects. Accrue the borrow index to now and snapshot the fee owed over
-        // this position's lifetime (Ceil favours the pool), then clear the
-        // position's book state before any external interaction (CEI).
+        // Effects. Accrue both indices to now (over the pre-trade skew, while
+        // this position is still in the book) and snapshot the fee and signed
+        // funding owed over this position's lifetime, then clear the position's
+        // book state before any external interaction (CEI).
         uint256 borrowFee = _accrueFee(pos);
+        int256 fundingOwed = _accrueFundingOwed(pos);
         _realizeClose(pos, key, exitPrice);
 
         // Interactions (kept in a helper to bound this frame's stack).
-        uint256 payout = _settle(pos, profit, pnl, borrowFee);
+        uint256 payout = _settle(pos, profit, pnl, borrowFee, fundingOwed);
 
-        emit PositionClosed(pos.owner, market, isLong, exitPrice, profit, pnl, borrowFee, payout);
+        emit PositionClosed(pos.owner, market, isLong, exitPrice, profit, pnl, borrowFee, fundingOwed, payout);
     }
 
     /**
-     * @dev Settles a closing position's transfers and returns the trader payout.
-     *      `A` = pre-fee proceeds (profit: collateral + pnl; loss:
-     *      collateral - pnl). The fee is charged as `min(fee, A)` so payout
-     *      `= A - charged` floors at 0 and never underflows; any uncollected
-     *      remainder is left for PR-5. Pool flow is netted into a single
-     *      {payProfit} (pool -> trader) or {receiveLoss} (-> pool) call, with the
-     *      collected fee folded into that net. Called only from {closePosition}
-     *      after all state effects, so it runs under that function's CEI ordering
-     *      and `nonReentrant` guard.
+     * @dev Settles a closing position's transfers and returns the trader payout,
+     *      folding the signed P&L, the borrow fee, and the signed funding into a
+     *      single net pool flow. `netToPool` is the pool's net claim (positive ⇒
+     *      the pool RECEIVES, negative ⇒ the pool PAYS): a profit is the only term
+     *      that pays the trader, while a loss, the borrow fee, and positive
+     *      funding all flow to the pool.
+     *
+     *      - `netToPool < 0`: the pool pays `-netToPool` via {payProfit} and the
+     *        trader's full collateral is returned; payout = collateral + poolPay.
+     *      - `netToPool >= 0`: the pool's claim is capped at the collateral
+     *        (`toPool = min(owed, collateral)`), the remainder is returned to the
+     *        trader, and payout floors at 0 — any owed beyond collateral is the
+     *        bad-debt seam left uncollected (bounded on the liquidation path).
+     *
+     *      Reduces EXACTLY to the PR-4a behavior when `fundingOwed == 0`. Called
+     *      only from {closePosition} after all state effects, so it runs under
+     *      that function's CEI ordering and `nonReentrant` guard.
      */
-    function _settle(Position memory pos, bool profit, uint256 pnl, uint256 borrowFee)
+    function _settle(Position memory pos, bool profit, uint256 pnl, uint256 borrowFee, int256 fundingOwed)
         internal
         returns (uint256 payout)
     {
-        uint256 available = profit ? pos.collateral + pnl : pos.collateral - pnl;
-        uint256 feeCharged = borrowFee > available ? available : borrowFee;
-        payout = available - feeCharged;
-
-        // Net pool flow: pool pays profit, receives loss + the collected fee.
-        uint256 poolOut = profit ? pnl : 0;
-        uint256 poolIn = (profit ? 0 : pnl) + feeCharged;
-
-        if (poolOut > poolIn) {
+        int256 netToPool = (profit ? -int256(pnl) : int256(pnl)) + int256(borrowFee) + fundingOwed;
+        if (netToPool < 0) {
             // Pool nets a payment to the trader; full collateral returned by PM.
-            pool.payProfit(pos.owner, poolOut - poolIn);
+            uint256 poolPay = uint256(-netToPool);
+            pool.payProfit(pos.owner, poolPay);
             asset.safeTransfer(pos.owner, pos.collateral);
+            payout = pos.collateral + poolPay;
         } else {
-            // Pool nets an inflow (loss and/or fee); PM funds it from collateral.
-            uint256 toPool = poolIn - poolOut;
-            uint256 returned = pos.collateral - toPool; // toPool <= collateral by construction
+            // Pool nets an inflow; PM funds it from collateral, capped at it.
+            uint256 owed = uint256(netToPool);
+            uint256 toPool = owed > pos.collateral ? pos.collateral : owed;
+            uint256 returned = pos.collateral - toPool;
             if (returned > 0) asset.safeTransfer(pos.owner, returned);
             if (toPool > 0) pool.receiveLoss(toPool);
+            payout = returned;
         }
     }
 
@@ -448,8 +526,9 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      *         call; the caller MUST append a fresh signed RedStone payload for
      *         `market` and is paid a bounty out of the position's collateral.
      * @dev    A position is liquidatable once its equity — collateral adjusted by
-     *         the UNCAPPED P&L at the fresh mark and the accrued borrow fee —
-     *         falls to at most {MAINTENANCE_MARGIN_BPS} of collateral. The
+     *         the UNCAPPED P&L at the fresh mark, the accrued borrow fee, and the
+     *         signed funding owed — falls to at most {MAINTENANCE_MARGIN_BPS} of
+     *         collateral. The
      *         uncapped P&L is used here (not the close-path capped figure) so the
      *         trigger reflects true solvency: a loss past collateral must still
      *         liquidate. By construction the position is underwater, so the pool
@@ -484,27 +563,25 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         // beyond collateral that the close path would have floored.
         (bool profit, uint256 pnl) = _computeRawPnl(pos, exitPrice);
 
-        // Accrue the borrow index to now and snapshot this position's fee
-        // (exactly one _accrueBorrow call, as on the close path).
+        // Accrue both indices to now and snapshot this position's fee and signed
+        // funding (exactly one accrual of each, as on the close path). Computed
+        // ONCE here and reused at settlement so the check and the split agree.
         uint256 borrowFee = _accrueFee(pos);
+        int256 fundingOwed = _accrueFundingOwed(pos);
 
-        // Equity check (everything favours the pool / against the trader).
+        // Equity check (everything favours the pool / against the trader): the
+        // signed equity nets uncapped P&L, the fee, and signed funding owed.
+        int256 signedEquity =
+            int256(pos.collateral) + (profit ? int256(pnl) : -int256(pnl)) - int256(borrowFee) - fundingOwed;
+        uint256 equity = signedEquity > 0 ? uint256(signedEquity) : 0;
         uint256 maintenance = Math.mulDiv(pos.collateral, MAINTENANCE_MARGIN_BPS, BPS_DENOMINATOR);
-        uint256 equity;
-        if (profit) {
-            uint256 gross = pos.collateral + pnl;
-            equity = gross > borrowFee ? gross - borrowFee : 0;
-        } else {
-            uint256 debit = pnl + borrowFee;
-            equity = pos.collateral > debit ? pos.collateral - debit : 0;
-        }
         if (equity > maintenance) revert NotLiquidatable(equity, maintenance);
 
         // Effects: clear book state and release reserves (CEI).
         _realizeClose(pos, key, exitPrice);
 
         // Settlement + interactions + event in a helper to bound this frame's stack.
-        _settleLiquidation(pos, exitPrice, profit, pnl, borrowFee);
+        _settleLiquidation(pos, exitPrice, profit, pnl, borrowFee, fundingOwed);
     }
 
     /**
@@ -512,25 +589,29 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      *      pool's net claim, the liquidator's bounty, and any owner refund, then
      *      performs the transfers (interactions only — all state effects ran in
      *      {liquidate} before this call) and emits {PositionLiquidated}. The
-     *      position is underwater by construction, so the pool only RECEIVES;
-     *      {LiquidityPool.payProfit} is never called. In the profit branch the
-     *      equity test in {liquidate} guarantees `borrowFee >= pnl`, so
-     *      `borrowFee - pnl` cannot underflow. Conservation holds exactly:
+     *      net claim folds the uncapped P&L, the borrow fee, and the signed
+     *      funding owed. The equity check in {liquidate} guarantees a position is
+     *      only liquidatable once `signedEquity <= maintenance < collateral`, and
+     *      since `signedEquity = collateral - netOwed`, the net owed is strictly
+     *      positive here — so the pool only ever RECEIVES; {LiquidityPool.payProfit}
+     *      is never called. Conservation holds exactly:
      *      `toPool + liquidatorBonus + ownerRefund == pos.collateral`.
      */
-    function _settleLiquidation(Position memory pos, uint256 exitPrice, bool profit, uint256 pnl, uint256 borrowFee)
-        internal
-    {
-        uint256 netOwedToPool = profit ? (borrowFee - pnl) : (pnl + borrowFee);
-        uint256 toPool = netOwedToPool > pos.collateral ? pos.collateral : netOwedToPool;
-        uint256 remaining = pos.collateral - toPool;
-        uint256 liquidatorBonus = Math.min(Math.mulDiv(pos.collateral, LIQUIDATION_FEE_BPS, BPS_DENOMINATOR), remaining);
-        uint256 ownerRefund = remaining - liquidatorBonus;
-        uint256 badDebt = netOwedToPool > pos.collateral ? netOwedToPool - pos.collateral : 0;
+    function _settleLiquidation(
+        Position memory pos,
+        uint256 exitPrice,
+        bool profit,
+        uint256 pnl,
+        uint256 borrowFee,
+        int256 fundingOwed
+    ) internal {
+        // The split is packed into one memory struct so the 13-field emit below
+        // stays within the stack limit (one slot, not four).
+        LiquidationSplit memory s = _splitLiquidation(pos.collateral, profit, pnl, borrowFee, fundingOwed);
 
-        if (toPool > 0) pool.receiveLoss(toPool);
-        if (liquidatorBonus > 0) asset.safeTransfer(msg.sender, liquidatorBonus);
-        if (ownerRefund > 0) asset.safeTransfer(pos.owner, ownerRefund);
+        if (s.toPool > 0) pool.receiveLoss(s.toPool);
+        if (s.liquidatorBonus > 0) asset.safeTransfer(msg.sender, s.liquidatorBonus);
+        if (s.ownerRefund > 0) asset.safeTransfer(pos.owner, s.ownerRefund);
 
         emit PositionLiquidated(
             pos.owner,
@@ -540,12 +621,34 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
             profit,
             pnl,
             borrowFee,
-            toPool,
-            liquidatorBonus,
-            ownerRefund,
-            badDebt,
+            fundingOwed,
+            s.toPool,
+            s.liquidatorBonus,
+            s.ownerRefund,
+            s.badDebt,
             msg.sender
         );
+    }
+
+    /**
+     * @dev Pure split of a liquidated position's collateral into the pool's net
+     *      claim, the liquidator's bounty, and the owner refund (plus any
+     *      uncollectable bad debt). `netOwed` folds the uncapped P&L, the borrow
+     *      fee, and the signed funding; the equity check in {liquidate} has
+     *      already guaranteed `netOwed > 0`, so the cast to uint256 is safe.
+     *      Conservation: `toPool + liquidatorBonus + ownerRefund == collateral`.
+     */
+    function _splitLiquidation(uint256 collateral, bool profit, uint256 pnl, uint256 borrowFee, int256 fundingOwed)
+        internal
+        pure
+        returns (LiquidationSplit memory s)
+    {
+        uint256 netOwedToPool = uint256((profit ? -int256(pnl) : int256(pnl)) + int256(borrowFee) + fundingOwed);
+        s.toPool = netOwedToPool > collateral ? collateral : netOwedToPool;
+        uint256 remaining = collateral - s.toPool;
+        s.liquidatorBonus = Math.min(Math.mulDiv(collateral, LIQUIDATION_FEE_BPS, BPS_DENOMINATOR), remaining);
+        s.ownerRefund = remaining - s.liquidatorBonus;
+        s.badDebt = netOwedToPool > collateral ? netOwedToPool - collateral : 0;
     }
 
     // --- views -----------------------------------------------------------
@@ -572,6 +675,38 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
             cum += BORROW_RATE_PER_SECOND * (block.timestamp - last);
         }
         return Math.mulDiv(pos.sizeUsd, cum - pos.entryCumBorrowRate, FEE_PRECISION, Math.Rounding.Ceil);
+    }
+
+    /**
+     * @notice Signed funding a currently-open position would settle if closed at
+     *         the current block time (positive ⇒ the position OWES funding,
+     *         negative ⇒ it is OWED). View-only: projects both per-side indices
+     *         forward by the elapsed interval without mutating state, using the
+     *         same accrual math as {_accrueFunding}. Returns 0 if no such position
+     *         is open. Rounding favors the pool (owed ⇒ Ceil, owed-to ⇒ Floor).
+     */
+    function pendingFunding(address owner, bytes32 market, bool isLong) external view returns (int256) {
+        Position memory pos = positions[_positionKey(owner, market, isLong)];
+        if (pos.sizeUsd == 0) return 0;
+
+        MarketState storage m = markets[market];
+        int256 longCum = m.longCumFunding;
+        int256 shortCum = m.shortCumFunding;
+        uint256 last = m.lastFundingAccrual;
+        uint256 longSize = m.longSizeUsd;
+        uint256 shortSize = m.shortSizeUsd;
+        if (last != 0 && longSize > 0 && shortSize > 0 && block.timestamp > last) {
+            (int256 longDelta, int256 shortDelta) = _fundingDeltas(longSize, shortSize, block.timestamp - last);
+            longCum += longDelta;
+            shortCum += shortDelta;
+        }
+
+        int256 cumNow = isLong ? longCum : shortCum;
+        int256 delta = cumNow - pos.entryCumFunding;
+        uint256 mag = SignedMath.abs(delta);
+        uint256 amt =
+            Math.mulDiv(pos.sizeUsd, mag, FUNDING_PRECISION, delta >= 0 ? Math.Rounding.Ceil : Math.Rounding.Floor);
+        return delta >= 0 ? int256(amt) : -int256(amt);
     }
 
     // --- internal: P&L & aggregates --------------------------------------
@@ -727,6 +862,90 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
             m.lastBorrowAccrual = block.timestamp;
         }
         return m.cumBorrowRate;
+    }
+
+    // --- internal: funding accrual ---------------------------------------
+
+    /**
+     * @dev Advances `market`'s signed per-side funding indices to the current
+     *      block time. Funding accrues ONLY while BOTH sides hold open interest;
+     *      a one-sided book (or `lastFundingAccrual == 0` first touch) accrues
+     *      nothing. The heavy side's index rises by `rate·elapsed` per unit
+     *      notional and the light side's falls by the same total spread over its
+     *      smaller notional (credit rounded DOWN so the dust the pool clears is
+     *      ≥ 0). The timestamp ALWAYS advances, so a gap during which the book was
+     *      one-sided is never retro-charged when the other side later returns.
+     *
+     *      Like the borrow index, this touches only funding state — it never
+     *      moves `totalUnrealizedProfit` or `totalReserved`, so pure time passing
+     *      cannot shift LP NAV or reserved liquidity; funding is a peer-to-peer
+     *      transfer recognized only when a close/liquidation realizes it.
+     */
+    function _accrueFunding(bytes32 market) internal {
+        MarketState storage m = markets[market];
+        uint256 last = m.lastFundingAccrual;
+        uint256 longSize = m.longSizeUsd;
+        uint256 shortSize = m.shortSizeUsd;
+        if (last != 0 && longSize > 0 && shortSize > 0 && block.timestamp > last) {
+            (int256 longDelta, int256 shortDelta) = _fundingDeltas(longSize, shortSize, block.timestamp - last);
+            m.longCumFunding += longDelta;
+            m.shortCumFunding += shortDelta;
+        }
+        // Always advance so one-sided gaps are never retro-charged.
+        m.lastFundingAccrual = block.timestamp;
+    }
+
+    /**
+     * @dev Pure core of the funding accrual: the signed increments to each side's
+     *      cumulative index over `elapsed` seconds given both sides' notionals.
+     *      The per-second rate is proportional to the skew magnitude
+     *      (`FUNDING_COEFF · |L-S|/(L+S)`) clamped at {MAX_FUNDING_RATE_PER_SECOND}.
+     *      Shared by {_accrueFunding} (mutating) and {pendingFunding} (read-only)
+     *      so the two can never diverge. Assumes `L > 0 && S > 0`; returns
+     *      `(0, 0)` when the book is balanced (`L == S`).
+     */
+    function _fundingDeltas(uint256 L, uint256 S, uint256 elapsed)
+        internal
+        pure
+        returns (int256 longDelta, int256 shortDelta)
+    {
+        if (L == S) return (0, 0);
+
+        uint256 absSkew = Math.mulDiv(L > S ? L - S : S - L, FUNDING_PRECISION, L + S); // [0, 1e18]
+        uint256 rate = Math.mulDiv(FUNDING_COEFF, absSkew, FUNDING_PRECISION); // per-sec, 1e18
+        if (rate > MAX_FUNDING_RATE_PER_SECOND) rate = MAX_FUNDING_RATE_PER_SECOND;
+
+        uint256 chargePerUnit = rate * elapsed; // index increment for the heavy side
+        if (L > S) {
+            // Longs pay; the total (chargePerUnit·L) is spread over the smaller
+            // short notional (Floor favours the pool).
+            uint256 creditPerUnit = Math.mulDiv(chargePerUnit, L, S);
+            longDelta = int256(chargePerUnit);
+            shortDelta = -int256(creditPerUnit);
+        } else {
+            // Shorts pay; symmetric.
+            uint256 creditPerUnit = Math.mulDiv(chargePerUnit, S, L);
+            shortDelta = int256(chargePerUnit);
+            longDelta = -int256(creditPerUnit);
+        }
+    }
+
+    /**
+     * @dev Accrues `pos`'s market funding indices to now (exactly ONE
+     *      {_accrueFunding} call) and returns the SIGNED funding this position
+     *      settles over its lifetime, `sizeUsd · (sideCumFunding − entryCumFunding)`
+     *      (positive ⇒ the position OWES, negative ⇒ it is OWED). Rounding favours
+     *      the pool: a charge rounds UP (Ceil), a credit rounds DOWN (Floor).
+     *      Shared by close and liquidate.
+     */
+    function _accrueFundingOwed(Position memory pos) internal returns (int256 fundingOwed) {
+        _accrueFunding(pos.market);
+        int256 cumNow = pos.isLong ? markets[pos.market].longCumFunding : markets[pos.market].shortCumFunding;
+        int256 delta = cumNow - pos.entryCumFunding; // > 0 trader OWES, < 0 trader is OWED
+        uint256 mag = SignedMath.abs(delta);
+        uint256 amt =
+            Math.mulDiv(pos.sizeUsd, mag, FUNDING_PRECISION, delta >= 0 ? Math.Rounding.Ceil : Math.Rounding.Floor);
+        fundingOwed = delta >= 0 ? int256(amt) : -int256(amt);
     }
 
     // --- internal: helpers -----------------------------------------------

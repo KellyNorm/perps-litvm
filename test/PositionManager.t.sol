@@ -253,7 +253,7 @@ contract PositionManagerTest is Test {
         _fund(pm, alice, COL);
         _open(pm, alice, BTC, true, COL, 10, ENTRY); // max leverage
         bytes32 key = pm.getPositionKey(alice, BTC, true);
-        (,,, uint256 collateral, uint256 sizeUsd, uint256 entryPrice,) = pm.positions(key);
+        (,,, uint256 collateral, uint256 sizeUsd, uint256 entryPrice,,) = pm.positions(key);
         assertEq(collateral, COL, "stored collateral");
         assertEq(sizeUsd, COL * 10, "size = collateral * leverage");
         assertEq(entryPrice, ENTRY * ONE8, "entry price scaled 1e8");
@@ -294,7 +294,7 @@ contract PositionManagerTest is Test {
         _fund(pm, alice, MIN_COLLATERAL);
         _open(pm, alice, BTC, true, MIN_COLLATERAL, 1, ENTRY);
         bytes32 key = pm.getPositionKey(alice, BTC, true);
-        (,,,, uint256 sizeUsd,,) = pm.positions(key);
+        (,,,, uint256 sizeUsd,,,) = pm.positions(key);
         assertEq(sizeUsd, MIN_COLLATERAL, "min collateral position opened");
     }
 
@@ -757,7 +757,7 @@ contract PositionManagerTest is Test {
         assertEq(pm.totalReserved(), 0, "reserve released");
         assertEq(pm.totalUnrealizedProfit(), 0, "cachedU clean");
         bytes32 key = pm.getPositionKey(alice, BTC, true);
-        (,,,, uint256 sizeUsd,,) = pm.positions(key);
+        (,,,, uint256 sizeUsd,,,) = pm.positions(key);
         assertEq(sizeUsd, 0, "position deleted");
     }
 
@@ -868,8 +868,8 @@ contract PositionManagerTest is Test {
         assertEq(mA.totalReserved(), mB.totalReserved(), "totalReserved matches close");
         assertEq(mA.totalUnrealizedProfit(), mB.totalUnrealizedProfit(), "cachedU matches close");
 
-        (uint256 lSizeA, uint256 lWeightA, uint256 sSizeA, uint256 sWeightA, uint256 markA,,) = mA.markets(BTC);
-        (uint256 lSizeB, uint256 lWeightB, uint256 sSizeB, uint256 sWeightB, uint256 markB,,) = mB.markets(BTC);
+        (uint256 lSizeA, uint256 lWeightA, uint256 sSizeA, uint256 sWeightA, uint256 markA,,,,,) = mA.markets(BTC);
+        (uint256 lSizeB, uint256 lWeightB, uint256 sSizeB, uint256 sWeightB, uint256 markB,,,,,) = mB.markets(BTC);
         assertEq(lSizeA, lSizeB, "longSizeUsd matches");
         assertEq(lWeightA, lWeightB, "longWeight matches");
         assertEq(sSizeA, sSizeB, "shortSizeUsd matches");
@@ -892,7 +892,7 @@ contract PositionManagerTest is Test {
 
         // Same-block close at +10%: profit 500, fee 0, payout = collateral + 500.
         vm.expectEmit(true, true, false, true, address(pm));
-        emit PositionManager.PositionClosed(alice, BTC, true, 66_000 * ONE8, true, 500e18, 0, COL + 500e18);
+        emit PositionManager.PositionClosed(alice, BTC, true, 66_000 * ONE8, true, 500e18, 0, int256(0), COL + 500e18);
         _close(pm, alice, BTC, true, 66_000);
 
         assertEq(asset.balanceOf(alice), aliceStart + 500e18, "profit payout unchanged");
@@ -908,7 +908,7 @@ contract PositionManagerTest is Test {
 
         // Same-block close at -10%: loss 500, fee 0, payout = collateral - 500.
         vm.expectEmit(true, true, false, true, address(pm));
-        emit PositionManager.PositionClosed(alice, BTC, true, 54_000 * ONE8, false, 500e18, 0, COL - 500e18);
+        emit PositionManager.PositionClosed(alice, BTC, true, 54_000 * ONE8, false, 500e18, 0, int256(0), COL - 500e18);
         _close(pm, alice, BTC, true, 54_000);
 
         assertEq(asset.balanceOf(alice), aliceStart - 500e18, "loss payout unchanged");
@@ -948,6 +948,358 @@ contract PositionManagerTest is Test {
         (bool okLiq, bytes memory ret) = _liquidateRaw(evilPm, liquidator, alice, BTC, true, 49_200);
         assertFalse(okLiq, "reentrant liquidate must revert");
         assertEq(bytes4(ret), ReentrancyGuard.ReentrancyGuardReentrantCall.selector, "reentrancy selector");
+    }
+
+    // =====================================================================
+    // PR-4b — Funding (true peer-to-peer)
+    // =====================================================================
+
+    address internal carol = makeAddr("carol");
+
+    // Mirrors of the manager's funding params for assertions.
+    uint256 internal constant MAX_FR = 347_222_222_222;
+    uint256 internal constant FCOEFF = 694_444_444_444;
+    uint256 internal constant FUNDING_PRECISION_T = 1e18;
+
+    // A light short to skew the book: 300 collateral * 5x = 1500 notional.
+    uint256 internal constant COL_S = 300e18;
+    uint256 internal constant SIZE_S = COL_S * LEV; // 1500e18
+    // A non-divisible light short (260 * 5 = 1300) to force a positive dust.
+    uint256 internal constant COL_D = 260e18;
+    uint256 internal constant SIZE_D = COL_D * LEV; // 1300e18
+    // A heavy short for the skew-flip test (2000 * 5 = 10000).
+    uint256 internal constant COL_C = 2_000e18;
+    uint256 internal constant SIZE_C = COL_C * LEV; // 10000e18
+
+    /// @dev Mirror of {PositionManager._fundingDeltas} rate: skew-proportional,
+    ///      clamped at MAX_FR.
+    function _fundingRate(uint256 L, uint256 S) internal pure returns (uint256 r) {
+        uint256 absSkew = ((L > S ? L - S : S - L) * FUNDING_PRECISION_T) / (L + S);
+        r = (FCOEFF * absSkew) / FUNDING_PRECISION_T;
+        if (r > MAX_FR) r = MAX_FR;
+    }
+
+    /// @dev Signed increment to ONE side's cumulative index over `elapsed`
+    ///      seconds, for a book held constant at (L, S). Mirrors the contract's
+    ///      heavy-pays / light-receives split with Floor on the credit.
+    function _sideCumDelta(uint256 L, uint256 S, uint256 elapsed, bool longSide) internal pure returns (int256) {
+        if (L == 0 || S == 0 || L == S) return 0;
+        uint256 charge = _fundingRate(L, S) * elapsed;
+        if (L > S) {
+            uint256 credit = (charge * L) / S; // Floor (favours pool)
+            return longSide ? int256(charge) : -int256(credit);
+        } else {
+            uint256 credit = (charge * S) / L; // Floor (favours pool)
+            return longSide ? -int256(credit) : int256(charge);
+        }
+    }
+
+    /// @dev Mirror of the contract's settled funding: sizeUsd · cumDelta scaled
+    ///      down, Ceil when the position OWES (cumDelta >= 0), Floor when OWED.
+    function _fundingAmt(uint256 size, int256 cumDelta) internal pure returns (int256) {
+        if (cumDelta >= 0) {
+            return int256((size * uint256(cumDelta) + FUNDING_PRECISION_T - 1) / FUNDING_PRECISION_T);
+        }
+        return -int256((size * uint256(-cumDelta)) / FUNDING_PRECISION_T);
+    }
+
+    /// @dev Trader balance after a FLAT close (exit == entry, pnl == 0), folding
+    ///      the borrow fee and signed funding exactly as {PositionManager._settle}
+    ///      does. `startBal` is the trader's balance before opening (== collateral
+    ///      here, since opening pulls the collateral and the position pays nothing
+    ///      else in). Used to assert realized payouts match the view.
+    function _flatCloseEnd(uint256 startBal, uint256 col, uint256 fee, int256 funding) internal pure returns (uint256) {
+        int256 netToPool = int256(fee) + funding; // pnl == 0 on a flat close
+        if (netToPool < 0) {
+            return startBal + uint256(-netToPool); // pool pays the trader
+        }
+        uint256 owed = uint256(netToPool);
+        uint256 toPool = owed > col ? col : owed; // capped at collateral
+        return startBal - toPool;
+    }
+
+    // --- 1: one-sided book accrues no funding ----------------------------
+
+    function test_Funding_OneSidedBook_NoFunding() public {
+        _fund(pm, alice, COL);
+        uint256 aliceStart = asset.balanceOf(alice);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY); // only longs in the book
+        vm.warp(block.timestamp + ONE_YEAR);
+
+        assertEq(pm.pendingFunding(alice, BTC, true), int256(0), "one-sided => zero funding");
+
+        // Flat close: only the borrow fee is taken — exactly the PR-4a result.
+        uint256 fee = _expectedFee(SIZE, ONE_YEAR);
+        _close(pm, alice, BTC, true, ENTRY);
+        assertEq(asset.balanceOf(alice), aliceStart - fee, "payout = collateral - borrow fee (no funding)");
+        assertEq(asset.balanceOf(address(pool)), poolBefore + fee, "pool collects only the borrow fee");
+    }
+
+    // --- 2: long-heavy — longs pay, shorts receive -----------------------
+
+    function test_Funding_LongHeavy_PayerAndReceiver() public {
+        _fund(pm, alice, COL);
+        _fund(pm, bob, COL_S);
+        uint256 aliceStart = asset.balanceOf(alice);
+        uint256 bobStart = asset.balanceOf(bob);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY); // long 5000 (heavy)
+        _open(pm, bob, BTC, false, COL_S, LEV, ENTRY); // short 1500 (light)
+
+        uint256 elapsed = 2 days;
+        vm.warp(block.timestamp + elapsed);
+
+        int256 aFund = _fundingAmt(SIZE, _sideCumDelta(SIZE, SIZE_S, elapsed, true));
+        int256 bFund = _fundingAmt(SIZE_S, _sideCumDelta(SIZE, SIZE_S, elapsed, false));
+        assertGt(aFund, int256(0), "long (heavy) owes funding");
+        assertLt(bFund, int256(0), "short (light) is owed funding");
+        assertEq(pm.pendingFunding(alice, BTC, true), aFund, "alice pending funding matches mirror");
+        assertEq(pm.pendingFunding(bob, BTC, false), bFund, "bob pending funding matches mirror");
+
+        uint256 feeA = _expectedFee(SIZE, elapsed);
+        uint256 feeB = _expectedFee(SIZE_S, elapsed);
+
+        _close(pm, alice, BTC, true, ENTRY); // pays borrow fee + funding
+        _close(pm, bob, BTC, false, ENTRY); // pays borrow fee, receives funding
+
+        assertEq(asset.balanceOf(alice), _flatCloseEnd(aliceStart, COL, feeA, aFund), "long payout reduced by funding");
+        assertEq(asset.balanceOf(bob), _flatCloseEnd(bobStart, COL_S, feeB, bFund), "short payout raised by funding");
+
+        // Pool is a pass-through: longs pay >= shorts receive (dust to pool), so
+        // the pool nets at least the two borrow fees and never less.
+        assertGe(uint256(aFund), uint256(-bFund), "longs paid >= shorts received (dust to pool)");
+        assertGe(asset.balanceOf(address(pool)), poolBefore + feeA + feeB, "pool net funding >= 0");
+    }
+
+    // --- 3: short-heavy — symmetric --------------------------------------
+
+    function test_Funding_ShortHeavy_PayerAndReceiver() public {
+        _fund(pm, alice, COL);
+        _fund(pm, bob, COL_S);
+        uint256 aliceStart = asset.balanceOf(alice);
+        uint256 bobStart = asset.balanceOf(bob);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+
+        _open(pm, alice, BTC, false, COL, LEV, ENTRY); // short 5000 (heavy)
+        _open(pm, bob, BTC, true, COL_S, LEV, ENTRY); // long 1500 (light)
+
+        uint256 elapsed = 2 days;
+        vm.warp(block.timestamp + elapsed);
+
+        // Book is (L = bob 1500, S = alice 5000): pass L, S accordingly.
+        int256 aFund = _fundingAmt(SIZE, _sideCumDelta(SIZE_S, SIZE, elapsed, false));
+        int256 bFund = _fundingAmt(SIZE_S, _sideCumDelta(SIZE_S, SIZE, elapsed, true));
+        assertGt(aFund, int256(0), "short (heavy) owes funding");
+        assertLt(bFund, int256(0), "long (light) is owed funding");
+        assertEq(pm.pendingFunding(alice, BTC, false), aFund, "alice short pending matches mirror");
+        assertEq(pm.pendingFunding(bob, BTC, true), bFund, "bob long pending matches mirror");
+
+        uint256 feeA = _expectedFee(SIZE, elapsed);
+        uint256 feeB = _expectedFee(SIZE_S, elapsed);
+
+        _close(pm, alice, BTC, false, ENTRY);
+        _close(pm, bob, BTC, true, ENTRY);
+
+        assertEq(asset.balanceOf(alice), _flatCloseEnd(aliceStart, COL, feeA, aFund), "short payout reduced by funding");
+        assertEq(asset.balanceOf(bob), _flatCloseEnd(bobStart, COL_S, feeB, bFund), "long payout raised by funding");
+
+        assertGe(uint256(aFund), uint256(-bFund), "shorts paid >= longs received (dust to pool)");
+        assertGe(asset.balanceOf(address(pool)), poolBefore + feeA + feeB, "pool net funding >= 0");
+    }
+
+    // --- 4: balanced book (L == S) accrues no funding --------------------
+
+    function test_Funding_BalancedBook_ZeroFunding() public {
+        _fund(pm, alice, COL);
+        _fund(pm, bob, COL);
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY); // long 5000
+        _open(pm, bob, BTC, false, COL, LEV, ENTRY); // short 5000 -> L == S
+
+        vm.warp(block.timestamp + ONE_YEAR);
+
+        assertEq(pm.pendingFunding(alice, BTC, true), int256(0), "balanced book: long funding 0");
+        assertEq(pm.pendingFunding(bob, BTC, false), int256(0), "balanced book: short funding 0");
+    }
+
+    // --- 5: skew flip mid-life — signed funding nets across the flip ------
+
+    function test_Funding_SkewFlip_NetsCorrectly() public {
+        _fund(pm, alice, COL);
+        _fund(pm, bob, COL_S);
+        _fund(pm, carol, COL_C);
+        uint256 aliceStart = asset.balanceOf(alice);
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY); // long 5000
+        _open(pm, bob, BTC, false, COL_S, LEV, ENTRY); // short 1500 -> long-heavy
+
+        uint256 t1 = 2 days;
+        vm.warp(block.timestamp + t1);
+
+        // Opening carol accrues the t1 (long-heavy) segment over the PRE-trade
+        // skew, then flips the book short-heavy (S = 11500 > L = 5000).
+        _open(pm, carol, BTC, false, COL_C, LEV, ENTRY); // short 10000
+
+        uint256 t2 = 2 days;
+        vm.warp(block.timestamp + t2);
+
+        int256 seg1 = _sideCumDelta(SIZE, SIZE_S, t1, true); // long pays while heavy: > 0
+        int256 seg2 = _sideCumDelta(SIZE, SIZE_S + SIZE_C, t2, true); // long receives while light: < 0
+        assertGt(seg1, int256(0), "segment 1: long pays (long-heavy)");
+        assertLt(seg2, int256(0), "segment 2: long receives (short-heavy)");
+
+        int256 aFund = _fundingAmt(SIZE, seg1 + seg2);
+        assertEq(pm.pendingFunding(alice, BTC, true), aFund, "alice funding nets the two segments");
+
+        // The view and settlement agree: realize on a flat close.
+        uint256 feeA = _expectedFee(SIZE, t1 + t2);
+        _close(pm, alice, BTC, true, ENTRY);
+        assertEq(asset.balanceOf(alice), _flatCloseEnd(aliceStart, COL, feeA, aFund), "realized funding == netted view");
+    }
+
+    // --- 6: funding folded into the close payout -------------------------
+
+    function test_Funding_FoldedIntoClosePayout() public {
+        _fund(pm, alice, COL);
+        _fund(pm, bob, COL_S);
+        uint256 aliceStart = asset.balanceOf(alice);
+        uint256 bobStart = asset.balanceOf(bob);
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY); // long 5000 (payer)
+        _open(pm, bob, BTC, false, COL_S, LEV, ENTRY); // short 1500 (receiver)
+
+        uint256 elapsed = 2 days;
+        vm.warp(block.timestamp + elapsed);
+
+        uint256 feeA = _expectedFee(SIZE, elapsed);
+        uint256 feeB = _expectedFee(SIZE_S, elapsed);
+
+        _close(pm, alice, BTC, true, ENTRY);
+        _close(pm, bob, BTC, false, ENTRY);
+
+        // Payer's payout is strictly BELOW the fee-only baseline; receiver's is
+        // strictly ABOVE it. Funding moved value from the long to the short.
+        assertLt(asset.balanceOf(alice), aliceStart - feeA, "payer payout reduced by funding");
+        assertGt(asset.balanceOf(bob), bobStart - feeB, "receiver payout increased by funding");
+    }
+
+    // --- 7: funding erosion alone triggers liquidatability ---------------
+
+    function test_Funding_ErosionTriggersLiquidation() public {
+        _fund(pm, alice, COL);
+        _fund(pm, bob, COL_S);
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY); // long 5000 (crowded payer)
+        _open(pm, bob, BTC, false, COL_S, LEV, ENTRY); // short 1500
+
+        // After a short interval, accrued funding is small: still healthy.
+        vm.warp(block.timestamp + 1 days);
+        (bool ok1, bytes memory ret1) = _liquidateRaw(pm, liquidator, alice, BTC, true, ENTRY);
+        assertFalse(ok1, "not liquidatable yet (funding still small)");
+        assertEq(bytes4(ret1), PositionManager.NotLiquidatable.selector, "not-liquidatable selector");
+
+        // Let funding bleed the crowded long at a FLAT price until equity breaches
+        // maintenance purely from accrued funding (no price move).
+        vm.warp(block.timestamp + 6 days);
+        _liquidate(pm, liquidator, alice, BTC, true, ENTRY);
+
+        bytes32 key = pm.getPositionKey(alice, BTC, true);
+        (,,,, uint256 sizeUsd,,,) = pm.positions(key);
+        assertEq(sizeUsd, 0, "liquidated by funding erosion alone");
+    }
+
+    // --- 8: funding-driven bad debt --------------------------------------
+
+    function test_Funding_DrivenBadDebt() public {
+        _fund(pm, alice, COL);
+        _fund(pm, bob, COL_S);
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY); // long 5000 (payer)
+        _open(pm, bob, BTC, false, COL_S, LEV, ENTRY); // short 1500
+
+        uint256 elapsed = 7 days;
+        vm.warp(block.timestamp + elapsed);
+
+        uint256 feeA = _expectedFee(SIZE, elapsed);
+        int256 aFund = _fundingAmt(SIZE, _sideCumDelta(SIZE, SIZE_S, elapsed, true));
+        uint256 netOwed = feeA + uint256(aFund);
+        assertGt(netOwed, COL, "funding + fee owed exceeds collateral");
+
+        uint256 poolBefore = asset.balanceOf(address(pool));
+        _liquidate(pm, liquidator, alice, BTC, true, ENTRY); // flat price; funding-driven
+
+        // Pool can only collect the collateral; the excess is uncollectable.
+        assertEq(asset.balanceOf(address(pool)), poolBefore + COL, "toPool capped at collateral");
+        assertEq(asset.balanceOf(liquidator), 0, "no bounty when deeply underwater");
+        assertEq(asset.balanceOf(alice), 0, "no owner refund");
+        assertGt(netOwed - COL, 0, "bad debt is positive");
+    }
+
+    // --- 9: pool pass-through invariant (pool net >= 0) ------------------
+
+    function test_Funding_PoolPassThroughInvariant() public {
+        // A non-divisible skew (5000 vs 1300) forces a strictly positive dust,
+        // which the pool keeps. Sign convention: pendingFunding > 0 means the
+        // trader OWES the pool, < 0 means the pool owes the trader. The pool's
+        // net receivable is therefore the SUM across all positions; "pool net
+        // >= 0" is exactly `sum >= 0`.
+        _fund(pm, alice, COL);
+        _fund(pm, bob, COL_D);
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY); // long 5000 (heavy)
+        _open(pm, bob, BTC, false, COL_D, LEV, ENTRY); // short 1300 (light)
+
+        vm.warp(block.timestamp + 2 days);
+
+        int256 longFunding = pm.pendingFunding(alice, BTC, true);
+        int256 shortFunding = pm.pendingFunding(bob, BTC, false);
+        assertGe(longFunding + shortFunding, int256(0), "pool net >= 0 (dust never leaves the pool)");
+    }
+
+    // --- 10: REGRESSION — single-sided is identical to the funding-free path
+
+    function test_Funding_Regression_SingleSidedIdentical() public {
+        // Profit leg: a single-sided long, aged a year, closes exactly as PR-4a.
+        _fund(pm, alice, COL);
+        uint256 aliceStart = asset.balanceOf(alice);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+        vm.warp(block.timestamp + ONE_YEAR);
+        assertEq(pm.pendingFunding(alice, BTC, true), int256(0), "single-sided long: zero funding");
+
+        uint256 feeA = _expectedFee(SIZE, ONE_YEAR);
+        _close(pm, alice, BTC, true, 66_000); // +500 profit
+        assertEq(asset.balanceOf(alice), aliceStart + 500e18 - feeA, "profit close identical (funding 0)");
+        assertEq(asset.balanceOf(address(pool)), poolBefore - 500e18 + feeA, "pool pays profit net of fee");
+
+        // Loss leg: another single-sided long, aged a year, closes at a loss.
+        _fund(pm, bob, COL);
+        uint256 bobStart = asset.balanceOf(bob);
+        _open(pm, bob, BTC, true, COL, LEV, ENTRY);
+        vm.warp(block.timestamp + ONE_YEAR);
+        assertEq(pm.pendingFunding(bob, BTC, true), int256(0), "single-sided long: zero funding (loss leg)");
+
+        uint256 feeB = _expectedFee(SIZE, ONE_YEAR);
+        _close(pm, bob, BTC, true, 54_000); // -500 loss
+        assertEq(asset.balanceOf(bob), bobStart - 500e18 - feeB, "loss close identical (funding 0)");
+    }
+
+    function test_Funding_Regression_SingleSidedLiquidationIdentical() public {
+        // Identical to test_Liquidate_AtMaintenanceThreshold: one-sided book, no
+        // warp (fee 0, funding 0) -> the PR-5 split is reproduced exactly.
+        _fund(pm, alice, COL);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+
+        _liquidate(pm, liquidator, alice, BTC, true, 49_200); // equity == maintenance
+
+        assertEq(asset.balanceOf(address(pool)), poolBefore + 900e18, "identical toPool (loss only)");
+        assertEq(asset.balanceOf(liquidator), BONUS, "identical liquidator bounty");
+        assertEq(asset.balanceOf(alice), 50e18, "identical owner refund");
     }
 }
 
