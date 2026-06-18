@@ -386,14 +386,57 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      * @param  leverage Leverage multiplier in [MIN_LEVERAGE, MAX_LEVERAGE].
      */
     function openPosition(bytes32 market, bool isLong, uint256 collateral, uint256 leverage) external nonReentrant {
+        // Hoist the param-validation checks ahead of the oracle read so that
+        // typed calls with NO appended payload still surface the same revert they
+        // do today (the oracle read would otherwise revert first on a missing
+        // payload). These checks are pure and idempotent; they re-run inside
+        // {_openPosition}, which holds the open logic verbatim.
         _requireSupportedMarket(market);
         if (collateral < MIN_COLLATERAL) revert CollateralTooLow(collateral, MIN_COLLATERAL);
         if (leverage < MIN_LEVERAGE || leverage > MAX_LEVERAGE) revert LeverageOutOfRange(leverage);
 
-        bytes32 key = _positionKey(msg.sender, market, isLong);
+        uint256 entryPrice = getOracleNumericValueFromTxMsg(market);
+        _openPosition(msg.sender, market, isLong, collateral, leverage, entryPrice, true);
+    }
+
+    /**
+     * @notice Price-parameterized core of {openPosition}. Holds the current open
+     *         logic verbatim, with the inline oracle read replaced by the passed
+     *         `entryPrice` and the collateral pull gated by `pullCollateral`.
+     * @dev    The direct path passes `pullCollateral = true`, so its behavior is
+     *         identical to the pre-refactor inline body and fully covered by the
+     *         existing tests. The `false` branch is the seam for PR-6b's deferred
+     *         executor, where collateral is pre-escrowed at request time; it stays
+     *         in the SAME CEI position (after effects, before the emit).
+     *
+     *         CEI: validate -> reserve & record (state) -> (gated) pull collateral
+     *         (interaction).
+     * @param  owner          Position owner (the trader); used everywhere the
+     *                        direct path uses `msg.sender`.
+     * @param  market         Market feed id (MARKET_BTC or MARKET_ETH).
+     * @param  isLong         True for long, false for short.
+     * @param  collateral     Collateral to post (asset units, >= MIN_COLLATERAL).
+     * @param  leverage       Leverage multiplier in [MIN_LEVERAGE, MAX_LEVERAGE].
+     * @param  entryPrice     Entry mark price (1e8), supplied by the caller.
+     * @param  pullCollateral Whether to pull `collateral` from `owner` (true on
+     *                        the direct path; false when pre-escrowed).
+     */
+    function _openPosition(
+        address owner,
+        bytes32 market,
+        bool isLong,
+        uint256 collateral,
+        uint256 leverage,
+        uint256 entryPrice,
+        bool pullCollateral
+    ) internal {
+        _requireSupportedMarket(market);
+        if (collateral < MIN_COLLATERAL) revert CollateralTooLow(collateral, MIN_COLLATERAL);
+        if (leverage < MIN_LEVERAGE || leverage > MAX_LEVERAGE) revert LeverageOutOfRange(leverage);
+
+        bytes32 key = _positionKey(owner, market, isLong);
         if (positions[key].sizeUsd != 0) revert PositionAlreadyOpen();
 
-        uint256 entryPrice = getOracleNumericValueFromTxMsg(market);
         if (entryPrice == 0) revert InvalidPrice();
 
         uint256 sizeUsd = collateral * leverage;
@@ -413,7 +456,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         _accrueFunding(market);
         int256 entryCumFunding = isLong ? markets[market].longCumFunding : markets[market].shortCumFunding;
         positions[key] = Position({
-            owner: msg.sender,
+            owner: owner,
             market: market,
             isLong: isLong,
             collateral: collateral,
@@ -426,9 +469,9 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         totalReserved += reserve;
 
         // Interaction.
-        asset.safeTransferFrom(msg.sender, address(this), collateral);
+        if (pullCollateral) asset.safeTransferFrom(owner, address(this), collateral);
 
-        emit PositionOpened(msg.sender, market, isLong, collateral, sizeUsd, entryPrice);
+        emit PositionOpened(owner, market, isLong, collateral, sizeUsd, entryPrice);
     }
 
     /**
@@ -457,11 +500,32 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      * @param  isLong Direction of the position to close.
      */
     function closePosition(bytes32 market, bool isLong) external nonReentrant {
-        bytes32 key = _positionKey(msg.sender, market, isLong);
+        uint256 exitPrice = getOracleNumericValueFromTxMsg(market);
+        _closePosition(msg.sender, market, isLong, exitPrice);
+    }
+
+    /**
+     * @notice Price-parameterized core of {closePosition}. Holds the current
+     *         close logic verbatim, with the inline oracle read replaced by the
+     *         passed `exitPrice`.
+     * @dev    The seam for PR-6b's deferred executor, which supplies the price
+     *         relayed on-chain at execution. CEI: compute P&L -> snapshot fee &
+     *         funding & clear book state (effects) -> settle transfers
+     *         (interactions). Returns the trader payout.
+     * @param  owner     Position owner (the trader); used everywhere the direct
+     *                  path uses `msg.sender`.
+     * @param  market    Market feed id.
+     * @param  isLong    Direction of the position to close.
+     * @param  exitPrice Exit mark price (1e8), supplied by the caller.
+     */
+    function _closePosition(address owner, bytes32 market, bool isLong, uint256 exitPrice)
+        internal
+        returns (uint256 payout)
+    {
+        bytes32 key = _positionKey(owner, market, isLong);
         Position memory pos = positions[key];
         if (pos.sizeUsd == 0) revert NoOpenPosition();
 
-        uint256 exitPrice = getOracleNumericValueFromTxMsg(market);
         if (exitPrice == 0) revert InvalidPrice();
 
         (bool profit, uint256 pnl) = _computePnl(pos, exitPrice);
@@ -475,7 +539,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         _realizeClose(pos, key, exitPrice);
 
         // Interactions (kept in a helper to bound this frame's stack).
-        uint256 payout = _settle(pos, profit, pnl, borrowFee, fundingOwed);
+        payout = _settle(pos, profit, pnl, borrowFee, fundingOwed);
 
         emit PositionClosed(pos.owner, market, isLong, exitPrice, profit, pnl, borrowFee, fundingOwed, payout);
     }
