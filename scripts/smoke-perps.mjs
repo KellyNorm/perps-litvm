@@ -1,11 +1,11 @@
-// End-to-end smoke test for the PR-3 perps stack on LitVM (chain 4441).
+// End-to-end smoke test for the PR-3 + PR-4a perps stack on LitVM (chain 4441).
 //
 // Runs one full trade against the deployed contracts:
 //   1. mint + approve mUSD collateral to the PositionManager,
 //   2. open a BTC long (100 mUSD collateral, 2x leverage) with a fresh signed
 //      RedStone price injected into the calldata, and print the entry price,
 //   3. close it with a fresh payload, and print the exit price, realized P&L,
-//      and the trader's payout.
+//      the borrow fee charged, and the trader's payout.
 //
 // Uses RedStone's pull model exactly like scripts/read-price.mjs:
 // `WrapperBuilder.usingDataService` (DataServiceWrapper, from
@@ -47,7 +47,7 @@ const POSITION_MANAGER_ABI = [
   "function openPosition(bytes32 market, bool isLong, uint256 collateral, uint256 leverage)",
   "function closePosition(bytes32 market, bool isLong)",
   "event PositionOpened(address indexed owner, bytes32 indexed market, bool isLong, uint256 collateral, uint256 sizeUsd, uint256 entryPrice)",
-  "event PositionClosed(address indexed owner, bytes32 indexed market, bool isLong, uint256 exitPrice, bool profit, uint256 pnl, uint256 payout)",
+  "event PositionClosed(address indexed owner, bytes32 indexed market, bool isLong, uint256 exitPrice, bool profit, uint256 pnl, uint256 borrowFee, uint256 payout)",
 ];
 
 // Wrap a signer-connected contract so each call carries a fresh RedStone payload.
@@ -139,6 +139,7 @@ async function main() {
 
   console.log(`  exit price:  ${ethers.utils.formatUnits(closed.exitPrice, 8)} USD`);
   console.log(`  realized P&L: ${sign}${pnl} mUSD (${closed.profit ? "profit" : "loss"})`);
+  console.log(`  borrow fee:  ${ethers.utils.formatUnits(closed.borrowFee, 18)} mUSD`);
   console.log(`  payout:      ${ethers.utils.formatUnits(closed.payout, 18)} mUSD`);
   console.log(`  trader balance delta (close - open window): ${ethers.utils.formatUnits(balAfter.sub(balBefore), 18)} mUSD`);
   console.log("");
