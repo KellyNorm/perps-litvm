@@ -30,16 +30,21 @@ Goal: prove the RedStone pull flow works on LitVM before any perps logic exists.
 
 **Acceptance:** test passes; contract deployed to testnet; JS script prints a live BTC price read from the deployed contract.
 
-## PR-2 — Liquidity pool (LP vault)  **[CURRENT]**
+## PR-2 — Liquidity pool (LP vault)  **[DONE]**
 LPs deposit collateral, mint an LP token, withdraw. The pool is the trader counterparty.
 - ERC20 LP token; deposit / withdraw; pool accounting; reentrancy-guarded.
 
 **Acceptance:** deposit/withdraw tested incl. edge cases; pool-share math verified.
 
-## PR-3 — Position management
+## PR-3 — Position management  **[CURRENT]**
 Open/close long & short with leverage; collateral + size accounting; P&L vs the oracle mark price (via PR-1 oracle).
 
 **Acceptance:** open/close tested for long & short, profit & loss, and leverage bounds.
+
+## PR: payload-aware LP pricing
+Close the LP share-price fairness gap left by PR-3. Today `LiquidityPool.totalAssets()` reads a cached aggregate trader mark (`cachedU`) that is refreshed only on position open/close, so an LP depositing/withdrawing mid-move transacts against a slightly stale share price. Add payload-aware LP entry/exit (e.g. `depositWithPrice`/`withdrawWithPrice`) that verify a fresh RedStone price and refresh the mark before pricing shares. This is a fairness fix only — PR-3's reserved-liquidity accounting already guarantees solvency independently of the cache.
+
+**Acceptance:** LP deposit/withdraw price shares against a fresh oracle mark; tested that mid-move LP entry/exit is not mispriced against the cached mark.
 
 ## PR-4 — Fees & funding rate
 Borrow/position fees; periodic funding to balance long/short open interest.
