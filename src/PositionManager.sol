@@ -19,19 +19,33 @@ import {LiquidityPool} from "./LiquidityPool.sol";
  *         (via {MainDemoConsumerBase}) verifies the signer(s) and the package
  *         timestamp before using the value.
  *
- * @dev    SCOPE (PR-3): open/close of one full position per
+ * @dev    SCOPE (PR-3 + PR-4a): open/close of one full position per
  *         (owner, market, direction); P&L settled against the pool; LP-share
- *         valuation via a cached aggregate mark; reserved-liquidity solvency.
+ *         valuation via a cached aggregate mark; reserved-liquidity solvency;
+ *         a time-based borrow fee (PR-4a) charged on notional, accrued O(1) via
+ *         a per-market cumulative index and deducted from payout at close.
  *
  *         OUT OF SCOPE — deferred to later PRs:
- *         - Funding rate & fees (PR-4).
+ *         - Funding rate between longs & shorts (PR-4b, sequenced AFTER PR-5 so
+ *           liquidations can bound a funding payer who outruns its collateral).
  *         - Liquidations AND residual bad debt beyond collateral (PR-5). Here a
- *           loss is floored at the trader's collateral; any deficit past it is
- *           simply not collected — PR-5 owns that path.
+ *           loss — and likewise a borrow fee — is floored at the trader's
+ *           collateral; any deficit past it is simply not collected — PR-5 owns
+ *           that path.
  *         - Two-step deferred execution / front-running protection (PR-6). This
  *           contract reads the price in the SAME transaction as the action.
  *         - Payload-aware LP deposit/withdraw to close the share-price fairness
  *           gap (its own PR; see TASK.md).
+ *
+ *         BORROW FEE (PR-4a): a flat per-second rate on each position's notional
+ *         (`sizeUsd`) compensates LPs for the liquidity the position reserves.
+ *         It is a pure trader -> pool transfer, recognized on close (never
+ *         pre-credited to LP NAV — same conservative stance as unrealized
+ *         losses). Accrual is O(1): a single per-market index accumulates
+ *         `Σ rate·dt`; each position records the index at open; the fee owed is
+ *         `sizeUsd · (indexNow − indexAtOpen)`. Because the rate is constant,
+ *         lazy accrual is exact regardless of gaps between trades, so no keeper
+ *         tick is required.
  *
  *         COLLATERAL CUSTODY: trader collateral is held by THIS contract, never
  *         by the pool, so it is never counted as LP NAV. On close the pool pays
@@ -82,6 +96,17 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
     ///      chosen large enough to preserve precision through integer division.
     uint256 private constant WEIGHT_PRECISION = 1e18;
 
+    /// @dev Fixed-point scale for the borrow-fee index (accumulated
+    ///      `Σ rate·dt`, a dimensionless fraction of notional). 1e18 keeps the
+    ///      per-second rate well above the integer-truncation floor.
+    uint256 private constant FEE_PRECISION = 1e18;
+
+    /// @notice Borrow-fee rate per second, scaled by {FEE_PRECISION}, charged on
+    ///         a position's notional (`sizeUsd`). Conservative starting value:
+    ///         `0.10 / 31_536_000 · 1e18 ≈ 3.17e9`, i.e. ~10%/yr on notional.
+    ///         Flat (utilization-independent) so the index advance is exact.
+    uint256 public constant BORROW_RATE_PER_SECOND = 3_170_979_198;
+
     // --- supported markets (RedStone feed ids) ---------------------------
 
     /// @notice Supported market feed id for BTC.
@@ -108,6 +133,9 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      * @param  collateral Collateral posted, in asset units (18 dp).
      * @param  sizeUsd    Notional size = collateral * leverage (18 dp).
      * @param  entryPrice Entry mark price (1e8).
+     * @param  entryCumBorrowRate Borrow-fee index ({MarketState.cumBorrowRate})
+     *                    snapshotted at open; the fee owed at close is
+     *                    `sizeUsd · (cumBorrowRate − entryCumBorrowRate)`.
      */
     struct Position {
         address owner;
@@ -116,6 +144,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         uint256 collateral;
         uint256 sizeUsd;
         uint256 entryPrice;
+        uint256 entryCumBorrowRate;
     }
 
     /**
@@ -129,6 +158,11 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      * @param  shortWeight  Σ shortSize/shortEntry (scaled).
      * @param  lastMarkPrice Most recent mark for this market (1e8), refreshed on
      *                       every open/close.
+     * @param  cumBorrowRate Cumulative borrow-fee index for this market:
+     *                       `Σ BORROW_RATE_PER_SECOND·dt` scaled by
+     *                       {FEE_PRECISION}. Monotonically non-decreasing.
+     * @param  lastBorrowAccrual Timestamp the index last advanced; 0 until the
+     *                       market's first touch.
      */
     struct MarketState {
         uint256 longSizeUsd;
@@ -136,6 +170,8 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         uint256 shortSizeUsd;
         uint256 shortWeight;
         uint256 lastMarkPrice;
+        uint256 cumBorrowRate;
+        uint256 lastBorrowAccrual;
     }
 
     /// @notice Open positions keyed by keccak256(owner, market, isLong).
@@ -183,6 +219,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         uint256 exitPrice,
         bool profit,
         uint256 pnl,
+        uint256 borrowFee,
         uint256 payout
     );
 
@@ -252,14 +289,17 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
             revert ExceedsUtilization();
         }
 
-        // Effects.
+        // Effects. Accrue the borrow index to now so the position's entry
+        // snapshot excludes fees that accrued before it existed.
+        uint256 entryCumBorrowRate = _accrueBorrow(market);
         positions[key] = Position({
             owner: msg.sender,
             market: market,
             isLong: isLong,
             collateral: collateral,
             sizeUsd: sizeUsd,
-            entryPrice: entryPrice
+            entryPrice: entryPrice,
+            entryCumBorrowRate: entryCumBorrowRate
         });
         _updateMarket(market, isLong, sizeUsd, entryPrice, entryPrice, true);
         totalReserved += reserve;
@@ -282,6 +322,16 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      *         and collateral is returned in full. Loss is capped at collateral
      *         (any deficit beyond it is left for PR-5); the trader receives
      *         collateral - loss and the loss is pushed into the pool.
+     *
+     *         BORROW FEE (PR-4a): the position's accrued borrow fee is then
+     *         deducted from the amount the trader would otherwise receive and
+     *         routed to the pool. With A = the trader's pre-fee proceeds
+     *         (profit: collateral + pnl; loss: collateral - pnl) the fee charged
+     *         is `min(fee, A)`, so payout = A - charged floors at 0 and never
+     *         underflows. If the fee alone exceeds A, the uncollected remainder
+     *         is simply not taken — the same bad-debt seam as a loss past
+     *         collateral, owned by PR-5. Net pool flow combines pnl and the fee
+     *         into a single {payProfit}/{receiveLoss} call (no new pool ABI).
      * @param  market Market feed id.
      * @param  isLong Direction of the position to close.
      */
@@ -294,27 +344,56 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         if (exitPrice == 0) revert InvalidPrice();
 
         (bool profit, uint256 pnl) = _computePnl(pos, exitPrice);
-        uint256 reserve = pos.collateral * MAX_PROFIT_FACTOR;
 
-        // Effects.
+        // Effects. Accrue the borrow index to now and snapshot the fee owed over
+        // this position's lifetime (Ceil rounding favours the pool), then clear
+        // the position's state before any external interaction (CEI).
+        uint256 borrowFee =
+            Math.mulDiv(pos.sizeUsd, _accrueBorrow(market) - pos.entryCumBorrowRate, FEE_PRECISION, Math.Rounding.Ceil);
         delete positions[key];
         _updateMarket(market, isLong, pos.sizeUsd, pos.entryPrice, exitPrice, false);
-        totalReserved -= reserve;
+        totalReserved -= pos.collateral * MAX_PROFIT_FACTOR;
 
-        // Interactions.
-        uint256 payout;
-        if (profit) {
-            payout = pos.collateral + pnl;
-            if (pnl > 0) pool.payProfit(pos.owner, pnl);
+        // Interactions (kept in a helper to bound this frame's stack).
+        uint256 payout = _settle(pos, profit, pnl, borrowFee);
+
+        emit PositionClosed(pos.owner, market, isLong, exitPrice, profit, pnl, borrowFee, payout);
+    }
+
+    /**
+     * @dev Settles a closing position's transfers and returns the trader payout.
+     *      `A` = pre-fee proceeds (profit: collateral + pnl; loss:
+     *      collateral - pnl). The fee is charged as `min(fee, A)` so payout
+     *      `= A - charged` floors at 0 and never underflows; any uncollected
+     *      remainder is left for PR-5. Pool flow is netted into a single
+     *      {payProfit} (pool -> trader) or {receiveLoss} (-> pool) call, with the
+     *      collected fee folded into that net. Called only from {closePosition}
+     *      after all state effects, so it runs under that function's CEI ordering
+     *      and `nonReentrant` guard.
+     */
+    function _settle(Position memory pos, bool profit, uint256 pnl, uint256 borrowFee)
+        internal
+        returns (uint256 payout)
+    {
+        uint256 available = profit ? pos.collateral + pnl : pos.collateral - pnl;
+        uint256 feeCharged = borrowFee > available ? available : borrowFee;
+        payout = available - feeCharged;
+
+        // Net pool flow: pool pays profit, receives loss + the collected fee.
+        uint256 poolOut = profit ? pnl : 0;
+        uint256 poolIn = (profit ? 0 : pnl) + feeCharged;
+
+        if (poolOut > poolIn) {
+            // Pool nets a payment to the trader; full collateral returned by PM.
+            pool.payProfit(pos.owner, poolOut - poolIn);
             asset.safeTransfer(pos.owner, pos.collateral);
         } else {
-            uint256 returned = pos.collateral - pnl; // pnl already capped to collateral
-            payout = returned;
+            // Pool nets an inflow (loss and/or fee); PM funds it from collateral.
+            uint256 toPool = poolIn - poolOut;
+            uint256 returned = pos.collateral - toPool; // toPool <= collateral by construction
             if (returned > 0) asset.safeTransfer(pos.owner, returned);
-            if (pnl > 0) pool.receiveLoss(pnl);
+            if (toPool > 0) pool.receiveLoss(toPool);
         }
-
-        emit PositionClosed(pos.owner, market, isLong, exitPrice, profit, pnl, payout);
     }
 
     // --- views -----------------------------------------------------------
@@ -322,6 +401,25 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
     /// @notice Returns the storage key for a position.
     function getPositionKey(address owner, bytes32 market, bool isLong) external pure returns (bytes32) {
         return _positionKey(owner, market, isLong);
+    }
+
+    /**
+     * @notice Borrow fee a currently-open position would owe if closed at the
+     *         current block time. View-only: projects the market's index forward
+     *         by the elapsed interval without mutating state. Returns 0 if no
+     *         such position is open. Uncapped (does not floor against
+     *         collateral); {closePosition} applies the cap on settlement.
+     */
+    function pendingBorrowFee(address owner, bytes32 market, bool isLong) external view returns (uint256) {
+        Position memory pos = positions[_positionKey(owner, market, isLong)];
+        if (pos.sizeUsd == 0) return 0;
+        MarketState storage m = markets[market];
+        uint256 cum = m.cumBorrowRate;
+        uint256 last = m.lastBorrowAccrual;
+        if (last != 0 && block.timestamp > last) {
+            cum += BORROW_RATE_PER_SECOND * (block.timestamp - last);
+        }
+        return Math.mulDiv(pos.sizeUsd, cum - pos.entryCumBorrowRate, FEE_PRECISION, Math.Rounding.Ceil);
     }
 
     // --- internal: P&L & aggregates --------------------------------------
@@ -413,6 +511,36 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         if (longValue > m.longSizeUsd) unrealized += longValue - m.longSizeUsd;
         uint256 shortValue = Math.mulDiv(price, m.shortWeight, WEIGHT_PRECISION);
         if (m.shortSizeUsd > shortValue) unrealized += m.shortSizeUsd - shortValue;
+    }
+
+    // --- internal: borrow-fee accrual ------------------------------------
+
+    /**
+     * @dev Advances `market`'s borrow-fee index to the current block time and
+     *      returns the up-to-date cumulative value. Because the rate is flat
+     *      (size-independent), the advance `rate · elapsed` is exact for any
+     *      interval, so this lazy accrual is correct with no keeper tick — gaps
+     *      between trades are captured in full on the next touch. The first
+     *      touch only seeds the timestamp (no retroactive accrual).
+     *
+     *      Touches only `cumBorrowRate`/`lastBorrowAccrual`; it never moves
+     *      `totalUnrealizedProfit` or `totalReserved`, so pure time passing
+     *      cannot shift LP NAV or reserved liquidity — the fee is recognized
+     *      only when a close realizes it.
+     */
+    function _accrueBorrow(bytes32 market) internal returns (uint256) {
+        MarketState storage m = markets[market];
+        uint256 last = m.lastBorrowAccrual;
+        if (last == 0) {
+            m.lastBorrowAccrual = block.timestamp;
+            return m.cumBorrowRate;
+        }
+        uint256 elapsed = block.timestamp - last;
+        if (elapsed != 0) {
+            m.cumBorrowRate += BORROW_RATE_PER_SECOND * elapsed;
+            m.lastBorrowAccrual = block.timestamp;
+        }
+        return m.cumBorrowRate;
     }
 
     // --- internal: helpers -----------------------------------------------

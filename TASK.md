@@ -36,7 +36,7 @@ LPs deposit collateral, mint an LP token, withdraw. The pool is the trader count
 
 **Acceptance:** deposit/withdraw tested incl. edge cases; pool-share math verified.
 
-## PR-3 — Position management  **[CURRENT]**
+## PR-3 — Position management  **[DONE]**
 Open/close long & short with leverage; collateral + size accounting; P&L vs the oracle mark price (via PR-1 oracle).
 
 **Acceptance:** open/close tested for long & short, profit & loss, and leverage bounds.
@@ -46,15 +46,42 @@ Close the LP share-price fairness gap left by PR-3. Today `LiquidityPool.totalAs
 
 **Acceptance:** LP deposit/withdraw price shares against a fresh oracle mark; tested that mid-move LP entry/exit is not mispriced against the cached mark.
 
-## PR-4 — Fees & funding rate
-Borrow/position fees; periodic funding to balance long/short open interest.
+## PR-4a — Borrow fee  **[CURRENT]**
+Time-based borrow fee that leveraged positions pay the pool for the LP capital they
+reserve. Accrued O(1) via a single shared cumulative index per market (each position
+stores the index value at open); continuous per-second accrual via the lazily-updated
+index — no keeper ticks. Deducted from the trader's payout at close (trader -> pool).
+No change to the deployed `LiquidityPool` ABI; settles via the existing `payProfit` /
+`receiveLoss` entry points. Conservative flat rate on notional (see plan §6).
 
-**Acceptance:** funding accrual + fee math tested across simulated time.
+Settlement: profit -> payout = collateral + profit - fee (fee to pool); loss -> payout =
+collateral - lossCapped - fee, floored at 0, pool inflow = lossCapped + fee. If the fee
+alone exceeds collateral, payout floors at 0 and the uncollected remainder is left for
+PR-5 (bad-debt seam) with NO revert/underflow. Pure accrual (time passing, no close)
+must not change `totalUnrealizedProfit` or `totalReserved`; pool balance and LP NAV rise
+by exactly the collected fee, only on close.
+
+**Acceptance:** borrow-fee accrual + deduction-at-close math tested across simulated time;
+payout floored at 0 when fee exceeds collateral; accounting invariants hold; existing PR-3
+tests still pass.
 
 ## PR-5 — Liquidations
 Permissionless, bounty-incentivized liquidation of underwater positions, with a tight oracle freshness check.
 
 **Acceptance:** liquidation triggers at correct thresholds; bounty paid; stale-price liquidation rejected.
+
+## PR-4b — Funding rate  **[AFTER PR-5]**
+True peer-to-peer (B1) funding between longs and shorts driven by open-interest imbalance:
+the heavy side pays the light side, routed through the pool as clearing buffer, accrued
+O(1) via signed per-side cumulative indices. Sequenced AFTER PR-5 because a funding payer
+who cannot cover its accrued funding from collateral produces bad debt that only the
+liquidation machinery (PR-5) can bound. The interim "funding-to-pool" (B2) variant is
+explicitly NOT built.
+
+**Acceptance:** funding direction correct under long-heavy and short-heavy books;
+per-step conservation (Σ paid ≈ Σ received, pool residual ≥ 0); rate clamped at the
+configured max; one-sided book accrues no funding; deduction/credit at close tested
+across simulated time.
 
 ## PR-6 — Two-step deferred execution + relayer
 Request/execute split; price relayed on-chain at execution (RedStone X-model pattern); permissionless relay.

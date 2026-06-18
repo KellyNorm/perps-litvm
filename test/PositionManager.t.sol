@@ -253,7 +253,7 @@ contract PositionManagerTest is Test {
         _fund(pm, alice, COL);
         _open(pm, alice, BTC, true, COL, 10, ENTRY); // max leverage
         bytes32 key = pm.getPositionKey(alice, BTC, true);
-        (,,, uint256 collateral, uint256 sizeUsd, uint256 entryPrice) = pm.positions(key);
+        (,,, uint256 collateral, uint256 sizeUsd, uint256 entryPrice,) = pm.positions(key);
         assertEq(collateral, COL, "stored collateral");
         assertEq(sizeUsd, COL * 10, "size = collateral * leverage");
         assertEq(entryPrice, ENTRY * ONE8, "entry price scaled 1e8");
@@ -294,7 +294,7 @@ contract PositionManagerTest is Test {
         _fund(pm, alice, MIN_COLLATERAL);
         _open(pm, alice, BTC, true, MIN_COLLATERAL, 1, ENTRY);
         bytes32 key = pm.getPositionKey(alice, BTC, true);
-        (,,,, uint256 sizeUsd,) = pm.positions(key);
+        (,,,, uint256 sizeUsd,,) = pm.positions(key);
         assertEq(sizeUsd, MIN_COLLATERAL, "min collateral position opened");
     }
 
@@ -516,6 +516,163 @@ contract PositionManagerTest is Test {
         (bool okClose, bytes memory ret) = address(evilPm).call(closeData);
         assertFalse(okClose, "reentrant close must revert");
         assertEq(bytes4(ret), ReentrancyGuard.ReentrancyGuardReentrantCall.selector, "reentrancy selector");
+    }
+
+    // =====================================================================
+    // PR-4a — Borrow fee
+    // =====================================================================
+
+    uint256 internal constant SIZE = COL * LEV; // 5000e18 notional
+    uint256 internal constant FEE_PRECISION = 1e18;
+    uint256 internal constant ONE_YEAR = 31_536_000; // seconds
+
+    /// @dev Mirrors the contract: ceil(size · rate·elapsed / FEE_PRECISION).
+    function _expectedFee(uint256 size, uint256 elapsed) internal view returns (uint256) {
+        uint256 num = size * (pm.BORROW_RATE_PER_SECOND() * elapsed);
+        return (num + FEE_PRECISION - 1) / FEE_PRECISION;
+    }
+
+    // --- accrual over simulated time -------------------------------------
+
+    function test_BorrowFeeAccruesOverTime() public {
+        _fund(pm, alice, COL);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+        uint256 aliceStart = asset.balanceOf(alice);
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+        // No fee right at open.
+        assertEq(pm.pendingBorrowFee(alice, BTC, true), 0, "no fee at open");
+
+        vm.warp(block.timestamp + ONE_YEAR);
+        uint256 fee = _expectedFee(SIZE, ONE_YEAR);
+        assertGt(fee, 0, "fee accrued");
+        assertEq(pm.pendingBorrowFee(alice, BTC, true), fee, "pending fee = size*rate*dt");
+
+        // Close flat (exit == entry): no P&L, only the borrow fee is taken.
+        _close(pm, alice, BTC, true, ENTRY);
+
+        // Trader paid exactly the fee; pool (LPs) received exactly the fee.
+        assertEq(asset.balanceOf(alice), aliceStart - fee, "trader pays borrow fee");
+        assertEq(asset.balanceOf(address(pool)), poolBefore + fee, "pool collects borrow fee");
+        assertEq(pm.totalUnrealizedProfit(), 0, "cachedU clean after close");
+        assertEq(pm.totalReserved(), 0, "reserve released");
+    }
+
+    function test_NoElapsedTime_NoFee() public {
+        _fund(pm, alice, COL);
+        uint256 aliceStart = asset.balanceOf(alice);
+
+        // Open and close in the same block: a +500 profit, zero fee.
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+        _close(pm, alice, BTC, true, 66_000);
+
+        // Exactly the PR-3 result — fee must not perturb same-block settlement.
+        assertEq(asset.balanceOf(alice), aliceStart + 500e18, "no fee when no time elapses");
+    }
+
+    // --- deduction at close: profit & loss -------------------------------
+
+    function test_BorrowFeeDeductedFromProfit() public {
+        _fund(pm, alice, COL);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+        uint256 aliceStart = asset.balanceOf(alice);
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+        vm.warp(block.timestamp + ONE_YEAR);
+        uint256 fee = _expectedFee(SIZE, ONE_YEAR);
+
+        _close(pm, alice, BTC, true, 66_000); // +500 pnl, well under the fee-vs-available cap
+
+        // payout = collateral + pnl - fee; pool nets pnl - fee out.
+        assertEq(asset.balanceOf(alice), aliceStart + 500e18 - fee, "payout = collateral + profit - fee");
+        assertEq(asset.balanceOf(address(pool)), poolBefore - 500e18 + fee, "pool pays profit net of fee");
+    }
+
+    function test_BorrowFeeDeductedFromLoss() public {
+        _fund(pm, alice, COL);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+        uint256 aliceStart = asset.balanceOf(alice);
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+        vm.warp(block.timestamp + ONE_YEAR);
+        uint256 fee = _expectedFee(SIZE, ONE_YEAR);
+
+        _close(pm, alice, BTC, true, 54_000); // -500 pnl (loss capped well under collateral)
+
+        // payout = collateral - lossCapped - fee; pool inflow = lossCapped + fee.
+        assertEq(asset.balanceOf(alice), aliceStart - 500e18 - fee, "payout = collateral - loss - fee");
+        assertEq(asset.balanceOf(address(pool)), poolBefore + 500e18 + fee, "pool inflow = loss + fee");
+    }
+
+    // --- fee exceeds collateral: payout floors at 0, remainder uncollected
+
+    function test_BorrowFeeCappedSoPayoutNeverNegative() public {
+        _fund(pm, alice, COL);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+        uint256 aliceStart = asset.balanceOf(alice);
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+        // Long enough that the uncapped fee exceeds the whole collateral.
+        vm.warp(block.timestamp + 4 * ONE_YEAR);
+        uint256 rawFee = pm.pendingBorrowFee(alice, BTC, true);
+        assertGt(rawFee, COL, "uncapped fee exceeds collateral");
+
+        // Close flat: available = collateral, fee charged is capped to it.
+        _close(pm, alice, BTC, true, ENTRY);
+
+        // Payout floors at 0 (no revert/underflow); only collateral is collected.
+        assertEq(asset.balanceOf(alice), aliceStart - COL, "payout floored at 0");
+        assertEq(
+            asset.balanceOf(address(pool)),
+            poolBefore + COL,
+            "pool collects only collateral; remainder uncollected (PR-5)"
+        );
+    }
+
+    // --- O(1) shared index: fees scale with size -------------------------
+
+    function test_BorrowFeeProportionalToSizeViaSharedIndex() public {
+        // Alice size 5000e18, Bob size 10000e18, same market, same interval.
+        _fund(pm, alice, COL);
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+        _fund(pm, bob, COL * 2);
+        _open(pm, bob, BTC, true, COL * 2, LEV, ENTRY); // size 10000e18
+
+        vm.warp(block.timestamp + ONE_YEAR);
+
+        uint256 aliceFee = pm.pendingBorrowFee(alice, BTC, true);
+        uint256 bobFee = pm.pendingBorrowFee(bob, BTC, true);
+
+        assertEq(aliceFee, _expectedFee(SIZE, ONE_YEAR), "alice fee from shared index");
+        assertEq(bobFee, _expectedFee(SIZE * 2, ONE_YEAR), "bob fee from shared index");
+        assertEq(bobFee, aliceFee * 2, "fee scales linearly with notional, one shared index");
+    }
+
+    // --- pure accrual must not move LP accounting; only close realizes ---
+
+    function test_PureAccrualDoesNotChangeNavOrReserved() public {
+        _fund(pm, alice, COL);
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+
+        uint256 reservedBefore = pm.totalReserved();
+        uint256 cachedUBefore = pm.totalUnrealizedProfit();
+        uint256 navBefore = pool.totalAssets();
+        uint256 poolBalBefore = asset.balanceOf(address(pool));
+
+        // Time passes with no open/close.
+        vm.warp(block.timestamp + ONE_YEAR);
+
+        // Accounting is untouched until a close realizes the fee.
+        assertEq(pm.totalReserved(), reservedBefore, "reserved unchanged by pure accrual");
+        assertEq(pm.totalUnrealizedProfit(), cachedUBefore, "cachedU unchanged by pure accrual");
+        assertEq(pool.totalAssets(), navBefore, "NAV unchanged by pure accrual");
+        assertEq(asset.balanceOf(address(pool)), poolBalBefore, "pool balance unchanged by pure accrual");
+
+        // Realize on close (flat price): pool balance and NAV rise by the fee.
+        uint256 fee = _expectedFee(SIZE, ONE_YEAR);
+        _close(pm, alice, BTC, true, ENTRY);
+        assertEq(asset.balanceOf(address(pool)), poolBalBefore + fee, "pool balance rises by fee at close");
+        assertEq(pool.totalAssets(), navBefore + fee, "LP NAV rises by exactly the collected fee");
     }
 }
 
