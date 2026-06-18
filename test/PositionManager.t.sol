@@ -674,6 +674,281 @@ contract PositionManagerTest is Test {
         assertEq(asset.balanceOf(address(pool)), poolBalBefore + fee, "pool balance rises by fee at close");
         assertEq(pool.totalAssets(), navBefore + fee, "LP NAV rises by exactly the collected fee");
     }
+
+    // =====================================================================
+    // PR-5 — Liquidations
+    // =====================================================================
+
+    address internal liquidator = makeAddr("liquidator");
+
+    // Mirrors of the manager's PR-5 risk params for assertions.
+    uint256 internal constant MAINTENANCE_MARGIN_BPS = 1_000; // 10%
+    uint256 internal constant LIQUIDATION_FEE_BPS = 500; // 5%
+    uint256 internal constant BPS_DENOMINATOR = 10_000;
+    uint256 internal constant MAINTENANCE = (COL * MAINTENANCE_MARGIN_BPS) / BPS_DENOMINATOR; // 100e18
+    uint256 internal constant BONUS = (COL * LIQUIDATION_FEE_BPS) / BPS_DENOMINATOR; // 50e18
+
+    // --- liquidation helpers ---------------------------------------------
+
+    function _liquidate(PositionManager p, address caller, address owner, bytes32 market, bool isLong, uint256 price)
+        internal
+    {
+        (bool ok,) = _liquidateRaw(p, caller, owner, market, isLong, price);
+        require(ok, "liquidate failed");
+    }
+
+    function _liquidateRaw(PositionManager p, address caller, address owner, bytes32 market, bool isLong, uint256 price)
+        internal
+        returns (bool ok, bytes memory ret)
+    {
+        bytes memory payload = _payload(block.timestamp * 1000, market, price);
+        bytes memory data = abi.encodePacked(
+            abi.encodeWithSelector(PositionManager.liquidate.selector, owner, market, isLong), payload
+        );
+        vm.prank(caller);
+        (ok, ret) = address(p).call(data);
+    }
+
+    // --- 1 & 2: healthy / profitable positions are NOT liquidatable -------
+
+    function test_Liquidate_RevertWhen_HealthyPositionSmallLoss() public {
+        _fund(pm, alice, COL);
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+
+        // exit 58800: -2% on 5x = -100 pnl -> equity 900, well above maintenance 100.
+        (bool ok, bytes memory ret) = _liquidateRaw(pm, liquidator, alice, BTC, true, 58_800);
+        assertFalse(ok, "healthy position must not be liquidatable");
+        assertEq(bytes4(ret), PositionManager.NotLiquidatable.selector, "not-liquidatable selector");
+    }
+
+    function test_Liquidate_RevertWhen_Profitable() public {
+        _fund(pm, alice, COL);
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+
+        // exit 66000: +500 profit -> equity 1500, far above maintenance.
+        (bool ok, bytes memory ret) = _liquidateRaw(pm, liquidator, alice, BTC, true, 66_000);
+        assertFalse(ok, "profitable position must not be liquidatable");
+        assertEq(bytes4(ret), PositionManager.NotLiquidatable.selector, "not-liquidatable selector");
+    }
+
+    // --- 3: equity exactly at maintenance -> liquidatable -----------------
+
+    function test_Liquidate_AtMaintenanceThreshold() public {
+        _fund(pm, alice, COL);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+
+        // exit 49200: -18% on 5x = -900 loss -> equity = 1000 - 900 = 100 == maintenance.
+        // equity > maintenance is the revert condition, so == is liquidatable.
+        _liquidate(pm, liquidator, alice, BTC, true, 49_200);
+
+        uint256 loss = 900e18; // raw pnl
+        uint256 toPool = loss; // net owed = pnl + fee(0)
+        uint256 remaining = COL - toPool; // 100e18
+        uint256 expectBonus = BONUS; // min(50, 100) = 50
+        uint256 expectRefund = remaining - expectBonus; // 50e18
+
+        assertEq(toPool, 900e18, "toPool = loss");
+        assertEq(toPool + expectBonus + expectRefund, COL, "conservation: split sums to collateral");
+        assertEq(asset.balanceOf(address(pool)), poolBefore + toPool, "pool balance += toPool");
+        assertEq(asset.balanceOf(liquidator), expectBonus, "liquidator received bounty");
+        assertEq(asset.balanceOf(alice), expectRefund, "owner received refund");
+        // badDebt == 0 here; position fully cleared.
+        assertEq(pm.totalReserved(), 0, "reserve released");
+        assertEq(pm.totalUnrealizedProfit(), 0, "cachedU clean");
+        bytes32 key = pm.getPositionKey(alice, BTC, true);
+        (,,,, uint256 sizeUsd,,) = pm.positions(key);
+        assertEq(sizeUsd, 0, "position deleted");
+    }
+
+    // --- 4: loss between maintenance and full collateral ------------------
+
+    function test_Liquidate_LossBetweenMaintenanceAndCollateral() public {
+        _fund(pm, alice, COL);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+
+        // exit 48600: -19% on 5x = -950 loss -> equity = 50 (< maintenance 100, > 0).
+        _liquidate(pm, liquidator, alice, BTC, true, 48_600);
+
+        uint256 toPool = 950e18;
+        uint256 remaining = COL - toPool; // 50e18
+        uint256 expectBonus = remaining < BONUS ? remaining : BONUS; // min(50,50)=50
+        uint256 expectRefund = remaining - expectBonus; // 0
+
+        assertEq(toPool, 950e18, "toPool = loss");
+        assertEq(expectBonus, 50e18, "bonus capped by remaining");
+        assertEq(expectRefund, 0, "no refund left for owner");
+        assertEq(toPool + expectBonus + expectRefund, COL, "conservation: split sums to collateral");
+        assertEq(asset.balanceOf(address(pool)), poolBefore + toPool, "pool balance += toPool");
+        assertEq(asset.balanceOf(liquidator), expectBonus, "liquidator received bounty");
+        assertEq(asset.balanceOf(alice), expectRefund, "owner refund == 0");
+    }
+
+    // --- 5: deeply underwater -> bad debt, no underflow -------------------
+
+    function test_Liquidate_DeeplyUnderwater_BadDebt() public {
+        _fund(pm, alice, COL);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+
+        // exit 40000: -33% on 5x = -1666.67 raw loss > collateral.
+        _liquidate(pm, liquidator, alice, BTC, true, 40_000);
+
+        // Raw uncapped loss = 5000 * 20000/60000 (Ceil).
+        uint256 rawLoss = (SIZE * 20_000 + (60_000 - 1)) / 60_000; // ceil(5000e18 * 20000/60000)
+        uint256 netOwed = rawLoss; // fee 0
+        assertGt(netOwed, COL, "net owed exceeds collateral");
+
+        uint256 expectBadDebt = netOwed - COL;
+        assertEq(asset.balanceOf(address(pool)), poolBefore + COL, "pool collects only collateral");
+        assertEq(asset.balanceOf(liquidator), 0, "no bounty when nothing remains");
+        assertEq(asset.balanceOf(alice), 0, "no refund when underwater");
+        assertGt(expectBadDebt, 0, "bad debt is positive");
+        assertEq(pm.totalReserved(), 0, "reserve still released");
+    }
+
+    // --- 6: fee-dominated but price-profitable -> net path, no payProfit --
+
+    function test_Liquidate_FeeDominatedProfitablePrice() public {
+        // High leverage so the borrow fee on notional can swamp a small price gain.
+        _fund(pm, alice, COL);
+        _open(pm, alice, BTC, true, COL, 10, ENTRY); // size 10000e18
+        uint256 size = COL * 10;
+        uint256 poolBefore = asset.balanceOf(address(pool));
+
+        // Age the position ~1.05y so the fee exceeds collateral + the small profit.
+        uint256 elapsed = (ONE_YEAR * 105) / 100;
+        vm.warp(block.timestamp + elapsed);
+        uint256 fee = _expectedFee(size, elapsed);
+
+        // exit 60600: +1% on 10x -> +100 raw profit (floored), swamped by the fee.
+        uint256 pnl = (size * 600) / 60_000; // 100e18, floor
+        // Liquidatable: equity = COL + pnl - fee <= maintenance, i.e. fee >= COL + pnl - MAINTENANCE.
+        assertGe(fee, COL + pnl - MAINTENANCE, "fee dominates: equity at/under maintenance");
+        assertGe(fee, pnl, "fee >= pnl so the net path cannot underflow");
+        assertLt(fee - pnl, COL, "net owed under collateral: bonus/refund are exercised");
+
+        _liquidate(pm, liquidator, alice, BTC, true, 60_600);
+
+        // Net owed to pool = fee - pnl (profit branch). Settled purely as an inflow.
+        uint256 netOwed = fee - pnl;
+        uint256 toPool = netOwed > COL ? COL : netOwed;
+        uint256 remaining = COL - toPool;
+        uint256 expectBonus = remaining < BONUS ? remaining : BONUS;
+        uint256 expectRefund = remaining - expectBonus;
+
+        assertEq(toPool + expectBonus + expectRefund, COL, "conservation holds on the net path");
+        // Pool only ever receives (no payProfit): balance rises by exactly toPool.
+        assertEq(asset.balanceOf(address(pool)), poolBefore + toPool, "pool received toPool, never paid profit");
+        assertEq(asset.balanceOf(liquidator), expectBonus, "liquidator bounty");
+        assertEq(asset.balanceOf(alice), expectRefund, "owner refund");
+    }
+
+    // --- 7: aggregate release matches a normal close (no leak) ------------
+
+    function test_Liquidate_AggregateReleaseMatchesClose() public {
+        // System A: liquidate alice while bob stays open.
+        (LiquidityPool poolA, PositionManagerHarness mA) = _newSystem(LP_LIQUIDITY);
+        _fund(mA, alice, COL);
+        _open(mA, alice, BTC, true, COL, LEV, ENTRY);
+        _fund(mA, bob, COL);
+        _open(mA, bob, BTC, true, COL, LEV, ENTRY); // healthy, stays open
+        _liquidate(mA, liquidator, alice, BTC, true, 49_200);
+
+        // System B: alice closes normally at the same price while bob stays open.
+        (LiquidityPool poolB, PositionManagerHarness mB) = _newSystem(LP_LIQUIDITY);
+        _fund(mB, alice, COL);
+        _open(mB, alice, BTC, true, COL, LEV, ENTRY);
+        _fund(mB, bob, COL);
+        _open(mB, bob, BTC, true, COL, LEV, ENTRY);
+        _close(mB, alice, BTC, true, 49_200);
+
+        // The residual book must be identical between liquidation and close.
+        assertEq(mA.totalReserved(), mB.totalReserved(), "totalReserved matches close");
+        assertEq(mA.totalUnrealizedProfit(), mB.totalUnrealizedProfit(), "cachedU matches close");
+
+        (uint256 lSizeA, uint256 lWeightA, uint256 sSizeA, uint256 sWeightA, uint256 markA,,) = mA.markets(BTC);
+        (uint256 lSizeB, uint256 lWeightB, uint256 sSizeB, uint256 sWeightB, uint256 markB,,) = mB.markets(BTC);
+        assertEq(lSizeA, lSizeB, "longSizeUsd matches");
+        assertEq(lWeightA, lWeightB, "longWeight matches");
+        assertEq(sSizeA, sSizeB, "shortSizeUsd matches");
+        assertEq(sWeightA, sWeightB, "shortWeight matches");
+        assertEq(markA, markB, "lastMarkPrice matches");
+        // Bob's single long survives in both books.
+        assertEq(lSizeA, SIZE, "only bob's notional remains");
+        poolA; // silence unused warnings
+        poolB;
+    }
+
+    // --- 8: REGRESSION — closePosition unchanged after the refactor -------
+
+    function test_Regression_CloseProfitUnchanged() public {
+        _fund(pm, alice, COL);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+        uint256 aliceStart = asset.balanceOf(alice);
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+
+        // Same-block close at +10%: profit 500, fee 0, payout = collateral + 500.
+        vm.expectEmit(true, true, false, true, address(pm));
+        emit PositionManager.PositionClosed(alice, BTC, true, 66_000 * ONE8, true, 500e18, 0, COL + 500e18);
+        _close(pm, alice, BTC, true, 66_000);
+
+        assertEq(asset.balanceOf(alice), aliceStart + 500e18, "profit payout unchanged");
+        assertEq(asset.balanceOf(address(pool)), poolBefore - 500e18, "pool pays profit unchanged");
+    }
+
+    function test_Regression_CloseLossUnchanged() public {
+        _fund(pm, alice, COL);
+        uint256 poolBefore = asset.balanceOf(address(pool));
+        uint256 aliceStart = asset.balanceOf(alice);
+
+        _open(pm, alice, BTC, true, COL, LEV, ENTRY);
+
+        // Same-block close at -10%: loss 500, fee 0, payout = collateral - 500.
+        vm.expectEmit(true, true, false, true, address(pm));
+        emit PositionManager.PositionClosed(alice, BTC, true, 54_000 * ONE8, false, 500e18, 0, COL - 500e18);
+        _close(pm, alice, BTC, true, 54_000);
+
+        assertEq(asset.balanceOf(alice), aliceStart - 500e18, "loss payout unchanged");
+        assertEq(asset.balanceOf(address(pool)), poolBefore + 500e18, "pool gains loss unchanged");
+    }
+
+    // --- 9: liquidate carries the reentrancy guard ------------------------
+
+    function test_Liquidate_ReentrancyBlocked() public {
+        ReenterLiquidateToken evil = new ReenterLiquidateToken();
+        LiquidityPool evilPool = new LiquidityPool(IERC20(address(evil)), "Evil LP", "eLP");
+        PositionManagerHarness evilPm = new PositionManagerHarness(evilPool);
+        evilPool.setPositionManager(address(evilPm));
+
+        evil.mint(address(this), LP_LIQUIDITY);
+        evil.approve(address(evilPool), LP_LIQUIDITY);
+        evilPool.deposit(LP_LIQUIDITY, lp);
+
+        // Alice opens a long that will be liquidatable at the exit price below.
+        evil.mint(alice, COL);
+        vm.prank(alice);
+        evil.approve(address(evilPm), COL);
+        {
+            bytes memory payload = _payload(block.timestamp * 1000, BTC, ENTRY);
+            bytes memory data = abi.encodePacked(
+                abi.encodeWithSelector(PositionManager.openPosition.selector, BTC, true, COL, LEV), payload
+            );
+            vm.prank(alice);
+            (bool ok,) = address(evilPm).call(data);
+            require(ok, "evil open failed");
+        }
+
+        // Arm the token to re-enter liquidate during the bounty/refund transfer.
+        evil.arm(evilPm, alice, BTC, true);
+
+        // exit 49200 -> liquidatable; the bounty transfer triggers the reentry.
+        (bool okLiq, bytes memory ret) = _liquidateRaw(evilPm, liquidator, alice, BTC, true, 49_200);
+        assertFalse(okLiq, "reentrant liquidate must revert");
+        assertEq(bytes4(ret), ReentrancyGuard.ReentrancyGuardReentrantCall.selector, "reentrancy selector");
+    }
 }
 
 /**
@@ -705,6 +980,42 @@ contract EvilToken is ERC20 {
             armed = false;
             // Re-enter; the manager's guard is active and must revert.
             pm.closePosition(market, isLong);
+        }
+        return super.transfer(to, amount);
+    }
+}
+
+/**
+ * @dev Malicious ERC20 that re-enters {PositionManager.liquidate} on its next
+ *      `transfer` (the manager's bounty/refund payout during a liquidation).
+ *      The `nonReentrant` guard must trip and revert the whole liquidation.
+ */
+contract ReenterLiquidateToken is ERC20 {
+    PositionManager internal pm;
+    address internal owner;
+    bytes32 internal market;
+    bool internal isLong;
+    bool internal armed;
+
+    constructor() ERC20("EvilLiq", "ELQ") {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function arm(PositionManager pm_, address owner_, bytes32 market_, bool isLong_) external {
+        pm = pm_;
+        owner = owner_;
+        market = market_;
+        isLong = isLong_;
+        armed = true;
+    }
+
+    function transfer(address to, uint256 amount) public override returns (bool) {
+        if (armed) {
+            armed = false;
+            // Re-enter; the guard runs before the oracle read and must revert.
+            pm.liquidate(owner, market, isLong);
         }
         return super.transfer(to, amount);
     }

@@ -65,7 +65,7 @@ by exactly the collected fee, only on close.
 payout floored at 0 when fee exceeds collateral; accounting invariants hold; existing PR-3
 tests still pass.
 
-## PR-5 — Liquidations
+## PR-5 — Liquidations  **[DONE]**
 Permissionless, bounty-incentivized liquidation of underwater positions, with a tight oracle freshness check.
 
 **Acceptance:** liquidation triggers at correct thresholds; bounty paid; stale-price liquidation rejected.
@@ -94,6 +94,9 @@ Next.js + shadcn on Cloudflare Pages; wallet connect; open/close UI; `DataServic
 **Acceptance:** an end-to-end trade completed from the UI on testnet.
 
 ---
+
+## Future refinements
+- Liquidator bonus is drawn only from the collateral buffer — full at the maintenance threshold, decaying to 0 below ~5% equity and 0 in the bad-debt case. For mainnet consider a protocol-funded liquidation incentive or a reserved slice of the buffer so late liquidations stay profitable.
 
 ## Backlog (post-MVP, deliberate PRs later)
 - Multi-asset markets (additional feeds).

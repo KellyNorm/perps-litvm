@@ -11,27 +11,27 @@ import {LiquidityPool} from "./LiquidityPool.sol";
 
 /**
  * @title PositionManager
- * @notice Perpetual position engine (PR-3) for the GMX-style perps DEX. Traders
+ * @notice Perpetual position engine for the GMX-style perps DEX. Traders
  *         open and close leveraged long/short positions against the
  *         {LiquidityPool}, which is the sole counterparty. Entry and exit marks
  *         come from the RedStone Pull-Model oracle: the caller appends a fresh
+
  *         signed price payload to the transaction calldata, and this contract
  *         (via {MainDemoConsumerBase}) verifies the signer(s) and the package
  *         timestamp before using the value.
  *
- * @dev    SCOPE (PR-3 + PR-4a): open/close of one full position per
+ * @dev    SCOPE (PR-3 + PR-4a + PR-5): open/close of one full position per
  *         (owner, market, direction); P&L settled against the pool; LP-share
  *         valuation via a cached aggregate mark; reserved-liquidity solvency;
  *         a time-based borrow fee (PR-4a) charged on notional, accrued O(1) via
- *         a per-market cumulative index and deducted from payout at close.
+ *         a per-market cumulative index and deducted from payout at close;
+ *         permissionless liquidation (PR-5) of positions that breach the
+ *         maintenance margin, with residual bad-debt accounting when a loss
+ *         (plus accrued fee) exceeds the trader's collateral.
  *
  *         OUT OF SCOPE — deferred to later PRs:
  *         - Funding rate between longs & shorts (PR-4b, sequenced AFTER PR-5 so
  *           liquidations can bound a funding payer who outruns its collateral).
- *         - Liquidations AND residual bad debt beyond collateral (PR-5). Here a
- *           loss — and likewise a borrow fee — is floored at the trader's
- *           collateral; any deficit past it is simply not collected — PR-5 owns
- *           that path.
  *         - Two-step deferred execution / front-running protection (PR-6). This
  *           contract reads the price in the SAME transaction as the action.
  *         - Payload-aware LP deposit/withdraw to close the share-price fairness
@@ -46,6 +46,15 @@ import {LiquidityPool} from "./LiquidityPool.sol";
  *         `sizeUsd · (indexNow − indexAtOpen)`. Because the rate is constant,
  *         lazy accrual is exact regardless of gaps between trades, so no keeper
  *         tick is required.
+ *
+ *         LIQUIDATION (PR-5): anyone may liquidate a position whose remaining
+ *         equity (collateral + P&L − accrued fee) has fallen to or below the
+ *         maintenance margin, priced against a fresh signed oracle mark. The
+ *         liquidator earns a bonus drawn from the position's collateral buffer
+ *         and the pool absorbs the trader's loss; if the loss exceeds collateral
+ *         the shortfall is recognized as residual bad debt rather than reverting,
+ *         keeping the engine solvent under gap moves. As with the borrow fee this
+ *         is a pure settlement against the pool — no value is pre-credited.
  *
  *         COLLATERAL CUSTODY: trader collateral is held by THIS contract, never
  *         by the pool, so it is never counted as LP NAV. On close the pool pays
@@ -78,6 +87,19 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
     ///         payout from the pool can never exceed MAX_PROFIT_FACTOR *
     ///         collateral, which bounds the reserved liquidity required on open.
     uint256 public constant MAX_PROFIT_FACTOR = 5;
+
+    /// @notice Maintenance-margin threshold (basis points of collateral). A
+    ///         position is liquidatable once its remaining equity — collateral
+    ///         net of uncapped P&L and the accrued borrow fee — falls to at most
+    ///         this fraction of its posted collateral (10%).
+    uint256 public constant MAINTENANCE_MARGIN_BPS = 1_000;
+
+    /// @notice Liquidator bounty (basis points of collateral) paid from the
+    ///         liquidated position's collateral (5%). Kept <= the maintenance
+    ///         margin so the bounty always fits inside the residual buffer left
+    ///         above the pool's net claim for a position liquidated exactly at
+    ///         the threshold.
+    uint256 public constant LIQUIDATION_FEE_BPS = 500;
 
     /// @notice Maximum fraction (in basis points) of the pool's balance that may
     ///         be reserved against open positions. Leaves a buffer of free LP
@@ -200,6 +222,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
     error ExceedsUtilization();
     error PriceTooStale(uint256 priceTimestampSeconds, uint256 blockTimestamp);
     error PriceFromFuture(uint256 priceTimestampSeconds, uint256 blockTimestamp);
+    error NotLiquidatable(uint256 equity, uint256 maintenance);
 
     // --- events ----------------------------------------------------------
 
@@ -221,6 +244,33 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         uint256 pnl,
         uint256 borrowFee,
         uint256 payout
+    );
+
+    /**
+     * @notice Emitted when a position is liquidated.
+     * @param  pnl Raw, UNCAPPED P&L magnitude at the liquidation mark (the value
+     *         the equity check used), not the close-path capped figure.
+     * @param  toPool Net amount routed into the pool (loss + fee, capped at
+     *         collateral).
+     * @param  liquidatorBonus Bounty paid to `liquidator` from the residual.
+     * @param  ownerRefund Collateral dust returned to `owner` after the pool
+     *         claim and the bounty.
+     * @param  badDebt Net owed beyond the position's collateral that the pool
+     *         could not collect (0 unless deeply underwater).
+     */
+    event PositionLiquidated(
+        address indexed owner,
+        bytes32 indexed market,
+        bool isLong,
+        uint256 exitPrice,
+        bool profit,
+        uint256 pnl,
+        uint256 borrowFee,
+        uint256 toPool,
+        uint256 liquidatorBonus,
+        uint256 ownerRefund,
+        uint256 badDebt,
+        address indexed liquidator
     );
 
     /**
@@ -346,13 +396,10 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         (bool profit, uint256 pnl) = _computePnl(pos, exitPrice);
 
         // Effects. Accrue the borrow index to now and snapshot the fee owed over
-        // this position's lifetime (Ceil rounding favours the pool), then clear
-        // the position's state before any external interaction (CEI).
-        uint256 borrowFee =
-            Math.mulDiv(pos.sizeUsd, _accrueBorrow(market) - pos.entryCumBorrowRate, FEE_PRECISION, Math.Rounding.Ceil);
-        delete positions[key];
-        _updateMarket(market, isLong, pos.sizeUsd, pos.entryPrice, exitPrice, false);
-        totalReserved -= pos.collateral * MAX_PROFIT_FACTOR;
+        // this position's lifetime (Ceil favours the pool), then clear the
+        // position's book state before any external interaction (CEI).
+        uint256 borrowFee = _accrueFee(pos);
+        _realizeClose(pos, key, exitPrice);
 
         // Interactions (kept in a helper to bound this frame's stack).
         uint256 payout = _settle(pos, profit, pnl, borrowFee);
@@ -396,6 +443,111 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         }
     }
 
+    /**
+     * @notice Permissionlessly liquidate an underwater position. ANYONE may
+     *         call; the caller MUST append a fresh signed RedStone payload for
+     *         `market` and is paid a bounty out of the position's collateral.
+     * @dev    A position is liquidatable once its equity — collateral adjusted by
+     *         the UNCAPPED P&L at the fresh mark and the accrued borrow fee —
+     *         falls to at most {MAINTENANCE_MARGIN_BPS} of collateral. The
+     *         uncapped P&L is used here (not the close-path capped figure) so the
+     *         trigger reflects true solvency: a loss past collateral must still
+     *         liquidate. By construction the position is underwater, so the pool
+     *         only ever RECEIVES at settlement — {LiquidityPool.payProfit} is
+     *         never called on this path.
+     *
+     *         Settlement splits the collateral three ways with exact
+     *         conservation (`toPool + liquidatorBonus + ownerRefund == collateral`):
+     *           - `toPool`          = min(net owed to pool, collateral),
+     *           - `liquidatorBonus` = min({LIQUIDATION_FEE_BPS} of collateral,
+     *                                     collateral - toPool),
+     *           - `ownerRefund`     = the remainder.
+     *         Any net owed beyond collateral is uncollectable `badDebt` (emitted,
+     *         not collected) — the residual bad-debt seam this PR owns.
+     *
+     *         CEI: read & validate price -> compute uncapped P&L + fee -> equity
+     *         check -> delete & release book state -> settle transfers.
+     *         `nonReentrant`; all effects precede all interactions.
+     * @param  owner  Owner of the position to liquidate.
+     * @param  market Market feed id.
+     * @param  isLong Direction of the position.
+     */
+    function liquidate(address owner, bytes32 market, bool isLong) external nonReentrant {
+        bytes32 key = _positionKey(owner, market, isLong);
+        Position memory pos = positions[key];
+        if (pos.sizeUsd == 0) revert NoOpenPosition();
+
+        uint256 exitPrice = getOracleNumericValueFromTxMsg(market);
+        if (exitPrice == 0) revert InvalidPrice();
+
+        // Uncapped P&L: solvency must see the true deficit, including any loss
+        // beyond collateral that the close path would have floored.
+        (bool profit, uint256 pnl) = _computeRawPnl(pos, exitPrice);
+
+        // Accrue the borrow index to now and snapshot this position's fee
+        // (exactly one _accrueBorrow call, as on the close path).
+        uint256 borrowFee = _accrueFee(pos);
+
+        // Equity check (everything favours the pool / against the trader).
+        uint256 maintenance = Math.mulDiv(pos.collateral, MAINTENANCE_MARGIN_BPS, BPS_DENOMINATOR);
+        uint256 equity;
+        if (profit) {
+            uint256 gross = pos.collateral + pnl;
+            equity = gross > borrowFee ? gross - borrowFee : 0;
+        } else {
+            uint256 debit = pnl + borrowFee;
+            equity = pos.collateral > debit ? pos.collateral - debit : 0;
+        }
+        if (equity > maintenance) revert NotLiquidatable(equity, maintenance);
+
+        // Effects: clear book state and release reserves (CEI).
+        _realizeClose(pos, key, exitPrice);
+
+        // Settlement + interactions + event in a helper to bound this frame's stack.
+        _settleLiquidation(pos, exitPrice, profit, pnl, borrowFee);
+    }
+
+    /**
+     * @dev Settles a liquidation: splits the position's collateral into the
+     *      pool's net claim, the liquidator's bounty, and any owner refund, then
+     *      performs the transfers (interactions only — all state effects ran in
+     *      {liquidate} before this call) and emits {PositionLiquidated}. The
+     *      position is underwater by construction, so the pool only RECEIVES;
+     *      {LiquidityPool.payProfit} is never called. In the profit branch the
+     *      equity test in {liquidate} guarantees `borrowFee >= pnl`, so
+     *      `borrowFee - pnl` cannot underflow. Conservation holds exactly:
+     *      `toPool + liquidatorBonus + ownerRefund == pos.collateral`.
+     */
+    function _settleLiquidation(Position memory pos, uint256 exitPrice, bool profit, uint256 pnl, uint256 borrowFee)
+        internal
+    {
+        uint256 netOwedToPool = profit ? (borrowFee - pnl) : (pnl + borrowFee);
+        uint256 toPool = netOwedToPool > pos.collateral ? pos.collateral : netOwedToPool;
+        uint256 remaining = pos.collateral - toPool;
+        uint256 liquidatorBonus = Math.min(Math.mulDiv(pos.collateral, LIQUIDATION_FEE_BPS, BPS_DENOMINATOR), remaining);
+        uint256 ownerRefund = remaining - liquidatorBonus;
+        uint256 badDebt = netOwedToPool > pos.collateral ? netOwedToPool - pos.collateral : 0;
+
+        if (toPool > 0) pool.receiveLoss(toPool);
+        if (liquidatorBonus > 0) asset.safeTransfer(msg.sender, liquidatorBonus);
+        if (ownerRefund > 0) asset.safeTransfer(pos.owner, ownerRefund);
+
+        emit PositionLiquidated(
+            pos.owner,
+            pos.market,
+            pos.isLong,
+            exitPrice,
+            profit,
+            pnl,
+            borrowFee,
+            toPool,
+            liquidatorBonus,
+            ownerRefund,
+            badDebt,
+            msg.sender
+        );
+    }
+
     // --- views -----------------------------------------------------------
 
     /// @notice Returns the storage key for a position.
@@ -425,16 +577,15 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
     // --- internal: P&L & aggregates --------------------------------------
 
     /**
-     * @dev Computes a position's settled P&L against `exitPrice`, applying the
-     *      profit cap (MAX_PROFIT_FACTOR*collateral) and the loss floor
-     *      (collateral). Returns whether the position is in profit and the
-     *      capped absolute P&L magnitude.
+     * @dev Raw, UNCAPPED P&L of a position against `exitPrice`. Returns whether
+     *      the position is in profit and the absolute P&L magnitude, with no
+     *      profit cap or loss floor applied.
      *
      *      Rounding always favors the pool: profit is rounded DOWN (Floor) so the
      *      pool never overpays, and loss magnitude is rounded UP (Ceil) so the
-     *      pool never under-collects. The cap and floor are applied afterwards.
+     *      pool never under-collects.
      */
-    function _computePnl(Position memory pos, uint256 exitPrice) internal pure returns (bool profit, uint256 pnl) {
+    function _computeRawPnl(Position memory pos, uint256 exitPrice) internal pure returns (bool profit, uint256 pnl) {
         uint256 delta;
         if (pos.isLong) {
             profit = exitPrice >= pos.entryPrice;
@@ -446,6 +597,15 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
 
         Math.Rounding rounding = profit ? Math.Rounding.Floor : Math.Rounding.Ceil;
         pnl = Math.mulDiv(pos.sizeUsd, delta, pos.entryPrice, rounding);
+    }
+
+    /**
+     * @dev Settled P&L for the CLOSE path: the raw P&L with the profit cap
+     *      (MAX_PROFIT_FACTOR*collateral) and the loss floor (collateral)
+     *      applied. Output is identical to PR-4a's `_computePnl`.
+     */
+    function _computePnl(Position memory pos, uint256 exitPrice) internal pure returns (bool profit, uint256 pnl) {
+        (profit, pnl) = _computeRawPnl(pos, exitPrice);
 
         if (profit) {
             uint256 cap = pos.collateral * MAX_PROFIT_FACTOR;
@@ -454,6 +614,32 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
             // Loss floored at collateral; residual bad debt is PR-5's concern.
             pnl = pos.collateral;
         }
+    }
+
+    /**
+     * @dev Accrues `pos`'s market borrow index to now (exactly ONE
+     *      {_accrueBorrow} call) and returns the fee this position owes over its
+     *      lifetime, `sizeUsd · (cumBorrowRate − entryCumBorrowRate)`, Ceil so
+     *      the pool never under-collects. Shared by close and liquidate.
+     */
+    function _accrueFee(Position memory pos) internal returns (uint256) {
+        return
+            Math.mulDiv(
+                pos.sizeUsd, _accrueBorrow(pos.market) - pos.entryCumBorrowRate, FEE_PRECISION, Math.Rounding.Ceil
+            );
+    }
+
+    /**
+     * @dev Book effects shared by close and liquidate: delete the position,
+     *      remove its size/weight from the market aggregates (refreshing the
+     *      mark to `exitPrice`), and release its reserved liquidity. Performs NO
+     *      borrow accrual (callers do that once via {_accrueFee}) and NO
+     *      transfers — settlement follows under the caller's CEI ordering.
+     */
+    function _realizeClose(Position memory pos, bytes32 key, uint256 exitPrice) internal {
+        delete positions[key];
+        _updateMarket(pos.market, pos.isLong, pos.sizeUsd, pos.entryPrice, exitPrice, false);
+        totalReserved -= pos.collateral * MAX_PROFIT_FACTOR;
     }
 
     /**
