@@ -1,0 +1,9 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+# Required by the RedStone oracle tests, which shell out to a Node helper
+# (test/ffi/redstone-mock-payload.js) to build mock signed price payloads.
+ffi = true
+
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
