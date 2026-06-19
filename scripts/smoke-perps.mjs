@@ -11,6 +11,18 @@
 //   5 DECREASE  50% via requestDecrease -> executeRequest      (size/collateral halve)
 //   6 TRIGGER-CLOSE (TP already met) closes the rest; keeper earns the execution fee
 //   7 TRIGGER-OPEN  (resting, not met) — execute REVERTS, the order stays active
+//   8 OPEN-SHORT    open a SHORT with the DOWN buffer (acceptable = P*0.93)
+//   9 CLOSE-SHORT   close it with the UP buffer (acceptable = P*1.07)
+//
+// Steps 1-6 only ever exercised LONGs, so they never tested the long/short-aware
+// half of the slippage gate. Steps 8/9 do, using the SAME acceptablePrice convention
+// the frontend uses (up = isOpenSide === isLong):
+//   - open short  -> DOWN buffer (below P): engine must require fill >= acceptable.
+//   - close short -> UP buffer   (above P): engine must require fill <= acceptable.
+// DISCRIMINATOR: if the short OPEN fills with the DOWN buffer, the engine is
+// long/short-aware and the frontend matrix is correct. If it slippage-CANCELS, the
+// engine groups by open/close only and the frontend's short buffer is on the wrong
+// side — the step FAILS and says so rather than widening the buffer to hide it.
 //
 // Every two-step action is: request (plain call, NO payload) -> waitForFreshPayload ->
 // executeRequest WITH a fresh signed RedStone payload (the keeper step).
@@ -142,6 +154,23 @@ function findEvent(contract, receipt, name) {
     if (parsed.name === name) return parsed.args;
   }
   throw new Error(`event ${name} not found in tx ${receipt.transactionHash}`);
+}
+
+// Non-throwing variant: returns the event args or null. Used by the SHORT walk to
+// tell a FILL (RequestExecuted) from a slippage CANCEL (RequestCancelled) without
+// blowing up — the whole point there is to observe which branch the engine took.
+function tryFindEvent(contract, receipt, name) {
+  for (const log of receipt.logs) {
+    if (log.address.toLowerCase() !== contract.address.toLowerCase()) continue;
+    let parsed;
+    try {
+      parsed = contract.interface.parseLog(log);
+    } catch {
+      continue;
+    }
+    if (parsed.name === name) return parsed.args;
+  }
+  return null;
 }
 
 // Fetch the live BTC data package: returns { ts (sec), price1e8 (BigNumber) }. The mark
@@ -556,6 +585,86 @@ async function main() {
     console.log(`  request ${id.toString()} left RESTING (active=true); recoverable via cancelRequest after CANCEL_DELAY (${CANCEL_DELAY}s).`);
     console.log(`  NOT waiting out CANCEL_DELAY — the smoke leaves it resting by design.`);
     passStep(name, "execute reverts TriggerNotMet, request stays active");
+  }
+
+  // Classify an executeRequest receipt without throwing: a FILL emits
+  // RequestExecuted; a market slippage miss emits RequestCancelled(slippage=true)
+  // and refunds (the execute itself does NOT revert). The SHORT walk needs to see
+  // which branch happened, so it inspects the receipt instead of assuming a fill.
+  function classifyOutcome(rcpt) {
+    const executed = tryFindEvent(mgr, rcpt, "RequestExecuted");
+    if (executed) return { kind: "filled", price: executed.executionPrice };
+    const cancelled = tryFindEvent(mgr, rcpt, "RequestCancelled");
+    if (cancelled) return { kind: cancelled.slippage ? "slippage" : "cancelled" };
+    return { kind: "unknown" };
+  }
+
+  const shortKey = await mgr.getPositionKey(wallet.address, market, false);
+
+  // ===== STEP 8: OPEN SHORT (slippage-side discriminator) ==================
+  console.log("\n--- 8 OPEN short (slippage-side discriminator) ------------");
+  {
+    const name = "8 OPEN short";
+    const SHORT_DOWN = pct(P, 93); // open short -> DOWN buffer; engine must require fill >= acceptable
+    const { id, ts } = await sendRequest(
+      `requestOpen BTC SHORT ${f18(OPEN_COLLATERAL)} mUSD @ ${OPEN_LEVERAGE}x (acceptable ${f8(SHORT_DOWN)} = P*0.93)...`,
+      () => mgr.requestOpen(market, false, OPEN_COLLATERAL, OPEN_LEVERAGE, SHORT_DOWN),
+    );
+    await waitForFreshPayload(ts);
+    console.log(`    executeRequest(${id.toString()}) as keeper (fresh BTC payload)...`);
+    const rcpt = await guardedExecute(id, ts);
+    const out = classifyOutcome(rcpt);
+    if (out.kind === "slippage") {
+      // Discriminator tripped: a DOWN buffer on a short open should only fail if the
+      // engine applied the LONG convention (fill <= acceptable). That means slippage
+      // is grouped by open/close only, not by side — and the frontend's short buffer
+      // (up = isOpenSide === isLong) is computed on the WRONG side.
+      await fail(
+        name,
+        `short OPEN slippage-CANCELLED with the DOWN buffer (acceptable ${f8(SHORT_DOWN)} = P*0.93). ` +
+          `The engine is NOT long/short-aware — it groups slippage by open/close only — so the frontend's ` +
+          `short acceptablePrice is on the WRONG side. FIX THE FRONTEND MATRIX (up = isOpenSide === isLong); ` +
+          `do NOT widen the buffer to mask this.`,
+      );
+    }
+    await expect(out.kind === "filled", name, `expected a fill or a slippage-cancel, got ${out.kind}`);
+    const pos = await mgr.positions(shortKey);
+    const expectedSize = OPEN_COLLATERAL.mul(OPEN_LEVERAGE); // 5000e18
+    console.log(`    filled at ${f8(out.price)}  position: size ${f18(pos.sizeUsd)} USD  isLong ${pos.isLong}  entry ${f8(pos.entryPrice)}`);
+    await expect(pos.isLong === false, name, `position isLong ${pos.isLong}, expected false (short)`);
+    await expect(pos.sizeUsd.eq(expectedSize), name, `sizeUsd ${f18(pos.sizeUsd)} != ${f18(expectedSize)}`);
+    passStep(
+      name,
+      `short opened: size ${f18(expectedSize)}, isLong=false, filled at ${f8(out.price)} with the DOWN buffer — engine slippage IS long/short-aware`,
+    );
+  }
+
+  // ===== STEP 9: CLOSE SHORT ===============================================
+  console.log("\n--- 9 CLOSE short ----------------------------------------");
+  {
+    const name = "9 CLOSE short";
+    const SHORT_UP = pct(P, 107); // close short -> UP buffer; engine must require fill <= acceptable
+    const { id, ts } = await sendRequest(
+      `requestClose BTC SHORT (acceptable ${f8(SHORT_UP)} = P*1.07)...`,
+      () => mgr.requestClose(market, false, SHORT_UP),
+    );
+    await waitForFreshPayload(ts);
+    console.log(`    executeRequest(${id.toString()}) as keeper (fresh BTC payload)...`);
+    const rcpt = await guardedExecute(id, ts);
+    const out = classifyOutcome(rcpt);
+    if (out.kind === "slippage") {
+      await fail(
+        name,
+        `short CLOSE slippage-CANCELLED with the UP buffer (acceptable ${f8(SHORT_UP)} = P*1.07). ` +
+          `The engine grouped slippage by open/close only — the frontend's close-short buffer is on the WRONG side. ` +
+          `FIX THE FRONTEND MATRIX; do NOT widen the buffer.`,
+      );
+    }
+    await expect(out.kind === "filled", name, `expected a fill or a slippage-cancel, got ${out.kind}`);
+    const pos = await mgr.positions(shortKey);
+    console.log(`    filled at ${f8(out.price)}  position: size ${f18(pos.sizeUsd)} USD`);
+    await expect(pos.sizeUsd.eq(0), name, `short not fully closed: sizeUsd ${f18(pos.sizeUsd)}`);
+    passStep(name, `short closed to size 0, filled at ${f8(out.price)} with the UP buffer`);
   }
 
   console.log("\nNote: on-chain liquidation (PR-5) is intentionally SKIPPED — the live demo feed");
