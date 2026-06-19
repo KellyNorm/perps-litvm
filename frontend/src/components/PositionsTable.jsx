@@ -6,8 +6,15 @@ import { signedPnl, liqPrice, health, healthColor, MIN_COLLATERAL } from "../lib
 // refunds the fee if the fill lands outside this.
 const CLOSE_SLIP = 0.005;
 
-export default function PositionsTable({ account, positions, marks, trade, wrongChain }) {
+export default function PositionsTable({ account, positions, marks, orders, trade, wrongChain, onAddTpSl }) {
   const colSpan = 9;
+
+  // A resting trigger-exit (TP/SL) for this position. Because the engine takes the
+  // position's closePending mutex at request time, while one rests the market Close /
+  // partial buttons would revert CloseAlreadyPending — so we lock them and point here.
+  function restingExitFor(p) {
+    return (orders || []).find((o) => o.symbol === p.symbol && o.isLong === p.isLong && o.kindClass === "exit");
+  }
 
   function emptyRow(content) {
     return (
@@ -48,19 +55,22 @@ export default function PositionsTable({ account, positions, marks, trade, wrong
         </span>
       );
     }
-    const disabled = wrongChain || trade?.inProgress;
+    const resting = restingExitFor(p);
+    const locked = Boolean(resting);
+    const disabled = wrongChain || trade?.inProgress || locked;
     // Dust guard (mirrors requestDecrease): a partial close that would leave the
     // remainder below MIN_COLLATERAL reverts on-chain, so disable it here.
     const dust25 = p.collateral * 0.75 < MIN_COLLATERAL;
     const dust50 = p.collateral * 0.5 < MIN_COLLATERAL;
     const dustTip = `Would leave less than ${MIN_COLLATERAL} mUSD collateral — use Close instead`;
+    const lockTip = "A TP/SL is resting on this position — cancel it in the Orders tab to close manually";
     return (
       <span className="row-acts">
         <button
           className="rowbtn"
           disabled={disabled || dust25}
           onClick={() => act(p, "decrease", 2500)}
-          title={dust25 ? dustTip : "Close 25% of this position"}
+          title={locked ? lockTip : dust25 ? dustTip : "Close 25% of this position"}
         >
           −25%
         </button>
@@ -68,12 +78,20 @@ export default function PositionsTable({ account, positions, marks, trade, wrong
           className="rowbtn"
           disabled={disabled || dust50}
           onClick={() => act(p, "decrease", 5000)}
-          title={dust50 ? dustTip : "Close 50% of this position"}
+          title={locked ? lockTip : dust50 ? dustTip : "Close 50% of this position"}
         >
           −50%
         </button>
-        <button className="rowbtn close" disabled={disabled} onClick={() => act(p, "close")} title="Close the whole position">
+        <button className="rowbtn close" disabled={disabled} onClick={() => act(p, "close")} title={locked ? lockTip : "Close the whole position"}>
           Close
+        </button>
+        <button
+          className={"rowbtn tpsl" + (locked ? " set" : "")}
+          disabled={wrongChain || trade?.inProgress || locked}
+          onClick={() => !locked && onAddTpSl?.(p)}
+          title={locked ? `${resting.typeLabel} resting at $${resting.triggerPrice} — one exit per position` : "Add a resting take-profit / stop-loss"}
+        >
+          {locked ? "TP/SL ✓" : "+ TP/SL"}
         </button>
       </span>
     );

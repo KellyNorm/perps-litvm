@@ -14,7 +14,7 @@ const IN_PROGRESS = ["approving", "requesting", "waiting", "executing"];
 // in-flight at a time (the contract serializes a position's lifecycle anyway), so a
 // single `flow` powers the global status banner. A pending breadcrumb is persisted to
 // localStorage after leg 1 so a refresh / abandoned wallet prompt can resume leg 2.
-export function useTrade({ account, getSigner, wrongChain, toast, onTraded }) {
+export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addOrderId }) {
   const [flow, setFlow] = useState(null);
   const [pending, setPending] = useState(null);
   const [lastFill, setLastFill] = useState({ n: 0 }); // bumps per fill -> ignite the button
@@ -215,6 +215,214 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded }) {
     }
   }, [pending, account, getSigner, toast, onTraded, scheduleClear]);
 
+  // --- 11c resting orders -------------------------------------------------------
+  // Place a RESTING trigger OPEN (limit / stop entry). Single leg: approve (collateral
+  // + fee) -> requestTriggerOpen -> stamp the id for the watcher. The order then RESTS
+  // on-chain until the keeper poll sees it fill — there is NO leg-2 here. triggerAbove
+  // is derived from trigger-vs-mark (never the Limit/Stop label); a STOP entry gets the
+  // permissive acceptablePrice so the catch isn't blocked by SlippageNotMet.
+  const submitTriggerOpen = useCallback(
+    async (p) => {
+      if (busyRef.current) return toast("A trade is already in progress.", true);
+      if (!account) return toast("Connect a wallet first.", true);
+      if (wrongChain) return toast("Switch to LiteForge (4441) first.", true);
+      busyRef.current = true;
+      clearTimeout(clearTimer.current);
+      try {
+        const signer = getSigner();
+        const pm = pmWrite(signer);
+        const musd = musdWrite(signer);
+        const market = trade.marketKey(p.symbol);
+        const collateral1e18 = trade.toAsset(p.collateral);
+        const needed = collateral1e18.add(trade.EXECUTION_FEE);
+
+        const triggerAbove = p.triggerPrice >= p.mark;
+        const isStop = triggerAbove === p.isLong; // entry stop
+        const label = isStop ? "Stop" : "Limit";
+
+        setFlow({ phase: "approving", action: "open", symbol: p.symbol, isLong: p.isLong, verb: "Placed", message: "Checking mUSD allowance…" });
+        await trade.ensureAllowance(musd, account, ADDRESSES.positionManager, needed, () =>
+          setFlow((f) => ({ ...f, message: "Approve mUSD spending — confirm in your wallet (one-time)." })),
+        );
+
+        const buffer = isStop ? trade.STOP_SLIP : p.slipFrac;
+        const acceptable = trade.acceptablePrice1e8(p.triggerPrice, buffer, true, p.isLong);
+        const trigger1e8 = ethers.BigNumber.from(Math.round(p.triggerPrice * 1e8).toString());
+
+        setFlow((f) => ({ ...f, phase: "requesting", message: `Placing your ${label.toLowerCase()} order — confirm in your wallet…` }));
+        const { id } = await trade.sendTriggerRequest(pm, "open", market, p.isLong, {
+          collateral: collateral1e18,
+          leverage: Math.round(p.leverage),
+          acceptablePrice: acceptable,
+          triggerPrice: trigger1e8,
+          triggerAbove,
+        });
+        addOrderId?.(account, id.toString());
+
+        setFlow({ phase: "done", ok: true, symbol: p.symbol, isLong: p.isLong, message: `${label} order resting until ${p.symbol} ${triggerAbove ? "≥" : "≤"} $${p.triggerPrice}.` });
+        toast(`${label} order placed ✓`);
+        onTraded?.();
+        scheduleClear();
+      } catch (err) {
+        const reason = err?.message || String(err);
+        if (err?.rejected) {
+          setFlow(null);
+          toast("Cancelled.", true);
+        } else {
+          setFlow({ phase: "done", ok: false, symbol: p.symbol, message: `Order failed: ${reason.slice(0, 110)}` });
+          toast("Order failed.", true);
+          scheduleClear();
+        }
+      } finally {
+        busyRef.current = false;
+      }
+    },
+    [account, wrongChain, getSigner, toast, onTraded, scheduleClear, addOrderId],
+  );
+
+  // Place a RESTING trigger EXIT (TP / SL) on an open position: requestTriggerClose
+  // (full) or requestTriggerDecrease (partial, closeBps). Escrows the fee only. The
+  // engine's closePending mutex allows only ONE resting exit per position (no OCO).
+  // A stop-loss gets the permissive acceptablePrice; take-profit uses the normal bound.
+  const submitTriggerExit = useCallback(
+    async (p) => {
+      if (busyRef.current) return toast("A trade is already in progress.", true);
+      if (!account) return toast("Connect a wallet first.", true);
+      if (wrongChain) return toast("Switch to LiteForge (4441) first.", true);
+      busyRef.current = true;
+      clearTimeout(clearTimer.current);
+      try {
+        const signer = getSigner();
+        const pm = pmWrite(signer);
+        const musd = musdWrite(signer);
+        const market = trade.marketKey(p.symbol);
+
+        const triggerAbove = p.triggerPrice >= p.mark;
+        const isStop = triggerAbove !== p.isLong; // exit stop-loss
+        const label = isStop ? "Stop-loss" : "Take-profit";
+
+        setFlow({ phase: "approving", action: p.kind, symbol: p.symbol, isLong: p.isLong, verb: "Placed", message: "Checking mUSD allowance…" });
+        await trade.ensureAllowance(musd, account, ADDRESSES.positionManager, trade.EXECUTION_FEE, () =>
+          setFlow((f) => ({ ...f, message: "Approve the 0.5 mUSD fee — confirm in your wallet (one-time)." })),
+        );
+
+        const buffer = isStop ? trade.STOP_SLIP : 0.005;
+        const acceptable = trade.acceptablePrice1e8(p.triggerPrice, buffer, false, p.isLong);
+        const trigger1e8 = ethers.BigNumber.from(Math.round(p.triggerPrice * 1e8).toString());
+
+        setFlow((f) => ({ ...f, phase: "requesting", message: `Placing your ${label.toLowerCase()} — confirm in your wallet…` }));
+        const { id } = await trade.sendTriggerRequest(pm, p.kind, market, p.isLong, {
+          acceptablePrice: acceptable,
+          closeBps: p.closeBps || 0,
+          triggerPrice: trigger1e8,
+          triggerAbove,
+        });
+        addOrderId?.(account, id.toString());
+
+        setFlow({ phase: "done", ok: true, symbol: p.symbol, isLong: p.isLong, message: `${label} resting until ${p.symbol} ${triggerAbove ? "≥" : "≤"} $${p.triggerPrice}.` });
+        toast(`${label} placed ✓`);
+        onTraded?.();
+        scheduleClear();
+      } catch (err) {
+        const reason = err?.message || String(err);
+        if (err?.rejected) {
+          setFlow(null);
+          toast("Cancelled.", true);
+        } else {
+          setFlow({ phase: "done", ok: false, symbol: p.symbol, message: /CloseAlreadyPending/.test(reason) ? "This position already has a resting exit order (one at a time)." : `Order failed: ${reason.slice(0, 110)}` });
+          toast("Order failed.", true);
+          scheduleClear();
+        }
+      } finally {
+        busyRef.current = false;
+      }
+    },
+    [account, wrongChain, getSigner, toast, onTraded, scheduleClear, addOrderId],
+  );
+
+  // The keeper FILL leg for a resting order, triggered once the static poll says it
+  // would fill: send the real executeRequest. If price moved back between the poll and
+  // the send, the engine reverts the gate again — classify that as STILL RESTING (never
+  // strand the order) and let the poll resume.
+  const fillOrder = useCallback(
+    async (order) => {
+      if (busyRef.current) return toast("A trade is already in progress.", true);
+      if (!account) return toast("Connect a wallet first.", true);
+      if (wrongChain) return toast("Switch to LiteForge (4441) first.", true);
+      busyRef.current = true;
+      clearTimeout(clearTimer.current);
+      const VERB = { open: "Opened", increase: "Increased", close: "Closed", decrease: "Decreased" };
+      const crumb = { id: order.id, feed: order.feed, symbol: order.symbol, isLong: order.isLong, action: order.kindName, verb: VERB[order.kindName] || "Filled" };
+      try {
+        setFlow({ ...crumb, phase: "executing", message: `Order ready — confirm the fill for ${order.typeLabel} ${order.symbol}…` });
+        const pm = pmWrite(getSigner());
+        const { outcome } = await trade.executeRequest(pm, crumb.feed, crumb.id);
+        if (outcome.kind === "filled") {
+          setFlow({ phase: "done", ...crumb, ok: true, message: `${crumb.verb} ${crumb.symbol} ✓` });
+          toast(`${crumb.verb} ${crumb.symbol} ✓`);
+          setLastFill((s) => ({ n: s.n + 1, action: crumb.action, isLong: crumb.isLong, symbol: crumb.symbol }));
+        } else {
+          // Triggers REVERT rather than auto-cancel, so a non-fill outcome is unusual;
+          // refresh and let the list reflect on-chain truth.
+          setFlow({ phase: "done", ...crumb, ok: false, message: "Order did not fill — still resting." });
+        }
+        onTraded?.();
+        scheduleClear();
+      } catch (err) {
+        const reason = err?.message || String(err);
+        if (err?.rejected) {
+          setFlow(null);
+          toast("Fill dismissed — order still resting.", true);
+        } else if (/TriggerNotMet|SlippageNotMet|TooEarly|PriceBeforeRequest/.test(reason)) {
+          setFlow({ phase: "done", ...crumb, ok: false, message: "Price moved back before the fill landed — order still resting." });
+          toast("Price moved back — still resting.", true);
+          scheduleClear();
+        } else {
+          setFlow({ phase: "done", ...crumb, ok: false, message: `Fill reverted: ${reason.slice(0, 110)}` });
+          toast("Fill reverted.", true);
+          scheduleClear();
+        }
+        onTraded?.();
+      } finally {
+        busyRef.current = false;
+      }
+    },
+    [account, wrongChain, getSigner, toast, onTraded, scheduleClear],
+  );
+
+  // Cancel a resting order and refund its escrow. Locked until CANCEL_DELAY (180s)
+  // after the request — the UI gates the button on the same countdown, so a press
+  // here should already be past the lock (TooEarlyToCancel is handled defensively).
+  const cancelOrder = useCallback(
+    async (order) => {
+      if (busyRef.current) return toast("A trade is already in progress.", true);
+      if (!account || wrongChain) return;
+      busyRef.current = true;
+      clearTimeout(clearTimer.current);
+      try {
+        setFlow({ phase: "executing", id: order.id, symbol: order.symbol, isLong: order.isLong, message: "Cancelling order & refunding — confirm in your wallet…" });
+        await trade.cancelRequest(pmWrite(getSigner()), order.id);
+        setFlow({ phase: "done", ok: true, symbol: order.symbol, message: "Order cancelled — escrow refunded." });
+        toast("Order cancelled — refunded.");
+        onTraded?.();
+        scheduleClear();
+      } catch (err) {
+        const reason = err?.message || String(err);
+        if (err?.rejected) {
+          setFlow(null);
+          toast("Cancelled.", true);
+        } else {
+          setFlow({ phase: "done", ok: false, symbol: order.symbol, message: /TooEarlyToCancel/.test(reason) ? "Too early to cancel — the 180s refund lock hasn't elapsed." : `Cancel failed: ${reason.slice(0, 110)}` });
+          toast("Cancel failed.", true);
+          scheduleClear();
+        }
+      } finally {
+        busyRef.current = false;
+      }
+    },
+    [account, wrongChain, getSigner, toast, onTraded, scheduleClear],
+  );
+
   // Hide the transient banner. Keeps any on-chain pending intact (it reappears as a
   // resume prompt on the next load); only clears the visual.
   const dismiss = useCallback(() => {
@@ -225,5 +433,19 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded }) {
 
   const inProgress = Boolean(flow && IN_PROGRESS.includes(flow.phase));
 
-  return { flow, pending, lastFill, inProgress, submit, resume, cancelPending, dismiss, CANCEL_DELAY: trade.CANCEL_DELAY };
+  return {
+    flow,
+    pending,
+    lastFill,
+    inProgress,
+    submit,
+    resume,
+    cancelPending,
+    dismiss,
+    submitTriggerOpen,
+    submitTriggerExit,
+    fillOrder,
+    cancelOrder,
+    CANCEL_DELAY: trade.CANCEL_DELAY,
+  };
 }

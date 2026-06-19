@@ -21,6 +21,13 @@ export const MIN_EXECUTION_DELAY = 3; // seconds; fill floor
 export const CANCEL_DELAY = 180; // seconds; owner-reclaim window
 export const SLIPPAGE_OPTIONS = [0.001, 0.005, 0.01]; // 0.1% / 0.5% / 1%
 
+// Permissive acceptablePrice buffer for STOP entries / stop-losses (11c). A stop
+// fires on an ADVERSE move, so by the time the gate opens the mark may already be a
+// chunk past the trigger; a tight bound would just re-revert SlippageNotMet during
+// the very move the order is meant to catch. A wide buffer lets the catch land.
+// Limit / take-profit orders use the normal user-selected slippage instead.
+export const STOP_SLIP = 0.05; // 5%
+
 // action → behaviour table. isOpenSide drives the slippage direction; needsCollateral
 // drives the approval amount; verb is the success toast verb (matches the button).
 export const ACTIONS = {
@@ -84,6 +91,36 @@ export function sendRequestTx(pm, action, market, isLong, params) {
     default:
       throw new Error(`unknown action ${action}`);
   }
+}
+
+// Build the requestTrigger* call (11c resting orders). Same fill cores as the market
+// requests above, PLUS the stored (triggerPrice, triggerAbove) gate — the engine
+// reverts TriggerNotMet/SlippageNotMet at execute until the mark crosses, so the
+// request RESTS. `kind` is "open" | "increase" | "close" | "decrease".
+export function sendTriggerRequestTx(pm, kind, market, isLong, params) {
+  const { collateral, leverage, acceptablePrice, closeBps, triggerPrice, triggerAbove } = params;
+  switch (kind) {
+    case "open":
+      return pm.requestTriggerOpen(market, isLong, collateral, leverage, acceptablePrice, triggerPrice, triggerAbove);
+    case "increase":
+      return pm.requestTriggerIncrease(market, isLong, collateral, leverage, acceptablePrice, triggerPrice, triggerAbove);
+    case "close":
+      return pm.requestTriggerClose(market, isLong, acceptablePrice, triggerPrice, triggerAbove);
+    case "decrease":
+      return pm.requestTriggerDecrease(market, isLong, closeBps, acceptablePrice, triggerPrice, triggerAbove);
+    default:
+      throw new Error(`unknown trigger kind ${kind}`);
+  }
+}
+
+// Send a requestTrigger* tx and return { id, requestTs }. Reuses findRequestId — the
+// Trigger*Requested events also end in "Requested", so the same parser finds the id.
+export async function sendTriggerRequest(pm, kind, market, isLong, params) {
+  const fallback = await pm.nextRequestId().catch(() => null);
+  const rcpt = await (await sendTriggerRequestTx(pm, kind, market, isLong, params)).wait();
+  const id = findRequestId(pm, rcpt, fallback);
+  const requestTs = (await readProvider().getBlock(rcpt.blockNumber)).timestamp;
+  return { id, requestTs, rcpt };
 }
 
 // Capture the request id from the receipt by parsing the emitted *Requested event

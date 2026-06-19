@@ -4,9 +4,11 @@ import TopBar from "./components/TopBar.jsx";
 import MarketStrip from "./components/MarketStrip.jsx";
 import Chart from "./components/Chart.jsx";
 import PositionsTable from "./components/PositionsTable.jsx";
+import OrdersTable from "./components/OrdersTable.jsx";
 import VaultPanel from "./components/VaultPanel.jsx";
 import OrderTicket from "./components/OrderTicket.jsx";
 import FaucetModal from "./components/FaucetModal.jsx";
+import TpSlModal from "./components/TpSlModal.jsx";
 import TradeStatus from "./components/TradeStatus.jsx";
 import { useWallet } from "./hooks/useWallet.js";
 import { useTrade } from "./hooks/useTrade.js";
@@ -14,6 +16,7 @@ import { useMarkets } from "./hooks/useMarkets.js";
 import { usePrices } from "./hooks/usePrices.js";
 import { useVault } from "./hooks/useVault.js";
 import { usePositions } from "./hooks/usePositions.js";
+import { useOrders } from "./hooks/useOrders.js";
 import { useBalances } from "./hooks/useBalances.js";
 import { addressesConfigured } from "./config.js";
 
@@ -31,6 +34,7 @@ export default function App() {
   const [selected, setSelected] = useState(null);
   const [tab, setTab] = useState("pos");
   const [modalOpen, setModalOpen] = useState(false);
+  const [tpslFor, setTpslFor] = useState(null); // position getting a TP/SL, or null
   const [toast, setToast] = useState({ msg: "", err: false, show: false });
 
   // Pick the first supported market once discovered; keep selection valid.
@@ -44,10 +48,13 @@ export default function App() {
     setTimeout(() => setToast((t) => ({ ...t, show: false })), 2600);
   }, []);
 
+  const orders = useOrders({ account, supported, toast: showToast });
+
   const onTraded = useCallback(() => {
     refreshPositions();
     balances.refresh();
-  }, [refreshPositions, balances]);
+    orders.refresh();
+  }, [refreshPositions, balances, orders]);
 
   const trade = useTrade({
     account,
@@ -55,6 +62,7 @@ export default function App() {
     wrongChain,
     toast: showToast,
     onTraded,
+    addOrderId: orders.addOrderId,
   });
 
   const meta = supported && selected ? supported.find((m) => m.symbol === selected) : null;
@@ -103,13 +111,26 @@ export default function App() {
                   <button className={tab === "pos" ? "on" : ""} onClick={() => setTab("pos")}>
                     Positions <span className="count">{positions ? positions.length : account ? "…" : 0}</span>
                   </button>
+                  <button className={tab === "orders" ? "on" : ""} onClick={() => setTab("orders")}>
+                    Orders <span className="count">{orders.orders ? orders.orders.length : account ? "…" : 0}</span>
+                  </button>
                   <button className={tab === "vault" ? "on" : ""} onClick={() => setTab("vault")}>
                     Liquidity vault
                   </button>
                 </div>
 
                 {tab === "pos" ? (
-                  <PositionsTable account={account} positions={positions} marks={marks} trade={trade} wrongChain={wrongChain} />
+                  <PositionsTable
+                    account={account}
+                    positions={positions}
+                    marks={marks}
+                    orders={orders.orders}
+                    trade={trade}
+                    wrongChain={wrongChain}
+                    onAddTpSl={setTpslFor}
+                  />
+                ) : tab === "orders" ? (
+                  <OrdersTable account={account} orders={orders.orders} readiness={orders.readiness} trade={trade} wrongChain={wrongChain} />
                 ) : (
                   <VaultPanel vault={vault} yourDeposit={yourDeposit} account={account} />
                 )}
@@ -123,6 +144,7 @@ export default function App() {
               musdBalance={balances.musd}
               nativeBalance={balances.native}
               positions={positions}
+              orders={orders.orders}
               trade={trade}
               account={account}
               wrongChain={wrongChain}
@@ -152,6 +174,8 @@ export default function App() {
         onClaimed={balances.refresh}
         toast={showToast}
       />
+
+      {tpslFor && <TpSlModal position={tpslFor} mark={marks[tpslFor.symbol] && !marks[tpslFor.symbol].error ? marks[tpslFor.symbol].price : null} trade={trade} onClose={() => setTpslFor(null)} />}
 
       <TradeStatus
         flow={trade.flow}
