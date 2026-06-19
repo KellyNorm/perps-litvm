@@ -6,6 +6,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SignedMath} from "@openzeppelin/contracts/utils/math/SignedMath.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {MainDemoConsumerBase} from "@redstone-finance/evm-connector/contracts/data-services/MainDemoConsumerBase.sol";
 
 import {LiquidityPool} from "./LiquidityPool.sol";
@@ -89,7 +90,7 @@ import {LiquidityPool} from "./LiquidityPool.sol";
  *         sizeUsd * |Δprice| / entryPrice keeps the 1e8 price scale internal and
  *         yields an 18-decimal asset amount, matching the collateral.
  */
-contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
+contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
 
     // --- risk parameters (immutable economics; all constant) -------------
@@ -192,6 +193,12 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
 
     /// @notice Supported market feed id for ETH.
     bytes32 public constant MARKET_ETH = bytes32("ETH");
+
+    /// @notice Owner-extendable registry of tradeable markets (RedStone feed ids).
+    ///         New opens are gated on this set; BTC and ETH are seeded at deploy.
+    ///         Only {requestOpen} consults it — close and liquidate are never
+    ///         gated, so a delisted market's existing positions stay closable.
+    mapping(bytes32 => bool) public supportedMarkets;
 
     // --- wiring ----------------------------------------------------------
 
@@ -459,17 +466,27 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
     ///      refunds to the owner.
     event RequestCancelled(uint256 indexed requestId, address indexed owner, bool slippage);
 
+    // market registry (PR-8)
+    event MarketAdded(bytes32 indexed market);
+    event MarketRemoved(bytes32 indexed market);
+
     /**
      * @param pool_ The deployed {LiquidityPool} counterparty.
      * @dev   Reads the pool's asset and pre-approves the pool to pull absorbed
      *        losses via {LiquidityPool.receiveLoss}. The pool must be linked to
-     *        this manager separately via {LiquidityPool.setPositionManager}.
+     *        this manager separately via {LiquidityPool.setPositionManager}. The
+     *        deployer becomes the {Ownable} owner — the sole, market-registry-only
+     *        admin (see {addMarket}/{removeMarket}); it has no other privilege.
+     *        BTC and ETH are seeded as supported so existing behavior is preserved.
      */
-    constructor(LiquidityPool pool_) {
+    constructor(LiquidityPool pool_) Ownable(msg.sender) {
         pool = pool_;
         IERC20 asset_ = IERC20(pool_.asset());
         asset = asset_;
         asset_.forceApprove(address(pool_), type(uint256).max);
+
+        supportedMarkets[MARKET_BTC] = true;
+        supportedMarkets[MARKET_ETH] = true;
     }
 
     // --- oracle staleness override ---------------------------------------
@@ -497,6 +514,33 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         // path, so that path is completely unaffected.
         uint256 minTs = _minExecutionTimestamp;
         if (minTs != 0 && receivedSeconds < minTs) revert PriceBeforeRequest(receivedSeconds, minTs);
+    }
+
+    // --- market registry (owner-only; PR-8) ------------------------------
+
+    /**
+     * @notice Add `market` to the supported set so traders may open positions on
+     *         it. Owner-only — this is the contract's sole admin power and is
+     *         scoped strictly to the registry; it grants no control over funds,
+     *         pricing, funding, or liquidation. Idempotent.
+     * @dev    Affects only the {requestOpen} gate. Existing positions and the
+     *         close/liquidate paths are unaffected.
+     */
+    function addMarket(bytes32 market) external onlyOwner {
+        supportedMarkets[market] = true;
+        emit MarketAdded(market);
+    }
+
+    /**
+     * @notice Remove `market` from the supported set, blocking NEW opens on it.
+     *         Owner-only (same scope as {addMarket}). Idempotent.
+     * @dev    Delisting only blocks {requestOpen}; positions already open on
+     *         `market` remain fully closable and liquidatable, since neither path
+     *         consults {supportedMarkets}.
+     */
+    function removeMarket(bytes32 market) external onlyOwner {
+        supportedMarkets[market] = false;
+        emit MarketRemoved(market);
     }
 
     // --- trading ---------------------------------------------------------
@@ -1303,7 +1347,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
         return keccak256(abi.encodePacked(owner, market, isLong));
     }
 
-    function _requireSupportedMarket(bytes32 market) internal pure {
-        if (market != MARKET_BTC && market != MARKET_ETH) revert MarketNotSupported(market);
+    function _requireSupportedMarket(bytes32 market) internal view {
+        if (!supportedMarkets[market]) revert MarketNotSupported(market);
     }
 }
