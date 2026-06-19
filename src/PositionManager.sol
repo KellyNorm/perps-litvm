@@ -389,6 +389,44 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
     /// @notice Queued requests by id.
     mapping(uint256 => Request) public requests;
 
+    /**
+     * @notice The (price, direction) gate that turns a queued Close/Decrease into a
+     *         RESTING trigger order (take-profit / stop-loss / limit / stop).
+     * @dev    A NON-ZERO {triggerPrice} marks the matching request as a trigger
+     *         order; a zero {triggerPrice} (the default for every market request)
+     *         means "no gate", so the request fills like a plain market order. The
+     *         direction picks which side of the threshold is executable:
+     *         {triggerAbove} == true  ⇒ executable once `price >= triggerPrice`,
+     *         {triggerAbove} == false ⇒ executable once `price <= triggerPrice`.
+     *
+     *         One (triggerPrice, triggerAbove) pair expresses ALL of TP / SL /
+     *         limit / stop — the TP-vs-SL label is a frontend concern, not the
+     *         contract's. A LONG take-profit rests ABOVE entry (triggerAbove=true);
+     *         a LONG stop-loss rests BELOW entry (triggerAbove=false); a SHORT is
+     *         the mirror.
+     *
+     *         MUTEX: trigger exits share the {closePending} position-edit mutex with
+     *         plain closes/decreases/increases, so a position can rest AT MOST ONE
+     *         exit at a time — no simultaneous TP+SL / OCO bracket yet (deferred).
+     *
+     *         STOP ORDERS: a stop-type order (e.g. a stop-loss, which fires INTO an
+     *         adverse move) should be queued with a PERMISSIVE {Request.acceptablePrice}
+     *         so the {_withinSlippage} bound does not keep it from firing when the
+     *         market gaps through the trigger — otherwise the order would rest
+     *         (revert) on a slippage miss exactly when it most needs to fire.
+     * @param  triggerPrice Threshold mark (1e8); 0 ⇒ not a trigger order.
+     * @param  triggerAbove True ⇒ fires at/above the threshold, false ⇒ at/below.
+     */
+    struct Trigger {
+        uint256 triggerPrice;
+        bool triggerAbove;
+    }
+
+    /// @notice Resting trigger gates keyed by requestId. Unset (triggerPrice == 0)
+    ///         for every plain market request; set only by {requestTriggerClose} /
+    ///         {requestTriggerDecrease} and cleared on fill or cancel.
+    mapping(uint256 => Trigger) public triggers;
+
     /// @notice Monotonic id assigned to the next request.
     uint256 public nextRequestId;
 
@@ -430,6 +468,11 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
     error InvalidAcceptablePrice();
     error CloseAlreadyPending();
     error InvalidCloseBps(uint256 bps);
+
+    // trigger exits (PR-10a)
+    error InvalidTriggerPrice();
+    error TriggerNotMet(uint256 price, uint256 triggerPrice, bool triggerAbove);
+    error SlippageNotMet(uint256 price, uint256 acceptablePrice);
 
     // --- events ----------------------------------------------------------
 
@@ -565,6 +608,39 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
         uint256 newSizeUsd,
         uint256 newCollateral,
         uint256 newEntryPrice
+    );
+
+    // trigger exits (PR-10a)
+
+    /// @dev Emitted when a RESTING trigger CLOSE is queued. The order fills only
+    ///      once the mark crosses `triggerPrice` (side per `triggerAbove`) AND the
+    ///      `acceptablePrice` slippage bound holds; until then a keeper's execute
+    ///      reverts and the request stays active. See {requestTriggerClose}.
+    event TriggerCloseRequested(
+        uint256 indexed requestId,
+        address indexed owner,
+        bytes32 indexed market,
+        bool isLong,
+        uint256 acceptablePrice,
+        uint256 triggerPrice,
+        bool triggerAbove,
+        uint256 executionFee
+    );
+
+    /// @dev Emitted when a RESTING trigger DECREASE is queued: a partial close of
+    ///      fraction `closeBps` that fills only once the mark crosses `triggerPrice`
+    ///      (side per `triggerAbove`) AND the slippage bound holds. See
+    ///      {requestTriggerDecrease}.
+    event TriggerDecreaseRequested(
+        uint256 indexed requestId,
+        address indexed owner,
+        bytes32 indexed market,
+        bool isLong,
+        uint256 closeBps,
+        uint256 acceptablePrice,
+        uint256 triggerPrice,
+        bool triggerAbove,
+        uint256 executionFee
     );
 
     event RequestExecuted(uint256 indexed requestId, address indexed keeper, uint256 executionPrice);
@@ -1416,6 +1492,138 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
     }
 
     /**
+     * @notice Queue a RESTING trigger CLOSE of the caller's open position: an
+     *         ordinary deferred full close PLUS a (triggerPrice, triggerAbove) gate.
+     *         A keeper's execute fills it only once the mark crosses the trigger AND
+     *         the slippage bound holds; until then the execute REVERTS and the
+     *         request stays active (the keeper retries) — it never cancels on the
+     *         trigger miss. This is the only behavioral difference from
+     *         {requestClose}; the escrow, mutex, and fill core are identical.
+     * @dev    Validation mirrors {requestClose} (non-zero acceptablePrice; position
+     *         exists; the {closePending} mutex is free) PLUS a non-zero
+     *         `triggerPrice`. CEI: validate -> mark pending & record request +
+     *         trigger (state) -> pull fee (interaction). `nonReentrant`.
+     *
+     *         A take-profit rests on the favorable side of entry, a stop-loss on the
+     *         adverse side; the contract does not distinguish them (see {Trigger}).
+     *         For a stop-type order, pass a PERMISSIVE `acceptablePrice` so adverse
+     *         slippage on the gap-through does not keep it from firing.
+     * @param  market          Market feed id.
+     * @param  isLong          Direction of the position to close.
+     * @param  acceptablePrice Directional slippage bound (1e8); see {_withinSlippage}.
+     * @param  triggerPrice    Threshold mark (1e8) the fill price must cross.
+     * @param  triggerAbove    True ⇒ fires at/above the threshold, false ⇒ at/below.
+     * @return requestId       Id of the queued request.
+     */
+    function requestTriggerClose(
+        bytes32 market,
+        bool isLong,
+        uint256 acceptablePrice,
+        uint256 triggerPrice,
+        bool triggerAbove
+    ) external nonReentrant returns (uint256 requestId) {
+        if (acceptablePrice == 0) revert InvalidAcceptablePrice();
+        if (triggerPrice == 0) revert InvalidTriggerPrice();
+
+        bytes32 key = _positionKey(msg.sender, market, isLong);
+        if (positions[key].sizeUsd == 0) revert NoOpenPosition();
+        if (closePending[key]) revert CloseAlreadyPending();
+
+        // Effects.
+        closePending[key] = true;
+        requestId = nextRequestId++;
+        requests[requestId] = Request({
+            owner: msg.sender,
+            market: market,
+            isLong: isLong,
+            kind: RequestKind.Close,
+            collateral: 0,
+            leverage: 0,
+            acceptablePrice: acceptablePrice,
+            executionFee: EXECUTION_FEE,
+            requestTimestamp: block.timestamp,
+            active: true
+        });
+        triggers[requestId] = Trigger({triggerPrice: triggerPrice, triggerAbove: triggerAbove});
+
+        // Interaction LAST (CEI).
+        asset.safeTransferFrom(msg.sender, address(this), EXECUTION_FEE);
+
+        emit TriggerCloseRequested(
+            requestId, msg.sender, market, isLong, acceptablePrice, triggerPrice, triggerAbove, EXECUTION_FEE
+        );
+    }
+
+    /**
+     * @notice Queue a RESTING trigger DECREASE of the caller's open position: an
+     *         ordinary deferred partial close of fraction `closeBps` PLUS a
+     *         (triggerPrice, triggerAbove) gate. Like {requestTriggerClose}, a
+     *         keeper's execute fills it only once the mark crosses the trigger AND
+     *         the slippage bound holds; until then the execute REVERTS and the
+     *         request stays active. The escrow, mutex, and decrease fill core are
+     *         identical to {requestDecrease}.
+     * @dev    Validation mirrors {requestDecrease} EXACTLY (non-zero acceptablePrice;
+     *         `closeBps` in (0, 10000) else {InvalidCloseBps}; position exists; the
+     *         {closePending} mutex is free; the dust guard requires the remaining
+     *         collateral to clear {MIN_COLLATERAL}) PLUS a non-zero `triggerPrice`.
+     *         CEI: validate -> mark pending & record request + trigger (state) ->
+     *         pull fee (interaction). `nonReentrant`. The fraction is carried in the
+     *         request's OVERLOADED `leverage` field (see {Request}).
+     * @param  market          Market feed id.
+     * @param  isLong          Direction of the position to decrease.
+     * @param  closeBps        Fraction to close, in basis points, in (0, 10000).
+     * @param  acceptablePrice Directional slippage bound (1e8); see {_withinSlippage}.
+     * @param  triggerPrice    Threshold mark (1e8) the fill price must cross.
+     * @param  triggerAbove    True ⇒ fires at/above the threshold, false ⇒ at/below.
+     * @return requestId       Id of the queued request.
+     */
+    function requestTriggerDecrease(
+        bytes32 market,
+        bool isLong,
+        uint256 closeBps,
+        uint256 acceptablePrice,
+        uint256 triggerPrice,
+        bool triggerAbove
+    ) external nonReentrant returns (uint256 requestId) {
+        if (acceptablePrice == 0) revert InvalidAcceptablePrice();
+        if (closeBps == 0 || closeBps >= BPS_DENOMINATOR) revert InvalidCloseBps(closeBps);
+        if (triggerPrice == 0) revert InvalidTriggerPrice();
+
+        bytes32 key = _positionKey(msg.sender, market, isLong);
+        Position memory pos = positions[key];
+        if (pos.sizeUsd == 0) revert NoOpenPosition();
+        if (closePending[key]) revert CloseAlreadyPending();
+
+        // Dust guard: the remainder must still clear the minimum-collateral floor.
+        uint256 remainingCollateral = pos.collateral - Math.mulDiv(pos.collateral, closeBps, BPS_DENOMINATOR);
+        if (remainingCollateral < MIN_COLLATERAL) revert CollateralTooLow(remainingCollateral, MIN_COLLATERAL);
+
+        // Effects.
+        closePending[key] = true;
+        requestId = nextRequestId++;
+        requests[requestId] = Request({
+            owner: msg.sender,
+            market: market,
+            isLong: isLong,
+            kind: RequestKind.Decrease,
+            collateral: 0,
+            leverage: closeBps, // OVERLOAD: Decrease carries closeBps here (see {Request}).
+            acceptablePrice: acceptablePrice,
+            executionFee: EXECUTION_FEE,
+            requestTimestamp: block.timestamp,
+            active: true
+        });
+        triggers[requestId] = Trigger({triggerPrice: triggerPrice, triggerAbove: triggerAbove});
+
+        // Interaction LAST (CEI).
+        asset.safeTransferFrom(msg.sender, address(this), EXECUTION_FEE);
+
+        emit TriggerDecreaseRequested(
+            requestId, msg.sender, market, isLong, closeBps, acceptablePrice, triggerPrice, triggerAbove, EXECUTION_FEE
+        );
+    }
+
+    /**
      * @notice Keeper-fill a queued request at a fresh post-request price. The
      *         caller MUST append a fresh signed RedStone payload for the request's
      *         market. On a successful fill the keeper earns the escrowed
@@ -1453,11 +1661,26 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
 
         bytes32 key = _positionKey(r.owner, r.market, r.isLong);
 
-        if (!_withinSlippage(r.kind, r.isLong, price, r.acceptablePrice)) {
-            // Slippage miss: cancel + full refund to the owner, keeper unpaid. The
-            // escrow shape and the mutex cross-cut by kind: every non-Open kind holds
-            // the closePending mutex (clear it), while Open AND Increase escrowed
-            // collateral + fee (refund both); Close/Decrease escrowed only the fee.
+        // Slippage holds once for both paths; the gate below branches on whether
+        // this is a RESTING trigger order (triggers[id] set) or a market order.
+        Trigger memory tr = triggers[requestId];
+        bool isTrigger = tr.triggerPrice != 0;
+        bool slipOk = _withinSlippage(r.kind, r.isLong, price, r.acceptablePrice);
+
+        if (isTrigger) {
+            // Resting order: REVERT (never cancel) until both gates pass. The revert
+            // rolls back the whole tx — including the `active = false` consumption
+            // above — so the request stays active and the keeper simply retries. No
+            // state write below a TriggerNotMet/SlippageNotMet revert may survive.
+            bool met = tr.triggerAbove ? price >= tr.triggerPrice : price <= tr.triggerPrice;
+            if (!met) revert TriggerNotMet(price, tr.triggerPrice, tr.triggerAbove);
+            if (!slipOk) revert SlippageNotMet(price, r.acceptablePrice);
+        } else if (!slipOk) {
+            // Market order: cancel + full refund to the owner, keeper unpaid
+            // (UNCHANGED from today). The escrow shape and the mutex cross-cut by
+            // kind: every non-Open kind holds the closePending mutex (clear it),
+            // while Open AND Increase escrowed collateral + fee (refund both);
+            // Close/Decrease escrowed only the fee.
             if (r.kind != RequestKind.Open) closePending[key] = false;
             if (r.kind == RequestKind.Open || r.kind == RequestKind.Increase) {
                 asset.safeTransfer(r.owner, r.collateral + r.executionFee);
@@ -1487,6 +1710,9 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
             }
         }
 
+        // On a successful fill, clear the (harmless if unset) trigger slot.
+        if (isTrigger) delete triggers[requestId];
+
         // Keeper earns the fee ONLY on a successful fill.
         asset.safeTransfer(msg.sender, r.executionFee);
 
@@ -1510,6 +1736,8 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
 
         // Effect.
         requests[requestId].active = false;
+        // Harmless no-op for a market order (slot unset); tears down a resting trigger.
+        delete triggers[requestId];
 
         // Interaction: full escrow back to the owner. Every non-Open kind holds the
         // closePending mutex (clear it); Open AND Increase escrowed collateral + fee
