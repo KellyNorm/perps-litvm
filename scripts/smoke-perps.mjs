@@ -13,6 +13,9 @@
 //   7 TRIGGER-OPEN  (resting, not met) — execute REVERTS, the order stays active
 //   8 OPEN-SHORT    open a SHORT with the DOWN buffer (acceptable = P*0.93)
 //   9 CLOSE-SHORT   close it with the UP buffer (acceptable = P*1.07)
+//  10 OPEN-LONG     fresh long, subject of the trigger walk     (size == collateral*lev)
+//  11 TRIGGER-DECREASE 50% (TRUE gate, already met) -> partial close, size halves
+//  12 TRIGGER-CLOSE remainder (FALSE gate, already met) -> size 0
 //
 // Steps 1-6 only ever exercised LONGs, so they never tested the long/short-aware
 // half of the slippage gate. Steps 8/9 do, using the SAME acceptablePrice convention
@@ -23,6 +26,22 @@
 // long/short-aware and the frontend matrix is correct. If it slippage-CANCELS, the
 // engine groups by open/close only and the frontend's short buffer is on the wrong
 // side — the step FAILS and says so rather than widening the buffer to hide it.
+//
+// TRIGGER WALK (steps 10-12): steps 6/7 only ever hit the TRUE gate on a long TP
+// and a resting NOT-met open. This self-contained walk fills the gaps — the
+// requestTriggerDecrease entrypoint, and the FALSE-gate direction — using the SAME
+// convention the frontend uses to derive the boolean from a user-picked threshold:
+//   triggerAbove = (triggerPrice >= mark)   (above mark fires UP=true, below fires DOWN=false)
+// matching the contract gate: true => fill once price >= trigger, false => once price <= trigger.
+// The live redstone-main-demo feed can't be driven across a threshold mid-run, so we
+// can't rest an order and wait for a real cross. Instead each step places its threshold
+// on the ALREADY-MET side (the inverse of where a resting order sits) so the gate fires
+// same-block: TRUE gate met with trigger = P*0.9 (below mark, price >= trigger holds);
+// FALSE gate met with trigger = P*1.1 (above mark, price <= trigger holds). A pass thus
+// confirms the contract's triggerAbove booleans mean exactly what the UI's convention
+// assumes — validating the UI logic without moving the feed. The "rest -> later cross ->
+// fill" path is forge-covered by PR-10 (TriggerEntries.t.sol / TriggerExits.t.sol); step 7
+// keeps a real resting NOT-met order on-chain as the live rest case.
 //
 // Every two-step action is: request (plain call, NO payload) -> waitForFreshPayload ->
 // executeRequest WITH a fresh signed RedStone payload (the keeper step).
@@ -665,6 +684,70 @@ async function main() {
     console.log(`    filled at ${f8(out.price)}  position: size ${f18(pos.sizeUsd)} USD`);
     await expect(pos.sizeUsd.eq(0), name, `short not fully closed: sizeUsd ${f18(pos.sizeUsd)}`);
     passStep(name, `short closed to size 0, filled at ${f8(out.price)} with the UP buffer`);
+  }
+
+  // ===== TRIGGER WALK (steps 10-12): gate-direction + requestTriggerDecrease ===
+  // Self-contained: opens its own fresh long, then exercises the TRUE gate via
+  // requestTriggerDecrease and the FALSE gate via requestTriggerClose. Thresholds
+  // sit on the already-met side (see the header note) so each fires same-block on
+  // the live feed; a pass proves the contract gate booleans match the frontend's
+  // `triggerAbove = triggerPrice >= mark` convention. The "place not-met -> mark
+  // crosses -> fills" rest path is forge-covered (PR-10); step 7 above left a real
+  // resting NOT-met trigger-open on-chain as the live rest case.
+  const TRIG_DOWN = pct(P, 90); // P*0.9, below mark -> TRUE gate already met (price >= trigger)
+  const TRIG_UP = pct(P, 110); // P*1.1, above mark -> FALSE gate already met (price <= trigger)
+
+  // ===== STEP 10: OPEN fresh long (trigger-walk subject) ===================
+  console.log("\n--- 10 OPEN long (trigger walk subject) ------------------");
+  {
+    const name = "10 OPEN long";
+    await walk(
+      `requestOpen BTC long ${f18(OPEN_COLLATERAL)} mUSD @ ${OPEN_LEVERAGE}x (ceiling ${f8(BUY)})...`,
+      () => mgr.requestOpen(market, true, OPEN_COLLATERAL, OPEN_LEVERAGE, BUY),
+    );
+    const pos = await mgr.positions(key);
+    const expectedSize = OPEN_COLLATERAL.mul(OPEN_LEVERAGE); // 5000e18
+    console.log(`  position: size ${f18(pos.sizeUsd)} USD  collateral ${f18(pos.collateral)} mUSD  entry ${f8(pos.entryPrice)}`);
+    await expect(pos.sizeUsd.eq(expectedSize), name, `sizeUsd ${f18(pos.sizeUsd)} != ${f18(expectedSize)}`);
+    passStep(name, `fresh long size ${f18(expectedSize)}`);
+  }
+
+  // ===== STEP 11: TRIGGER-DECREASE 50% (TRUE gate, already met) ============
+  console.log("\n--- 11 TRIGGER-DECREASE 50% (TRUE gate, met) -------------");
+  {
+    const name = "11 TRIGGER-DECREASE";
+    // trigger = P*0.9 sits BELOW mark, so the TRUE gate (fill once price >= trigger)
+    // is already satisfied -> the decrease fills in the same block.
+    const { fill } = await walk(
+      `requestTriggerDecrease BTC long ${DECREASE_BPS}bps (floor ${f8(SELL)}, trigger ${f8(TRIG_DOWN)}=P*0.9, above=true)...`,
+      () => mgr.requestTriggerDecrease(market, true, DECREASE_BPS, SELL, TRIG_DOWN, true),
+    );
+    const pos = await mgr.positions(key);
+    const expectedSize = ethers.utils.parseUnits("2500", 18); // 5000 * 50%
+    console.log(`  filled at ${f8(fill)}  (TRUE gate: fill >= trigger ${f8(TRIG_DOWN)})`);
+    console.log(`  position: size ${f18(pos.sizeUsd)} USD  collateral ${f18(pos.collateral)} mUSD`);
+    await expect(pos.sizeUsd.eq(expectedSize), name, `sizeUsd ${f18(pos.sizeUsd)} != ${f18(expectedSize)} (size did not halve)`);
+    await expect(fill.gte(TRIG_DOWN), name, `fill ${f8(fill)} < trigger ${f8(TRIG_DOWN)} — TRUE gate should not have fired`);
+    passStep(name, `size halved to ${f18(expectedSize)}, fill ${f8(fill)} >= trigger ${f8(TRIG_DOWN)} (TRUE gate)`);
+  }
+
+  // ===== STEP 12: TRIGGER-CLOSE remainder (FALSE gate, already met) ========
+  console.log("\n--- 12 TRIGGER-CLOSE remainder (FALSE gate, met) ---------");
+  {
+    const name = "12 TRIGGER-CLOSE (FALSE gate)";
+    // trigger = P*1.1 sits ABOVE mark, so the FALSE gate (fill once price <= trigger)
+    // is already satisfied -> the close fills the remainder to size 0. This is the
+    // FALSE-gate direction the long-only TP step (6, above=true) never exercised.
+    const { fill } = await walk(
+      `requestTriggerClose BTC long (floor ${f8(SELL)}, trigger ${f8(TRIG_UP)}=P*1.1, above=false)...`,
+      () => mgr.requestTriggerClose(market, true, SELL, TRIG_UP, false),
+    );
+    const pos = await mgr.positions(key);
+    console.log(`  filled at ${f8(fill)}  (FALSE gate: fill <= trigger ${f8(TRIG_UP)})`);
+    console.log(`  position: size ${f18(pos.sizeUsd)} USD`);
+    await expect(pos.sizeUsd.eq(0), name, `position not fully closed: sizeUsd ${f18(pos.sizeUsd)}`);
+    await expect(fill.lte(TRIG_UP), name, `fill ${f8(fill)} > trigger ${f8(TRIG_UP)} — FALSE gate should not have fired`);
+    passStep(name, `size 0, fill ${f8(fill)} <= trigger ${f8(TRIG_UP)} (FALSE gate fired)`);
   }
 
   console.log("\nNote: on-chain liquidation (PR-5) is intentionally SKIPPED — the live demo feed");
