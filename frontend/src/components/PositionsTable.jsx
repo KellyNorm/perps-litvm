@@ -1,5 +1,5 @@
-import { fmtUsd, fmt2, fmtSigned } from "../lib/format.js";
-import { signedPnl, liqPrice, health, healthColor } from "../lib/engine.js";
+import { fmtUsd, fmtSigned } from "../lib/format.js";
+import { signedPnl, liqPrice, health, healthColor, MIN_COLLATERAL } from "../lib/engine.js";
 
 // Default slippage for close / partial-close (the order panel carries the selector
 // for opens; closes use a sensible 0.5% bound). The two-step loop auto-cancels +
@@ -49,12 +49,27 @@ export default function PositionsTable({ account, positions, marks, trade, wrong
       );
     }
     const disabled = wrongChain || trade?.inProgress;
+    // Dust guard (mirrors requestDecrease): a partial close that would leave the
+    // remainder below MIN_COLLATERAL reverts on-chain, so disable it here.
+    const dust25 = p.collateral * 0.75 < MIN_COLLATERAL;
+    const dust50 = p.collateral * 0.5 < MIN_COLLATERAL;
+    const dustTip = `Would leave less than ${MIN_COLLATERAL} mUSD collateral — use Close instead`;
     return (
       <span className="row-acts">
-        <button className="rowbtn" disabled={disabled} onClick={() => act(p, "decrease", 2500)} title="Close 25% of this position">
+        <button
+          className="rowbtn"
+          disabled={disabled || dust25}
+          onClick={() => act(p, "decrease", 2500)}
+          title={dust25 ? dustTip : "Close 25% of this position"}
+        >
           −25%
         </button>
-        <button className="rowbtn" disabled={disabled} onClick={() => act(p, "decrease", 5000)} title="Close 50% of this position">
+        <button
+          className="rowbtn"
+          disabled={disabled || dust50}
+          onClick={() => act(p, "decrease", 5000)}
+          title={dust50 ? dustTip : "Close 50% of this position"}
+        >
           −50%
         </button>
         <button className="rowbtn close" disabled={disabled} onClick={() => act(p, "close")} title="Close the whole position">

@@ -109,14 +109,27 @@ export default function App() {
                 </div>
 
                 {tab === "pos" ? (
-                  <PositionsTable account={account} positions={positions} marks={marks} />
+                  <PositionsTable account={account} positions={positions} marks={marks} trade={trade} wrongChain={wrongChain} />
                 ) : (
                   <VaultPanel vault={vault} yourDeposit={yourDeposit} account={account} />
                 )}
               </div>
             </div>
 
-            <OrderTicket meta={meta} mark={marks[selected]} state={states[selected]} musdBalance={balances.musd} />
+            <OrderTicket
+              meta={meta}
+              mark={marks[selected]}
+              state={states[selected]}
+              musdBalance={balances.musd}
+              nativeBalance={balances.native}
+              positions={positions}
+              trade={trade}
+              account={account}
+              wrongChain={wrongChain}
+              onConnect={wallet.connect}
+              onSwitch={wallet.switchChain}
+              onFaucet={() => setModalOpen(true)}
+            />
           </div>
         </>
       ) : (
@@ -140,9 +153,17 @@ export default function App() {
         toast={showToast}
       />
 
+      <TradeStatus
+        flow={trade.flow}
+        cancelDelay={trade.CANCEL_DELAY}
+        onResume={trade.resume}
+        onCancel={trade.cancelPending}
+        onDismiss={trade.dismiss}
+      />
+
       <div className={"toast" + (toast.show ? " show" : "") + (toast.err ? " err" : "")}>{toast.msg}</div>
       <div className="demo-tag">
-        Read-only · <b>TachyonFi</b> · live on LiteForge 4441
+        <b>TachyonFi</b> · live on LiteForge 4441
         {account && balances.native != null ? ` · ${balances.native.toFixed(3)} zkLTC` : ""}
       </div>
     </>

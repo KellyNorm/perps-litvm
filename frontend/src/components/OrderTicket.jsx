@@ -10,7 +10,7 @@ import { SLIPPAGE_OPTIONS } from "../lib/trade.js";
 // (request -> wait for a fresh payload -> self-keeper execute). Close / partial-close
 // live in the positions table. All preview numbers still come from the live mark +
 // engine math so the readout stays honest.
-export default function OrderTicket({ meta, mark, state, musdBalance, positions, trade, account, wrongChain, onConnect, onSwitch }) {
+export default function OrderTicket({ meta, mark, state, musdBalance, nativeBalance, positions, trade, account, wrongChain, onConnect, onSwitch, onFaucet }) {
   const [side, setSide] = useState("long");
   const [coll, setColl] = useState(100);
   const [lev, setLev] = useState(2);
@@ -51,11 +51,18 @@ export default function OrderTicket({ meta, mark, state, musdBalance, positions,
   const collNum = Number(coll) || 0;
   const tooSmall = collNum < MIN_COLLATERAL;
   const overBalance = musdBalance != null && collNum > musdBalance;
-  const canSubmit = account && !wrongChain && price != null && !tooSmall && !overBalance && !busy;
+  // Token preconditions: opening/increasing needs zkLTC for gas AND mUSD (collateral +
+  // the 0.5 fee). With either missing, route the user to the faucet instead of a dead
+  // disabled button.
+  const needsGas = account && !wrongChain && nativeBalance != null && nativeBalance <= 0;
+  const needsMusd = account && !wrongChain && musdBalance != null && musdBalance <= 0;
+  const needsTokens = needsGas || needsMusd;
+  const canSubmit = account && !wrongChain && !needsTokens && price != null && !tooSmall && !overBalance && !busy;
 
   function submit() {
     if (!account) return onConnect?.();
     if (wrongChain) return onSwitch?.();
+    if (needsTokens) return onFaucet?.();
     trade.submit({ action, symbol: meta.symbol, isLong, collateral: collNum, leverage: lev, slipFrac: slip });
   }
 
@@ -63,6 +70,8 @@ export default function OrderTicket({ meta, mark, state, musdBalance, positions,
   let btnLabel;
   if (!account) btnLabel = "Connect wallet to trade";
   else if (wrongChain) btnLabel = "Switch to LiteForge (4441)";
+  else if (needsGas) btnLabel = "Get zkLTC gas to trade →";
+  else if (needsMusd) btnLabel = "Get mUSD to trade →";
   else if (busy && myFlow) btnLabel = myFlow.phase === "approving" ? "Approving…" : myFlow.phase === "executing" ? "Executing…" : "Working…";
   else btnLabel = `${verb} ${side} · ${meta.symbol}`;
 
@@ -170,12 +179,14 @@ export default function OrderTicket({ meta, mark, state, musdBalance, positions,
         </div>
       </div>
 
-      {account && !wrongChain && tooSmall && <div className="ticket-warn">Minimum collateral is {MIN_COLLATERAL} mUSD.</div>}
-      {account && !wrongChain && !tooSmall && overBalance && <div className="ticket-warn">Collateral exceeds your mUSD balance.</div>}
+      {account && !wrongChain && !needsTokens && tooSmall && <div className="ticket-warn">Minimum collateral is {MIN_COLLATERAL} mUSD.</div>}
+      {account && !wrongChain && !needsTokens && !tooSmall && overBalance && (
+        <div className="ticket-warn">Collateral exceeds your mUSD balance.</div>
+      )}
 
       <button
-        className={"open-btn " + side + (igniting ? " igniting" : "")}
-        disabled={account && !wrongChain && !canSubmit}
+        className={"open-btn " + side + (igniting ? " igniting" : "") + (needsTokens ? " cta" : "")}
+        disabled={account && !wrongChain && !needsTokens && !canSubmit}
         onClick={submit}
       >
         {btnLabel}
