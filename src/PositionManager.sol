@@ -289,6 +289,21 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
         uint256 badDebt;
     }
 
+    /**
+     * @dev Transient (memory-only) settlement outcome of a partial close, packed
+     *      into a struct so {_decreasePosition}'s 12-field {PositionDecreased} emit
+     *      stays within the EVM stack limit. See {_decreasePosition}.
+     */
+    struct DecreaseResult {
+        bool profit;
+        uint256 pnl;
+        uint256 borrowFee;
+        int256 fundingOwed;
+        uint256 payout;
+        uint256 remainingSizeUsd;
+        uint256 remainingCollateral;
+    }
+
     /// @notice Open positions keyed by keccak256(owner, market, isLong).
     mapping(bytes32 => Position) public positions;
 
@@ -306,11 +321,12 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
 
     // --- two-step deferred execution state (PR-6b) -----------------------
 
-    /// @notice Whether a queued request opens a new position or closes an
-    ///         existing one.
+    /// @notice Whether a queued request opens a new position, closes an existing
+    ///         one in full, or closes a fraction of it (decrease).
     enum RequestKind {
         Open,
-        Close
+        Close,
+        Decrease
     }
 
     /**
@@ -323,9 +339,15 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
      * @param  owner            Trader who queued the request and owns the escrow.
      * @param  market           Market feed id (MARKET_BTC or MARKET_ETH).
      * @param  isLong           Direction of the position to open/close.
-     * @param  kind             Open or Close.
-     * @param  collateral       Collateral escrowed (Open only; 0 for Close).
-     * @param  leverage         Leverage multiplier (Open only; 0 for Close).
+     * @param  kind             Open, Close, or Decrease.
+     * @param  collateral       Collateral escrowed (Open only; 0 for Close/Decrease).
+     * @param  leverage         OVERLOADED by kind to keep the struct arity (and the
+     *                          {requests} getter / test destructures) unchanged:
+     *                          for Open it is the leverage multiplier; for Decrease
+     *                          it carries `closeBps`, the fraction to close in basis
+     *                          points; for Close it is unused (0). Open never reads
+     *                          it as closeBps and Close/Decrease never read it as
+     *                          leverage, so the overload is unambiguous per kind.
      * @param  acceptablePrice  Directional slippage bound (1e8); see {_withinSlippage}.
      * @param  executionFee     Keeper fee escrowed at request ({EXECUTION_FEE}).
      * @param  requestTimestamp `block.timestamp` when the request was queued.
@@ -382,6 +404,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
     error PriceBeforeRequest(uint256 priceTs, uint256 minTs);
     error InvalidAcceptablePrice();
     error CloseAlreadyPending();
+    error InvalidCloseBps(uint256 bps);
 
     // --- events ----------------------------------------------------------
 
@@ -457,6 +480,36 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
         bool isLong,
         uint256 acceptablePrice,
         uint256 executionFee
+    );
+
+    /// @dev `closeBps` is the fraction (basis points) to decrease, carried in the
+    ///      request's overloaded `leverage` field. See {requestDecrease}.
+    event DecreaseRequested(
+        uint256 indexed requestId,
+        address indexed owner,
+        bytes32 indexed market,
+        bool isLong,
+        uint256 closeBps,
+        uint256 acceptablePrice,
+        uint256 executionFee
+    );
+
+    /// @dev Emitted when a fraction `closeBps` of a position is closed. The
+    ///      remainder keeps the original entry price and entry fee/funding indices;
+    ///      `remainingSizeUsd`/`remainingCollateral` are the post-decrease values.
+    event PositionDecreased(
+        address indexed owner,
+        bytes32 indexed market,
+        bool isLong,
+        uint256 closeBps,
+        uint256 exitPrice,
+        bool profit,
+        uint256 pnl,
+        uint256 borrowFee,
+        int256 funding,
+        uint256 payout,
+        uint256 remainingSizeUsd,
+        uint256 remainingCollateral
     );
 
     event RequestExecuted(uint256 indexed requestId, address indexed keeper, uint256 executionPrice);
@@ -658,6 +711,113 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
         payout = _settle(pos, profit, pnl, borrowFee, fundingOwed);
 
         emit PositionClosed(pos.owner, market, isLong, exitPrice, profit, pnl, borrowFee, fundingOwed, payout);
+    }
+
+    /**
+     * @notice Price-parameterized core of the partial-close (decrease) path:
+     *         realize a fraction `closeBps` of a position at `exitPrice`, paying out
+     *         that fraction's P&L / borrow fee / funding and returning that
+     *         fraction's collateral, while leaving a SMALLER position behind.
+     * @dev    The closed fraction is modeled as a SYNTHETIC sub-position that shares
+     *         the original's entry price and entry fee/funding indices but has the
+     *         scaled `sizeUsd`/`collateral`. It is then settled by EXACTLY the
+     *         full-close rules — {_computePnl}, {_accrueFee}, {_accrueFundingOwed},
+     *         and {_settle} are reused UNCHANGED — so a 50% decrease of a size-S
+     *         position settles identically to a full close of an independent
+     *         size-S/2 position with the same entry, collateral, and timing.
+     *
+     *         INVARIANTS (why there is no double-count):
+     *         - The remainder keeps the ORIGINAL entry price and the ORIGINAL entry
+     *           fee/funding indices. The closed fraction stops accruing at close
+     *           time; the remainder keeps accruing from entry on its smaller size,
+     *           so nothing is charged twice and nothing is dropped.
+     *         - {_updateMarket} removes EXACTLY `closedSize` and its entry-priced
+     *           weight `closedSize/entry`, leaving the remainder's book contribution
+     *           intact (the surviving `sizeUsd`/`entry` are unchanged).
+     *         - Reserve releases EXACTLY `closedCollateral * MAX_PROFIT_FACTOR`,
+     *           matching the slice of reserve the closed collateral backed.
+     *         - {_computePnl}'s cap/floor apply to the synthetic sub-position, so the
+     *           profit cap / loss floor scale proportionally with the closed size.
+     *
+     *         CEI: compute P&L -> snapshot fee/funding & shrink storage (effects) ->
+     *         settle the closed fraction (interaction). Runs under
+     *         {executeRequest}'s `nonReentrant` guard (so it adds none of its own).
+     * @param  owner     Position owner (the trader).
+     * @param  market    Market feed id.
+     * @param  isLong    Direction of the position to decrease.
+     * @param  closeBps  Fraction to close, in basis points, in (0, 10000).
+     * @param  exitPrice Exit mark price (1e8), supplied by the caller.
+     * @return payout    Asset paid out to the trader for the closed fraction.
+     */
+    function _decreasePosition(address owner, bytes32 market, bool isLong, uint256 closeBps, uint256 exitPrice)
+        internal
+        returns (uint256 payout)
+    {
+        bytes32 key = _positionKey(owner, market, isLong);
+        Position memory pos = positions[key];
+        if (pos.sizeUsd == 0) revert NoOpenPosition();
+        if (exitPrice == 0) revert InvalidPrice();
+
+        uint256 closedSize = Math.mulDiv(pos.sizeUsd, closeBps, BPS_DENOMINATOR);
+        uint256 closedCollateral = Math.mulDiv(pos.collateral, closeBps, BPS_DENOMINATOR);
+
+        // Capture the remainder NOW, before the synthetic sub-position is built:
+        // `closedPos = pos` aliases `pos`'s memory, so mutating `closedPos.sizeUsd`
+        // below would also overwrite `pos.sizeUsd`. The remainder is what survives
+        // in storage — same entry price & entry indices, smaller size/collateral.
+        DecreaseResult memory d;
+        d.remainingSizeUsd = pos.sizeUsd - closedSize;
+        d.remainingCollateral = pos.collateral - closedCollateral;
+
+        // Synthetic sub-position: same entry & indices, scaled size/collateral.
+        Position memory closedPos = pos;
+        closedPos.sizeUsd = closedSize;
+        closedPos.collateral = closedCollateral;
+
+        // Settlement outputs packed into the same memory struct so the 12-field emit
+        // in the settle helper stays within the EVM stack limit.
+        (d.profit, d.pnl) = _computePnl(closedPos, exitPrice); // proportional cap/floor
+        d.borrowFee = _accrueFee(closedPos); // accrues market borrow index once
+        d.fundingOwed = _accrueFundingOwed(closedPos); // accrues market funding index once
+
+        // Effects: shrink in place; entry price & entry indices UNCHANGED.
+        positions[key].sizeUsd = d.remainingSizeUsd;
+        positions[key].collateral = d.remainingCollateral;
+        _updateMarket(market, isLong, closedSize, pos.entryPrice, exitPrice, false);
+        totalReserved -= closedCollateral * MAX_PROFIT_FACTOR;
+
+        // Interaction + event in a helper to bound this frame's stack.
+        payout = _settleDecrease(closedPos, closeBps, exitPrice, d);
+    }
+
+    /**
+     * @dev Settles a decrease's closed fraction by the full-close rules ({_settle},
+     *      reused UNCHANGED) and emits {PositionDecreased} with the post-shrink
+     *      remainder read from storage. Interactions only — all state effects ran in
+     *      {_decreasePosition} before this call, so it runs under that path's CEI
+     *      ordering and the `nonReentrant` guard. Split out solely to keep the
+     *      caller's stack within the EVM limit (mirrors {_settleLiquidation}).
+     */
+    function _settleDecrease(Position memory closedPos, uint256 closeBps, uint256 exitPrice, DecreaseResult memory d)
+        internal
+        returns (uint256 payout)
+    {
+        payout = _settle(closedPos, d.profit, d.pnl, d.borrowFee, d.fundingOwed);
+
+        emit PositionDecreased(
+            closedPos.owner,
+            closedPos.market,
+            closedPos.isLong,
+            closeBps,
+            exitPrice,
+            d.profit,
+            d.pnl,
+            d.borrowFee,
+            d.fundingOwed,
+            payout,
+            d.remainingSizeUsd,
+            d.remainingCollateral
+        );
     }
 
     /**
@@ -931,6 +1091,68 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
     }
 
     /**
+     * @notice Queue a deferred partial CLOSE (decrease) of the caller's open
+     *         position: close a fraction `closeBps` of it at a keeper-filled price,
+     *         leaving a SMALLER position with the SAME entry price and SAME entry
+     *         fee/funding indices. Like {requestClose}, only the {EXECUTION_FEE} is
+     *         escrowed (the position's collateral is already held). A keeper fills
+     *         it later at a post-request price.
+     * @dev    Rides the same two-step machinery as a full close: it sets
+     *         {closePending} on the position key (so a decrease and a close cannot
+     *         be queued at once) and the executor settles it via {_decreasePosition}.
+     *         CEI: validate -> mark pending & record request (state) -> pull fee
+     *         (interaction). `nonReentrant`.
+     *
+     *         The fraction is carried in the request's OVERLOADED `leverage` field
+     *         (Close/Decrease never use it as leverage); see {Request} and
+     *         {executeRequest}. `closeBps` is strictly within (0, 10000): a full
+     *         close must go through {requestClose}, and a 0% close is a no-op.
+     * @param  market          Market feed id.
+     * @param  isLong          Direction of the position to decrease.
+     * @param  closeBps        Fraction to close, in basis points, in (0, 10000).
+     * @param  acceptablePrice Directional slippage bound (1e8); see {_withinSlippage}.
+     * @return requestId       Id of the queued request.
+     */
+    function requestDecrease(bytes32 market, bool isLong, uint256 closeBps, uint256 acceptablePrice)
+        external
+        nonReentrant
+        returns (uint256 requestId)
+    {
+        if (acceptablePrice == 0) revert InvalidAcceptablePrice();
+        if (closeBps == 0 || closeBps >= BPS_DENOMINATOR) revert InvalidCloseBps(closeBps);
+
+        bytes32 key = _positionKey(msg.sender, market, isLong);
+        Position memory pos = positions[key];
+        if (pos.sizeUsd == 0) revert NoOpenPosition();
+        if (closePending[key]) revert CloseAlreadyPending();
+
+        // Dust guard: the remainder must still clear the minimum-collateral floor.
+        uint256 remainingCollateral = pos.collateral - Math.mulDiv(pos.collateral, closeBps, BPS_DENOMINATOR);
+        if (remainingCollateral < MIN_COLLATERAL) revert CollateralTooLow(remainingCollateral, MIN_COLLATERAL);
+
+        // Effects.
+        closePending[key] = true;
+        requestId = nextRequestId++;
+        requests[requestId] = Request({
+            owner: msg.sender,
+            market: market,
+            isLong: isLong,
+            kind: RequestKind.Decrease,
+            collateral: 0,
+            leverage: closeBps, // OVERLOAD: Decrease carries closeBps here (see {Request}).
+            acceptablePrice: acceptablePrice,
+            executionFee: EXECUTION_FEE,
+            requestTimestamp: block.timestamp,
+            active: true
+        });
+
+        // Interaction LAST (CEI).
+        asset.safeTransferFrom(msg.sender, address(this), EXECUTION_FEE);
+
+        emit DecreaseRequested(requestId, msg.sender, market, isLong, closeBps, acceptablePrice, EXECUTION_FEE);
+    }
+
+    /**
      * @notice Keeper-fill a queued request at a fresh post-request price. The
      *         caller MUST append a fresh signed RedStone payload for the request's
      *         market. On a successful fill the keeper earns the escrowed
@@ -970,23 +1192,31 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
 
         if (!_withinSlippage(r.kind, r.isLong, price, r.acceptablePrice)) {
             // Slippage miss: cancel + full refund to the owner, keeper unpaid.
-            if (r.kind == RequestKind.Close) {
+            // Open escrows collateral + fee; Close/Decrease escrow only the fee and
+            // hold the closePending flag, so both clear it and refund the fee.
+            if (r.kind == RequestKind.Open) {
+                asset.safeTransfer(r.owner, r.collateral + r.executionFee);
+            } else {
                 closePending[key] = false;
                 asset.safeTransfer(r.owner, r.executionFee);
-            } else {
-                asset.safeTransfer(r.owner, r.collateral + r.executionFee);
             }
             emit RequestCancelled(requestId, r.owner, true);
             return;
         }
 
-        // Fill.
+        // Fill. Open is its own path (pre-escrowed collateral); Close and Decrease
+        // share the closePending teardown and only differ in the settlement core.
         if (r.kind == RequestKind.Open) {
             // Collateral was pre-escrowed at request time -> pullCollateral=false.
             _openPosition(r.owner, r.market, r.isLong, r.collateral, r.leverage, price, false);
         } else {
             closePending[key] = false;
-            _closePosition(r.owner, r.market, r.isLong, price);
+            if (r.kind == RequestKind.Close) {
+                _closePosition(r.owner, r.market, r.isLong, price);
+            } else {
+                // OVERLOAD: r.leverage carries closeBps for a Decrease (see {Request}).
+                _decreasePosition(r.owner, r.market, r.isLong, r.leverage, price);
+            }
         }
 
         // Keeper earns the fee ONLY on a successful fill.
@@ -1013,12 +1243,13 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
         // Effect.
         requests[requestId].active = false;
 
-        // Interaction: full escrow back to the owner.
-        if (r.kind == RequestKind.Close) {
+        // Interaction: full escrow back to the owner. Open escrowed collateral +
+        // fee; Close/Decrease escrowed only the fee and hold closePending.
+        if (r.kind == RequestKind.Open) {
+            asset.safeTransfer(r.owner, r.collateral + r.executionFee);
+        } else {
             closePending[_positionKey(r.owner, r.market, r.isLong)] = false;
             asset.safeTransfer(r.owner, r.executionFee);
-        } else {
-            asset.safeTransfer(r.owner, r.collateral + r.executionFee);
         }
 
         emit RequestCancelled(requestId, r.owner, false);
