@@ -6,4 +6,8 @@ libs = ["lib"]
 # (test/ffi/redstone-mock-payload.js) to build mock signed price payloads.
 ffi = true
 
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+
+optimizer = true
+optimizer_runs = 200
