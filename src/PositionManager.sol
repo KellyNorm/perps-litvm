@@ -304,6 +304,20 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
         uint256 remainingCollateral;
     }
 
+    /**
+     * @dev Transient (memory-only) outcome of a position increase, packed into a
+     *      struct so {_increasePosition}'s 9-field {PositionIncreased} emit stays
+     *      within the EVM stack limit. See {_increasePosition}.
+     */
+    struct IncreaseResult {
+        uint256 addSize;
+        uint256 newSizeUsd;
+        uint256 newCollateral;
+        uint256 newEntryPrice;
+        uint256 newEntryBorrow;
+        int256 newEntryFunding;
+    }
+
     /// @notice Open positions keyed by keccak256(owner, market, isLong).
     mapping(bytes32 => Position) public positions;
 
@@ -322,11 +336,15 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
     // --- two-step deferred execution state (PR-6b) -----------------------
 
     /// @notice Whether a queued request opens a new position, closes an existing
-    ///         one in full, or closes a fraction of it (decrease).
+    ///         one in full, closes a fraction of it (decrease), or adds size and
+    ///         collateral to it (increase). Open, Decrease, and Increase escrow
+    ///         and/or move collateral; the three non-Open kinds share the
+    ///         {closePending} position-edit mutex (see {closePending}).
     enum RequestKind {
         Open,
         Close,
-        Decrease
+        Decrease,
+        Increase
     }
 
     /**
@@ -339,15 +357,17 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
      * @param  owner            Trader who queued the request and owns the escrow.
      * @param  market           Market feed id (MARKET_BTC or MARKET_ETH).
      * @param  isLong           Direction of the position to open/close.
-     * @param  kind             Open, Close, or Decrease.
-     * @param  collateral       Collateral escrowed (Open only; 0 for Close/Decrease).
+     * @param  kind             Open, Close, Decrease, or Increase.
+     * @param  collateral       Collateral escrowed: the posted collateral for Open,
+     *                          the added collateral for Increase, 0 for Close/Decrease.
      * @param  leverage         OVERLOADED by kind to keep the struct arity (and the
      *                          {requests} getter / test destructures) unchanged:
-     *                          for Open it is the leverage multiplier; for Decrease
-     *                          it carries `closeBps`, the fraction to close in basis
-     *                          points; for Close it is unused (0). Open never reads
-     *                          it as closeBps and Close/Decrease never read it as
-     *                          leverage, so the overload is unambiguous per kind.
+     *                          for Open it is the leverage multiplier; for Increase
+     *                          it is the leverage applied to the added collateral
+     *                          (its natural meaning); for Decrease it carries
+     *                          `closeBps`, the fraction to close in basis points; for
+     *                          Close it is unused (0). Each kind reads it in exactly
+     *                          one sense, so the overload is unambiguous per kind.
      * @param  acceptablePrice  Directional slippage bound (1e8); see {_withinSlippage}.
      * @param  executionFee     Keeper fee escrowed at request ({EXECUTION_FEE}).
      * @param  requestTimestamp `block.timestamp` when the request was queued.
@@ -372,8 +392,13 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
     /// @notice Monotonic id assigned to the next request.
     uint256 public nextRequestId;
 
-    /// @notice Whether a position key already has a live close request, so a
-    ///         position cannot be double-queued for close.
+    /// @notice General pending position-edit mutex: true while a position key has a
+    ///         live Close, Decrease, OR Increase request, so at most one edit to an
+    ///         existing position can be queued at a time (e.g. a close and an
+    ///         increase cannot both be pending on one position). Open does not use
+    ///         it (it creates a position rather than editing one). Set at request
+    ///         time and cleared on fill or any cancel. Name kept for ABI/test
+    ///         stability though its meaning is now broader than close-only.
     mapping(bytes32 => bool) public closePending;
 
     /// @dev Set ONLY for the duration of {executeRequest}'s oracle read to the
@@ -510,6 +535,36 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
         uint256 payout,
         uint256 remainingSizeUsd,
         uint256 remainingCollateral
+    );
+
+    /// @dev `addCollateral` is escrowed (like an Open) and `addLeverage` carries
+    ///      the natural leverage applied to it (carried in the request's `leverage`
+    ///      field). See {requestIncrease}.
+    event IncreaseRequested(
+        uint256 indexed requestId,
+        address indexed owner,
+        bytes32 indexed market,
+        bool isLong,
+        uint256 addCollateral,
+        uint256 addLeverage,
+        uint256 acceptablePrice,
+        uint256 executionFee
+    );
+
+    /// @dev Emitted when size `addSize` and collateral `addCollateral` are merged
+    ///      into a position at the keeper-filled `fillPrice`. The position keeps a
+    ///      size-weighted blended entry price and blended entry fee/funding indices;
+    ///      `newSizeUsd`/`newCollateral`/`newEntryPrice` are the post-merge values.
+    event PositionIncreased(
+        address indexed owner,
+        bytes32 indexed market,
+        bool isLong,
+        uint256 fillPrice,
+        uint256 addCollateral,
+        uint256 addSize,
+        uint256 newSizeUsd,
+        uint256 newCollateral,
+        uint256 newEntryPrice
     );
 
     event RequestExecuted(uint256 indexed requestId, address indexed keeper, uint256 executionPrice);
@@ -818,6 +873,147 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
             d.remainingSizeUsd,
             d.remainingCollateral
         );
+    }
+
+    /**
+     * @notice Price-parameterized core of the INCREASE path: add `addCollateral` of
+     *         collateral and `addCollateral * addLeverage` of notional to an open
+     *         position at `fillPrice`, merging into it with a size-weighted blended
+     *         entry price AND size-weighted blended entry borrow/funding indices.
+     * @dev    THE KEY INVARIANT — blending the entry INDICES, not just the price,
+     *         makes the future accrual EXACTLY equal to "the old portion accrues from
+     *         its original entry index and the new portion accrues from this increase
+     *         moment," as if the two legs aged independently. Concretely, for the
+     *         borrow index, closing the merged size `N` at a future cumulative index
+     *         `C` charges `N·(C − newEntryBorrow)`, and choosing
+     *         `newEntryBorrow = (sizeUsd·entryBorrow + addSize·curBorrow)/N` makes that
+     *         identically `sizeUsd·(C − entryBorrow) + addSize·(C − curBorrow)` — the
+     *         sum of the two legs aging from their own entry moments. The funding
+     *         index blends the same way (signed). This is WHY no mid-life
+     *         fee/funding realization and no extra transfer are needed: nothing is
+     *         settled now, only re-based.
+     *
+     *         The blended entry PRICE is chosen so the book weight stays additive:
+     *         `newSize/newEntry == sizeUsd/entry + addSize/fillPrice`, i.e. the merged
+     *         position's `Σ size/price` equals the old leg's plus a fresh
+     *         `addSize/fillPrice` chunk — exactly what {_updateMarket} adds below. All
+     *         rounding favors the pool: the entry price rounds UP for a long and DOWN
+     *         for a short (worse cost basis for the trader), and the borrow-index
+     *         increment floors (keeping the blended entry index lower ⇒ more fee owed).
+     *
+     *         Collateral was escrowed at request time, so there is NO pull here (like
+     *         {_openPosition} with `pullCollateral=false`). Runs under
+     *         {executeRequest}'s `nonReentrant` guard (adds none of its own). The
+     *         market borrow/funding indices are advanced to NOW over the OLD skew
+     *         (before this increase changes OI), realizing nothing — exactly the
+     *         pre-trade accrual {_openPosition} performs.
+     * @param  owner        Position owner (the trader).
+     * @param  market       Market feed id.
+     * @param  isLong       Direction of the position to increase.
+     * @param  addCollateral Collateral added (asset units; already escrowed).
+     * @param  addLeverage  Leverage applied to `addCollateral`.
+     * @param  fillPrice    Increase mark price (1e8), supplied by the caller.
+     */
+    function _increasePosition(
+        address owner,
+        bytes32 market,
+        bool isLong,
+        uint256 addCollateral,
+        uint256 addLeverage,
+        uint256 fillPrice
+    ) internal {
+        bytes32 key = _positionKey(owner, market, isLong);
+        Position memory pos = positions[key];
+        if (pos.sizeUsd == 0) revert NoOpenPosition();
+        if (fillPrice == 0) revert InvalidPrice();
+
+        IncreaseResult memory res;
+        res.addSize = addCollateral * addLeverage;
+        res.newSizeUsd = pos.sizeUsd + res.addSize;
+        res.newCollateral = pos.collateral + addCollateral;
+
+        // Solvency gate on the incremental reserve (the SAME check {_openPosition}
+        // performs): reserved liquidity must stay within the configured fraction of
+        // the pool balance.
+        uint256 reserve = addCollateral * MAX_PROFIT_FACTOR;
+        if (totalReserved + reserve > Math.mulDiv(asset.balanceOf(address(pool)), MAX_UTILIZATION_BPS, BPS_DENOMINATOR))
+        {
+            revert ExceedsUtilization();
+        }
+
+        // Compute the blended entry price and the blended entry borrow/funding
+        // indices (which also advances both market indices to NOW over the OLD skew,
+        // before the OI below changes them). Split into a helper to bound this
+        // frame's stack (no via-ir).
+        _blendEntry(market, isLong, pos, fillPrice, res);
+
+        // Effects: write the merged position (collateral, size, blended entry & both
+        // blended entry indices) and bump the reserve.
+        positions[key].collateral = res.newCollateral;
+        positions[key].sizeUsd = res.newSizeUsd;
+        positions[key].entryPrice = res.newEntryPrice;
+        positions[key].entryCumBorrowRate = res.newEntryBorrow;
+        positions[key].entryCumFunding = res.newEntryFunding;
+        totalReserved += reserve;
+
+        // Safety net: the merged leverage never exceeds the cap (both the prior leg
+        // and the added chunk are individually <= MAX_LEVERAGE, so the sum is too).
+        assert(res.newSizeUsd / res.newCollateral <= MAX_LEVERAGE);
+
+        // Aggregates: add addSize to OI and addSize/fillPrice to the weight, exactly
+        // the chunk the blended entry price accounts for. Collateral was escrowed at
+        // request time -> no pull here (like Open with pullCollateral=false).
+        _updateMarket(market, isLong, res.addSize, fillPrice, fillPrice, true);
+
+        emit PositionIncreased(
+            owner,
+            market,
+            isLong,
+            fillPrice,
+            addCollateral,
+            res.addSize,
+            res.newSizeUsd,
+            res.newCollateral,
+            res.newEntryPrice
+        );
+    }
+
+    /**
+     * @dev Advances `market`'s borrow & funding indices to now over the OLD skew
+     *      (realizing nothing — the same pre-trade accrual {_openPosition} does),
+     *      then fills `res` with the size-weighted blended entry price and blended
+     *      entry borrow/funding indices for the merge. Split out of
+     *      {_increasePosition} solely to keep that frame within the EVM stack limit
+     *      (no via-ir). `res.addSize`/`res.newSizeUsd` must already be set.
+     *
+     *      Blended entry PRICE (pool-favorable: long UP / short DOWN) keeps the book
+     *      weight additive — `newSizeUsd/newEntryPrice == sizeUsd/entry +
+     *      addSize/fillPrice`. Blended entry BORROW/FUNDING indices are size-weighted
+     *      so future accrual equals the two legs aging from their own entry moments
+     *      (see {_increasePosition}); the borrow increment floors (pool-favorable),
+     *      and the funding increment truncates its magnitude consistently with
+     *      {_accrueFundingOwed} (sign preserved; magnitude negligible).
+     */
+    function _blendEntry(bytes32 market, bool isLong, Position memory pos, uint256 fillPrice, IncreaseResult memory res)
+        internal
+    {
+        uint256 curBorrow = _accrueBorrow(market);
+        _accrueFunding(market);
+        int256 curFunding = isLong ? markets[market].longCumFunding : markets[market].shortCumFunding;
+
+        res.newEntryPrice = Math.mulDiv(
+            res.newSizeUsd,
+            pos.entryPrice * fillPrice,
+            pos.sizeUsd * fillPrice + res.addSize * pos.entryPrice,
+            isLong ? Math.Rounding.Ceil : Math.Rounding.Floor
+        );
+
+        res.newEntryBorrow =
+            pos.entryCumBorrowRate + Math.mulDiv(res.addSize, curBorrow - pos.entryCumBorrowRate, res.newSizeUsd);
+
+        int256 fDelta = curFunding - pos.entryCumFunding;
+        uint256 fInc = Math.mulDiv(res.addSize, SignedMath.abs(fDelta), res.newSizeUsd);
+        res.newEntryFunding = pos.entryCumFunding + (fDelta >= 0 ? int256(fInc) : -int256(fInc));
     }
 
     /**
@@ -1153,6 +1349,73 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
     }
 
     /**
+     * @notice Queue a deferred INCREASE of the caller's open position: add
+     *         `addCollateral` of collateral and `addCollateral * addLeverage` of
+     *         notional at a keeper-filled price, merging into the existing position
+     *         with a size-weighted blended entry price and blended entry fee/funding
+     *         indices. Mirrors {requestOpen}'s inputs (collateral + leverage): the
+     *         `addCollateral` and the {EXECUTION_FEE} are escrowed here now, and a
+     *         keeper fills it later at a post-request price.
+     * @dev    Rides the same two-step machinery as a close/decrease: it sets the
+     *         {closePending} position-edit mutex on the key (so an increase cannot be
+     *         queued alongside a close or decrease) and the executor settles it via
+     *         {_increasePosition}. CEI: validate fast (BEFORE escrow, mirroring
+     *         {requestDecrease}) -> mark pending & record request (state) -> pull the
+     *         collateral + fee escrow (interaction). `nonReentrant`.
+     *
+     *         The added leverage is carried in the request's OVERLOADED `leverage`
+     *         field in its NATURAL sense (Increase reads it as leverage, never as
+     *         closeBps); see {Request} and {executeRequest}.
+     * @param  market          Market feed id.
+     * @param  isLong          Direction of the position to increase.
+     * @param  addCollateral   Collateral to add (asset units, >= MIN_COLLATERAL).
+     * @param  addLeverage     Leverage applied to the added collateral, in
+     *                         [MIN_LEVERAGE, MAX_LEVERAGE].
+     * @param  acceptablePrice Directional slippage bound (1e8); an increase BUYS into
+     *                         the position, so it uses the OPEN direction; see
+     *                         {_withinSlippage}.
+     * @return requestId       Id of the queued request.
+     */
+    function requestIncrease(
+        bytes32 market,
+        bool isLong,
+        uint256 addCollateral,
+        uint256 addLeverage,
+        uint256 acceptablePrice
+    ) external nonReentrant returns (uint256 requestId) {
+        if (acceptablePrice == 0) revert InvalidAcceptablePrice();
+        if (addLeverage < MIN_LEVERAGE || addLeverage > MAX_LEVERAGE) revert LeverageOutOfRange(addLeverage);
+        if (addCollateral < MIN_COLLATERAL) revert CollateralTooLow(addCollateral, MIN_COLLATERAL);
+
+        bytes32 key = _positionKey(msg.sender, market, isLong);
+        if (positions[key].sizeUsd == 0) revert NoOpenPosition();
+        if (closePending[key]) revert CloseAlreadyPending();
+
+        // Effects.
+        closePending[key] = true;
+        requestId = nextRequestId++;
+        requests[requestId] = Request({
+            owner: msg.sender,
+            market: market,
+            isLong: isLong,
+            kind: RequestKind.Increase,
+            collateral: addCollateral,
+            leverage: addLeverage, // natural meaning (leverage applied to addCollateral)
+            acceptablePrice: acceptablePrice,
+            executionFee: EXECUTION_FEE,
+            requestTimestamp: block.timestamp,
+            active: true
+        });
+
+        // Interaction LAST (CEI): escrow collateral + fee like an Open.
+        asset.safeTransferFrom(msg.sender, address(this), addCollateral + EXECUTION_FEE);
+
+        emit IncreaseRequested(
+            requestId, msg.sender, market, isLong, addCollateral, addLeverage, acceptablePrice, EXECUTION_FEE
+        );
+    }
+
+    /**
      * @notice Keeper-fill a queued request at a fresh post-request price. The
      *         caller MUST append a fresh signed RedStone payload for the request's
      *         market. On a successful fill the keeper earns the escrowed
@@ -1191,27 +1454,32 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
         bytes32 key = _positionKey(r.owner, r.market, r.isLong);
 
         if (!_withinSlippage(r.kind, r.isLong, price, r.acceptablePrice)) {
-            // Slippage miss: cancel + full refund to the owner, keeper unpaid.
-            // Open escrows collateral + fee; Close/Decrease escrow only the fee and
-            // hold the closePending flag, so both clear it and refund the fee.
-            if (r.kind == RequestKind.Open) {
+            // Slippage miss: cancel + full refund to the owner, keeper unpaid. The
+            // escrow shape and the mutex cross-cut by kind: every non-Open kind holds
+            // the closePending mutex (clear it), while Open AND Increase escrowed
+            // collateral + fee (refund both); Close/Decrease escrowed only the fee.
+            if (r.kind != RequestKind.Open) closePending[key] = false;
+            if (r.kind == RequestKind.Open || r.kind == RequestKind.Increase) {
                 asset.safeTransfer(r.owner, r.collateral + r.executionFee);
             } else {
-                closePending[key] = false;
                 asset.safeTransfer(r.owner, r.executionFee);
             }
             emit RequestCancelled(requestId, r.owner, true);
             return;
         }
 
-        // Fill. Open is its own path (pre-escrowed collateral); Close and Decrease
-        // share the closePending teardown and only differ in the settlement core.
+        // Fill. Open is its own path (creates a position; pre-escrowed collateral);
+        // Close/Decrease/Increase all edit an existing position, so they share the
+        // closePending teardown and differ only in the settlement core.
         if (r.kind == RequestKind.Open) {
             // Collateral was pre-escrowed at request time -> pullCollateral=false.
             _openPosition(r.owner, r.market, r.isLong, r.collateral, r.leverage, price, false);
         } else {
             closePending[key] = false;
-            if (r.kind == RequestKind.Close) {
+            if (r.kind == RequestKind.Increase) {
+                // Collateral was pre-escrowed at request time (like Open).
+                _increasePosition(r.owner, r.market, r.isLong, r.collateral, r.leverage, price);
+            } else if (r.kind == RequestKind.Close) {
                 _closePosition(r.owner, r.market, r.isLong, price);
             } else {
                 // OVERLOAD: r.leverage carries closeBps for a Decrease (see {Request}).
@@ -1243,12 +1511,13 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
         // Effect.
         requests[requestId].active = false;
 
-        // Interaction: full escrow back to the owner. Open escrowed collateral +
-        // fee; Close/Decrease escrowed only the fee and hold closePending.
-        if (r.kind == RequestKind.Open) {
+        // Interaction: full escrow back to the owner. Every non-Open kind holds the
+        // closePending mutex (clear it); Open AND Increase escrowed collateral + fee
+        // (refund both), while Close/Decrease escrowed only the fee.
+        if (r.kind != RequestKind.Open) closePending[_positionKey(r.owner, r.market, r.isLong)] = false;
+        if (r.kind == RequestKind.Open || r.kind == RequestKind.Increase) {
             asset.safeTransfer(r.owner, r.collateral + r.executionFee);
         } else {
-            closePending[_positionKey(r.owner, r.market, r.isLong)] = false;
             asset.safeTransfer(r.owner, r.executionFee);
         }
 
@@ -1258,21 +1527,23 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
     /**
      * @dev Directional slippage test for a fill at `price` against the request's
      *      `acceptable` bound (both 1e8). A long wants to BUY low / SELL high, a
-     *      short the reverse:
-     *        - Open  long:  fill `price <= acceptable` (entry not above the cap).
-     *        - Open  short: fill `price >= acceptable` (entry not below the floor).
-     *        - Close long:  fill `price >= acceptable` (exit not below the floor).
-     *        - Close short: fill `price <= acceptable` (exit not above the cap).
+     *      short the reverse. An Increase BUYS into the position, so it uses the
+     *      SAME direction as Open; a Decrease SELLS a fraction, so it uses the Close
+     *      direction:
+     *        - Open/Increase long:  fill `price <= acceptable` (buy not above the cap).
+     *        - Open/Increase short: fill `price >= acceptable` (buy not below the floor).
+     *        - Close/Decrease long:  fill `price >= acceptable` (sell not below the floor).
+     *        - Close/Decrease short: fill `price <= acceptable` (sell not above the cap).
      */
     function _withinSlippage(RequestKind kind, bool isLong, uint256 price, uint256 acceptable)
         internal
         pure
         returns (bool)
     {
-        if (kind == RequestKind.Open) {
+        if (kind == RequestKind.Open || kind == RequestKind.Increase) {
             return isLong ? price <= acceptable : price >= acceptable;
         }
-        return isLong ? price >= acceptable : price <= acceptable;
+        return isLong ? price >= acceptable : price <= acceptable; // Close or Decrease
     }
 
     // --- views -----------------------------------------------------------
