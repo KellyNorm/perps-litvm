@@ -3,14 +3,25 @@ import LeverageSlider from "./LeverageSlider.jsx";
 import { fmtUsd, fmt2 } from "../lib/format.js";
 import { borrowDayFrac, fundingDayFrac, liqPrice, MIN_COLLATERAL } from "../lib/engine.js";
 import { SLIPPAGE_OPTIONS } from "../lib/trade.js";
+import { KIND_OPEN, KIND_INCREASE } from "../lib/triggers.js";
 
 // Trade ticket. Market tab runs the 11b two-step open/increase. Limit & Stop tabs
-// (11c) place a RESTING trigger-open via the shared controller — one leg, then the
+// (11c) place a RESTING trigger entry via the shared controller — one leg, then the
 // order rests on-chain until the browser-keeper poll fills it. triggerAbove is derived
 // from trigger-vs-mark, NOT the Limit/Stop label (which only seeds the default + buffer
-// intent); the "Rests as" badge shows the on-chain truth. A resting open is only
-// offered when there's no position AND no existing resting open on this market+side
-// (the contract reverts PositionAlreadyOpen / one entry per key).
+// intent); the "Rests as" badge shows the on-chain truth.
+//
+// The Limit/Stop tabs are ALWAYS viewable — only the submit is gated, never the tab.
+// Routing by selected market+side:
+//   • no position, no resting open here  -> requestTriggerOpen (resting OPEN)
+//   • position open here                 -> requestTriggerIncrease (resting INCREASE,
+//                                           inputs are ADD amounts)
+//   • no position but a resting open here -> BLOCK a second open (on-chain a second
+//                                           open can never fill once the first creates
+//                                           the position)
+// MUTEX: requestTriggerIncrease takes the position's closePending mutex, so only ONE
+// resting trigger-edit per position (an increase OR a TP/SL close, never both) — if a
+// resting exit already rests on this position, the increase submit is blocked.
 export default function OrderTicket({ meta, mark, state, musdBalance, nativeBalance, positions, orders, trade, account, wrongChain, onConnect, onSwitch, onFaucet }) {
   const [side, setSide] = useState("long");
   const [otype, setOtype] = useState("market"); // "market" | "limit" | "stop"
@@ -25,23 +36,28 @@ export default function OrderTicket({ meta, mark, state, musdBalance, nativeBala
   const price = mark && !mark.error ? mark.price : null;
   const size = coll * lev;
 
-  // Existing position on THIS market+side ⇒ the Market action is Increase. Trigger
-  // entries can't sit behind a live position (use it as a market increase instead), so
-  // Limit/Stop are disabled while one is open.
+  // Existing position on THIS market+side ⇒ both Market and trigger actions become
+  // Increase. A trigger entry with a live position routes to requestTriggerIncrease, so
+  // the Limit/Stop tabs stay viewable (no longer disabled) — only the submit is gated.
   const existing = useMemo(
     () => (positions || []).find((p) => p.symbol === meta.symbol && p.isLong === isLong),
     [positions, meta.symbol, isLong],
   );
-  // A resting trigger-OPEN already on this market+side blocks a second (one entry/key).
-  const restingOpen = useMemo(
-    () => (orders || []).find((o) => o.symbol === meta.symbol && o.isLong === isLong && o.kindClass === "entry"),
+  // A resting trigger-OPEN already on this market+side blocks a second open: on-chain a
+  // second open can never fill once the first creates the position.
+  const restingOpenHere = useMemo(
+    () => (orders || []).find((o) => o.symbol === meta.symbol && o.isLong === isLong && o.kind === KIND_OPEN),
     [orders, meta.symbol, isLong],
   );
-
-  // Force back to Market if the side change makes a trigger entry impossible.
-  useEffect(() => {
-    if (otype !== "market" && existing) setOtype("market");
-  }, [existing, otype]);
+  // The closePending mutex group for THIS position: a resting trigger INCREASE or a
+  // resting trigger EXIT (TP/SL). Either one blocks placing the other.
+  const restingEditHere = useMemo(
+    () =>
+      (orders || []).find(
+        (o) => o.symbol === meta.symbol && o.isLong === isLong && (o.kind === KIND_INCREASE || o.kindClass === "exit"),
+      ),
+    [orders, meta.symbol, isLong],
+  );
 
   const isTrigger = otype !== "market";
   const action = existing ? "increase" : "open";
@@ -94,29 +110,41 @@ export default function OrderTicket({ meta, mark, state, musdBalance, nativeBala
   const needsGas = account && !wrongChain && nativeBalance != null && nativeBalance <= 0;
   const needsMusd = account && !wrongChain && musdBalance != null && musdBalance <= 0;
   const needsTokens = needsGas || needsMusd;
-  const blockedByResting = isTrigger && Boolean(restingOpen);
+  // Gate the SUBMIT (never the tab): a second open can't fill, and the closePending
+  // mutex allows only one resting trigger-edit per position. The increase block covers
+  // BOTH the trigger increase AND the Market-tab increase — requestIncrease takes the
+  // same closePending mutex, so it would revert CloseAlreadyPending (wasted-gas tx)
+  // while any resting trigger-edit (increase or exit) rests on this position.
+  const blockedOpen = isTrigger && action === "open" && Boolean(restingOpenHere);
+  const blockedIncrease = action === "increase" && Boolean(restingEditHere);
+  const blocked = blockedOpen || blockedIncrease;
   const canSubmit =
-    account && !wrongChain && !needsTokens && price != null && !tooSmall && !overBalance && !busy && trigValid && !blockedByResting;
+    account && !wrongChain && !needsTokens && price != null && !tooSmall && !overBalance && !busy && trigValid && !blocked;
 
   function submit() {
     if (!account) return onConnect?.();
     if (wrongChain) return onSwitch?.();
     if (needsTokens) return onFaucet?.();
     if (isTrigger) {
-      trade.submitTriggerOpen({ symbol: meta.symbol, isLong, collateral: collNum, leverage: lev, triggerPrice: trig, mark: price, slipFrac: slip });
+      trade.submitTriggerEntry({ kind: action, symbol: meta.symbol, isLong, collateral: collNum, leverage: lev, triggerPrice: trig, mark: price, slipFrac: slip });
     } else {
       trade.submit({ action, symbol: meta.symbol, isLong, collateral: collNum, leverage: lev, slipFrac: slip });
     }
   }
 
-  const verb = isTrigger ? `Place ${restsAs ? restsAs.toLowerCase() : otype}` : action === "increase" ? "Increase" : "Open";
+  const verb = isTrigger
+    ? `Place ${restsAs ? restsAs.toLowerCase() : otype}${action === "increase" ? " increase" : ""}`
+    : action === "increase"
+      ? "Increase"
+      : "Open";
   let btnLabel;
   if (!account) btnLabel = "Connect wallet to trade";
   else if (wrongChain) btnLabel = "Switch to LiteForge (4441)";
   else if (needsGas) btnLabel = "Get zkLTC gas to trade →";
   else if (needsMusd) btnLabel = "Get mUSD to trade →";
   else if (busy && myFlow) btnLabel = myFlow.phase === "approving" ? "Approving…" : myFlow.phase === "executing" ? "Executing…" : "Working…";
-  else if (blockedByResting) btnLabel = "Order already resting";
+  else if (blockedOpen) btnLabel = "Open already resting";
+  else if (blockedIncrease) btnLabel = "Position has a resting trigger-edit";
   else btnLabel = `${verb} ${side} · ${meta.symbol}`;
 
   return (
@@ -127,16 +155,14 @@ export default function OrderTicket({ meta, mark, state, musdBalance, nativeBala
         </button>
         <button
           className={otype === "limit" ? "on" : ""}
-          disabled={Boolean(existing)}
-          title={existing ? "You hold this side — limit entries can't sit behind a live position" : "Rest a limit entry below/above the mark"}
+          title={existing ? "Rest a limit increase that adds to your live position" : "Rest a limit entry below/above the mark"}
           onClick={() => { setOtype("limit"); setTrigTouched(false); }}
         >
           Limit
         </button>
         <button
           className={otype === "stop" ? "on" : ""}
-          disabled={Boolean(existing)}
-          title={existing ? "You hold this side — stop entries can't sit behind a live position" : "Rest a stop entry that fires on a breakout"}
+          title={existing ? "Rest a stop increase that adds on a breakout" : "Rest a stop entry that fires on a breakout"}
           onClick={() => { setOtype("stop"); setTrigTouched(false); }}
         >
           Stop
@@ -152,21 +178,33 @@ export default function OrderTicket({ meta, mark, state, musdBalance, nativeBala
         </button>
       </div>
 
-      {existing && !isTrigger && (
+      {existing && !isTrigger && !blockedIncrease && (
         <div className="ticket-note">
           You hold a {isLong ? "long" : "short"} {meta.symbol} — this will <b>add</b> to it (blended entry).
         </div>
       )}
-      {blockedByResting && (
+      {existing && isTrigger && !blockedIncrease && (
         <div className="ticket-note">
-          A {restingOpen.typeLabel.toLowerCase()} order is already resting on {meta.symbol} {isLong ? "long" : "short"}. Cancel it
-          in the Orders tab to place another (<b>one entry per market + side</b>).
+          You hold a {isLong ? "long" : "short"} {meta.symbol} — this rests a trigger <b>increase</b> that adds to it (blended
+          entry) when the mark crosses your trigger.
+        </div>
+      )}
+      {blockedOpen && (
+        <div className="ticket-note">
+          A {restingOpenHere.typeLabel.toLowerCase()} already rests here — only one can fill; cancel it in the Orders tab first
+          (<b>a second open can never fill</b> once the first creates the position).
+        </div>
+      )}
+      {blockedIncrease && (
+        <div className="ticket-note">
+          This position already has a resting {restingEditHere.typeLabel.toLowerCase()} — only <b>one</b> resting trigger-edit per
+          position (an increase OR a TP/SL close). Cancel it in the Orders tab first.
         </div>
       )}
 
       <div className="field">
         <div className="field-head">
-          <label htmlFor="collInput">{action === "increase" && !isTrigger ? "Add collateral" : "Collateral"}</label>
+          <label htmlFor="collInput">{action === "increase" ? "Add collateral" : "Collateral"}</label>
           <button
             className="bal"
             type="button"
@@ -244,7 +282,7 @@ export default function OrderTicket({ meta, mark, state, musdBalance, nativeBala
           </div>
         )}
         <div className="row">
-          <span className="k">{action === "increase" && !isTrigger ? "Added size" : "Position size"}</span>
+          <span className="k">{action === "increase" ? "Added size" : "Position size"}</span>
           <span className="v">{fmtUsd(size)}</span>
         </div>
         <div className="row">

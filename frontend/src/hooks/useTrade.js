@@ -216,18 +216,23 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
   }, [pending, account, getSigner, toast, onTraded, scheduleClear]);
 
   // --- 11c resting orders -------------------------------------------------------
-  // Place a RESTING trigger OPEN (limit / stop entry). Single leg: approve (collateral
-  // + fee) -> requestTriggerOpen -> stamp the id for the watcher. The order then RESTS
-  // on-chain until the keeper poll sees it fill — there is NO leg-2 here. triggerAbove
-  // is derived from trigger-vs-mark (never the Limit/Stop label); a STOP entry gets the
-  // permissive acceptablePrice so the catch isn't blocked by SlippageNotMet.
-  const submitTriggerOpen = useCallback(
+  // Place a RESTING trigger ENTRY — limit/stop OPEN (no position yet) OR limit/stop
+  // INCREASE (add to a live position). Both are single-leg, escrow collateral + fee,
+  // and rest on-chain until the keeper poll fills them (NO leg-2 here). The ONLY
+  // on-chain difference is requestTriggerOpen vs requestTriggerIncrease (and the latter
+  // takes the position's closePending mutex). triggerAbove is derived from
+  // trigger-vs-mark (never the Limit/Stop label); a STOP entry gets the permissive
+  // acceptablePrice so the catch isn't blocked by SlippageNotMet. `p.kind` is
+  // "open" | "increase".
+  const submitTriggerEntry = useCallback(
     async (p) => {
       if (busyRef.current) return toast("A trade is already in progress.", true);
       if (!account) return toast("Connect a wallet first.", true);
       if (wrongChain) return toast("Switch to LiteForge (4441) first.", true);
       busyRef.current = true;
       clearTimeout(clearTimer.current);
+      const kind = p.kind === "increase" ? "increase" : "open";
+      const noun = kind === "increase" ? "increase" : "order"; // "limit increase" / "limit order"
       try {
         const signer = getSigner();
         const pm = pmWrite(signer);
@@ -240,7 +245,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
         const isStop = triggerAbove === p.isLong; // entry stop
         const label = isStop ? "Stop" : "Limit";
 
-        setFlow({ phase: "approving", action: "open", symbol: p.symbol, isLong: p.isLong, verb: "Placed", message: "Checking mUSD allowance…" });
+        setFlow({ phase: "approving", action: kind, symbol: p.symbol, isLong: p.isLong, verb: "Placed", message: "Checking mUSD allowance…" });
         await trade.ensureAllowance(musd, account, ADDRESSES.positionManager, needed, () =>
           setFlow((f) => ({ ...f, message: "Approve mUSD spending — confirm in your wallet (one-time)." })),
         );
@@ -249,8 +254,8 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
         const acceptable = trade.acceptablePrice1e8(p.triggerPrice, buffer, true, p.isLong);
         const trigger1e8 = ethers.BigNumber.from(Math.round(p.triggerPrice * 1e8).toString());
 
-        setFlow((f) => ({ ...f, phase: "requesting", message: `Placing your ${label.toLowerCase()} order — confirm in your wallet…` }));
-        const { id } = await trade.sendTriggerRequest(pm, "open", market, p.isLong, {
+        setFlow((f) => ({ ...f, phase: "requesting", message: `Placing your ${label.toLowerCase()} ${noun} — confirm in your wallet…` }));
+        const { id } = await trade.sendTriggerRequest(pm, kind, market, p.isLong, {
           collateral: collateral1e18,
           leverage: Math.round(p.leverage),
           acceptablePrice: acceptable,
@@ -259,8 +264,8 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
         });
         addOrderId?.(account, id.toString());
 
-        setFlow({ phase: "done", ok: true, symbol: p.symbol, isLong: p.isLong, message: `${label} order resting until ${p.symbol} ${triggerAbove ? "≥" : "≤"} $${p.triggerPrice}.` });
-        toast(`${label} order placed ✓`);
+        setFlow({ phase: "done", ok: true, symbol: p.symbol, isLong: p.isLong, message: `${label} ${noun} resting until ${p.symbol} ${triggerAbove ? "≥" : "≤"} $${p.triggerPrice}.` });
+        toast(`${label} ${noun} placed ✓`);
         onTraded?.();
         scheduleClear();
       } catch (err) {
@@ -269,7 +274,14 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
           setFlow(null);
           toast("Cancelled.", true);
         } else {
-          setFlow({ phase: "done", ok: false, symbol: p.symbol, message: `Order failed: ${reason.slice(0, 110)}` });
+          setFlow({
+            phase: "done",
+            ok: false,
+            symbol: p.symbol,
+            message: /CloseAlreadyPending/.test(reason)
+              ? "This position already has a resting trigger-edit (one at a time)."
+              : `Order failed: ${reason.slice(0, 110)}`,
+          });
           toast("Order failed.", true);
           scheduleClear();
         }
@@ -442,7 +454,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
     resume,
     cancelPending,
     dismiss,
-    submitTriggerOpen,
+    submitTriggerEntry,
     submitTriggerExit,
     fillOrder,
     cancelOrder,

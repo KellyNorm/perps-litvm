@@ -1,5 +1,6 @@
 import { fmtUsd, fmtSigned } from "../lib/format.js";
 import { signedPnl, liqPrice, health, healthColor, MIN_COLLATERAL } from "../lib/engine.js";
+import { KIND_INCREASE } from "../lib/triggers.js";
 
 // Default slippage for close / partial-close (the order panel carries the selector
 // for opens; closes use a sensible 0.5% bound). The two-step loop auto-cancels +
@@ -9,11 +10,14 @@ const CLOSE_SLIP = 0.005;
 export default function PositionsTable({ account, positions, marks, orders, trade, wrongChain, onAddTpSl }) {
   const colSpan = 9;
 
-  // A resting trigger-exit (TP/SL) for this position. Because the engine takes the
-  // position's closePending mutex at request time, while one rests the market Close /
-  // partial buttons would revert CloseAlreadyPending — so we lock them and point here.
-  function restingExitFor(p) {
-    return (orders || []).find((o) => o.symbol === p.symbol && o.isLong === p.isLong && o.kindClass === "exit");
+  // A resting trigger-edit on this position — a TP/SL exit OR a trigger increase. Both
+  // take the engine's closePending mutex at request time, so while one rests the market
+  // Close / partial / +TP/SL controls would revert CloseAlreadyPending — lock them and
+  // point at the Orders tab.
+  function restingEditFor(p) {
+    return (orders || []).find(
+      (o) => o.symbol === p.symbol && o.isLong === p.isLong && (o.kindClass === "exit" || o.kind === KIND_INCREASE),
+    );
   }
 
   function emptyRow(content) {
@@ -55,15 +59,18 @@ export default function PositionsTable({ account, positions, marks, orders, trad
         </span>
       );
     }
-    const resting = restingExitFor(p);
+    const resting = restingEditFor(p);
     const locked = Boolean(resting);
+    const isExit = resting?.kindClass === "exit";
     const disabled = wrongChain || trade?.inProgress || locked;
     // Dust guard (mirrors requestDecrease): a partial close that would leave the
     // remainder below MIN_COLLATERAL reverts on-chain, so disable it here.
     const dust25 = p.collateral * 0.75 < MIN_COLLATERAL;
     const dust50 = p.collateral * 0.5 < MIN_COLLATERAL;
     const dustTip = `Would leave less than ${MIN_COLLATERAL} mUSD collateral — use Close instead`;
-    const lockTip = "A TP/SL is resting on this position — cancel it in the Orders tab to close manually";
+    const lockTip = isExit
+      ? "A TP/SL is resting on this position — cancel it in the Orders tab to close manually"
+      : "A trigger increase is resting on this position — cancel it in the Orders tab to close manually";
     return (
       <span className="row-acts">
         <button
@@ -86,12 +93,18 @@ export default function PositionsTable({ account, positions, marks, orders, trad
           Close
         </button>
         <button
-          className={"rowbtn tpsl" + (locked ? " set" : "")}
+          className={"rowbtn tpsl" + (isExit ? " set" : "")}
           disabled={wrongChain || trade?.inProgress || locked}
           onClick={() => !locked && onAddTpSl?.(p)}
-          title={locked ? `${resting.typeLabel} resting at $${resting.triggerPrice} — one exit per position` : "Add a resting take-profit / stop-loss"}
+          title={
+            locked
+              ? isExit
+                ? `${resting.typeLabel} resting at $${resting.triggerPrice} — one resting trigger-edit per position`
+                : `A trigger increase is resting at $${resting.triggerPrice} — one resting trigger-edit per position (cancel it first)`
+              : "Add a resting take-profit / stop-loss"
+          }
         >
-          {locked ? "TP/SL ✓" : "+ TP/SL"}
+          {isExit ? "TP/SL ✓" : "+ TP/SL"}
         </button>
       </span>
     );
