@@ -20,85 +20,111 @@ Claude Code: read `CLAUDE.md`, then this file. Work **ONLY** on the task marked 
 
 ---
 
-## PR-1 — Oracle smoke test  **[DONE]**
-Goal: prove the RedStone pull flow works on LitVM before any perps logic exists.
-- Scaffold the Foundry project + finalize remappings for RedStone + OpenZeppelin.
-- A minimal contract extending `MainDemoConsumerBase` exposing `getPrice(bytes32 feedId)` returning the verified value from tx calldata.
-- A Foundry test using RedStone's mock wrapper proving the read works for "BTC" and "ETH".
-- A deploy script targeting chain 4441.
-- A small JS script using `DataServiceWrapper` (`redstone-main-demo`) that calls the deployed contract and prints a live price.
+## Status — engine feature-complete (2026-06-19)
+Phase 1 + Phase 2 engine **FEATURE-COMPLETE** — **126 tests passing, 0 failures**, money
+path reviewed PR by PR. Deployed contracts are **STALE** (last deploy post-PR-6c,
+pre-PR-7), so the on-chain addresses do not match `main`. Next step: **ONE batched
+redeploy + a full-surface on-chain smoke**, then the frontend (PR-11).
 
-**Acceptance:** test passes; contract deployed to testnet; JS script prints a live BTC price read from the deployed contract.
+---
 
-## PR-2 — Liquidity pool (LP vault)  **[DONE]**
-LPs deposit collateral, mint an LP token, withdraw. The pool is the trader counterparty.
-- ERC20 LP token; deposit / withdraw; pool accounting; reentrancy-guarded.
+## PHASE 1 — engine core  **(all DONE)**
 
-**Acceptance:** deposit/withdraw tested incl. edge cases; pool-share math verified.
+### PR-1 — PriceReader (oracle smoke test)  **[DONE]**
+RedStone pull oracle on `MainDemoConsumerBase`; `getPrice(bytes32 feedId)` returns the
+verified value from tx calldata. Foundry test via the mock wrapper for "BTC"/"ETH";
+deploy script for chain 4441; JS `DataServiceWrapper` script prints a live price.
 
-## PR-3 — Position management  **[DONE]**
-Open/close long & short with leverage; collateral + size accounting; P&L vs the oracle mark price (via PR-1 oracle).
+### PR-2 — LiquidityPool (LP vault)  **[DONE]**
+GLP-style ERC-4626 vault; LPs deposit collateral, mint LP shares, withdraw; pool is the
+trader counterparty; reentrancy-guarded; pool-share math verified.
 
-**Acceptance:** open/close tested for long & short, profit & loss, and leverage bounds.
+### PR-3 — PositionManager (position management)  **[DONE]**
+Open/close long & short with leverage; collateral + size accounting; P&L vs the oracle
+mark; O(1) per-market aggregates; reserved-liquidity solvency independent of the cache.
 
-## PR: payload-aware LP pricing
-Close the LP share-price fairness gap left by PR-3. Today `LiquidityPool.totalAssets()` reads a cached aggregate trader mark (`cachedU`) that is refreshed only on position open/close, so an LP depositing/withdrawing mid-move transacts against a slightly stale share price. Add payload-aware LP entry/exit (e.g. `depositWithPrice`/`withdrawWithPrice`) that verify a fresh RedStone price and refresh the mark before pricing shares. This is a fairness fix only — PR-3's reserved-liquidity accounting already guarantees solvency independently of the cache.
+### PR-4a — Borrow fee  **[DONE]**
+Time-based borrow fee positions pay the pool for reserved LP capital. Accrued O(1) via a
+single shared cumulative index per market (position stores the index at open); continuous
+per-second accrual, no keeper ticks. Deducted from payout at close; settles via the
+existing `payProfit` / `receiveLoss` entry points (no LP ABI change). Payout floors at 0
+when the fee exceeds collateral; the uncollected remainder is left for the bad-debt seam.
 
-**Acceptance:** LP deposit/withdraw price shares against a fresh oracle mark; tested that mid-move LP entry/exit is not mispriced against the cached mark.
+### PR-5 — Liquidations  **[DONE]**
+Permissionless, bounty-incentivized liquidation of underwater positions, with a tight
+oracle freshness check and bad-debt accounting. Stale-price liquidation rejected.
 
-## PR-4a — Borrow fee  **[CURRENT]**
-Time-based borrow fee that leveraged positions pay the pool for the LP capital they
-reserve. Accrued O(1) via a single shared cumulative index per market (each position
-stores the index value at open); continuous per-second accrual via the lazily-updated
-index — no keeper ticks. Deducted from the trader's payout at close (trader -> pool).
-No change to the deployed `LiquidityPool` ABI; settles via the existing `payProfit` /
-`receiveLoss` entry points. Conservative flat rate on notional (see plan §6).
+### PR-4b — Funding rate  **[DONE]**
+True peer-to-peer funding between longs and shorts driven by open-interest imbalance: the
+heavy side pays the light side, routed through the pool as clearing buffer, accrued O(1)
+via signed per-side cumulative indices. Rate clamped at the configured max; one-sided book
+accrues no funding. Sequenced after PR-5 so the liquidation machinery can bound a payer
+who cannot cover accrued funding. The interim "funding-to-pool" variant was NOT built.
 
-Settlement: profit -> payout = collateral + profit - fee (fee to pool); loss -> payout =
-collateral - lossCapped - fee, floored at 0, pool inflow = lossCapped + fee. If the fee
-alone exceeds collateral, payout floors at 0 and the uncollected remainder is left for
-PR-5 (bad-debt seam) with NO revert/underflow. Pure accrual (time passing, no close)
-must not change `totalUnrealizedProfit` or `totalReserved`; pool balance and LP NAV rise
-by exactly the collected fee, only on close.
+### PR-6 — Two-step deferred execution  **[DONE]**  (shipped as 6a / 6b / 6c)
+Request/execute split with the price relayed on-chain at execution (RedStone X-model);
+permissionless relay; payload-freshness guard closes the front-run exploit.
+- **PR-6a** — price-parameterized open/close cores.
+- **PR-6b** — two-step deferred execution layer (`requestOpen`/`requestClose` ->
+  `executeRequest` -> `cancelRequest`).
+- **PR-6c** — removed the direct path; two-step is the only trader entry.
 
-**Acceptance:** borrow-fee accrual + deduction-at-close math tested across simulated time;
-payout floored at 0 when fee exceeds collateral; accounting invariants hold; existing PR-3
-tests still pass.
+---
 
-## PR-5 — Liquidations  **[DONE]**
-Permissionless, bounty-incentivized liquidation of underwater positions, with a tight oracle freshness check.
+## PHASE 2 — trader features  **(all DONE)**
 
-**Acceptance:** liquidation triggers at correct thresholds; bounty paid; stale-price liquidation rejected.
+### PR-7 — mUSD faucet  **[DONE]**
+Cooldown faucet on the mUSD `MockERC20` collateral token.
 
-## PR-4b — Funding rate  **[AFTER PR-5]**
-True peer-to-peer (B1) funding between longs and shorts driven by open-interest imbalance:
-the heavy side pays the light side, routed through the pool as clearing buffer, accrued
-O(1) via signed per-side cumulative indices. Sequenced AFTER PR-5 because a funding payer
-who cannot cover its accrued funding from collateral produces bad debt that only the
-liquidation machinery (PR-5) can bound. The interim "funding-to-pool" (B2) variant is
-explicitly NOT built.
+### PR-8 — Market registry  **[DONE]**
+Owner-extendable market registry (`Ownable`; `addMarket` / `removeMarket`). Admin power
+scoped to market listing only.
 
-**Acceptance:** funding direction correct under long-heavy and short-heavy books;
-per-step conservation (Σ paid ≈ Σ received, pool residual ≥ 0); rate clamped at the
-configured max; one-sided book accrues no funding; deduction/credit at close tested
-across simulated time.
+### PR-9a — Partial close (decrease)  **[DONE]**
+Proportional realize on a two-step decrease; the remainder keeps its entry price and
+fee/funding indices.
 
-## PR-6 — Two-step deferred execution + relayer
-Request/execute split; price relayed on-chain at execution (RedStone X-model pattern); permissionless relay.
+### PR-9b — Increase (add size / collateral)  **[DONE]**
+Size-weighted blended entry price + blended fee/funding indices; no mid-life realization.
 
-**Acceptance:** front-running test (execution price unknown at request time) passes; relayer script works on testnet.
+### PR-10a — Trigger exits (take-profit / stop-loss)  **[DONE]**
+Resting Close/Decrease requests behind a price gate; kind-agnostic gate keyed off
+`triggers[id]`; `cancelRequest` refunds collateral+fee for Open/Increase.
 
-## PR-7 — Frontend
-Next.js + shadcn on Cloudflare Pages; wallet connect; open/close UI; `DataServiceWrapper` payload injection.
+### PR-10b — Trigger entries (limit / stop open & increase)  **[DONE]**
+Additive `requestTriggerOpen` / `requestTriggerIncrease`; reuse the existing fill cores
+and the PR-10a gate unchanged — no execution-machinery changes, only the two request
+functions + events.
+
+---
+
+## NEXT
+
+### PR-11 — Frontend  **[CURRENT]**  (previously mislabeled "PR-7 Frontend", renumbered)
+React/Vite wired to the full contract surface; the browser plays keeper (poll for a fresh
+payload -> `executeRequest`); `DataServiceWrapper` payload injection. **Comes AFTER** the
+batched redeploy + full-surface on-chain smoke.
 
 **Acceptance:** an end-to-end trade completed from the UI on testnet.
 
 ---
 
-## Future refinements
-- Liquidator bonus is drawn only from the collateral buffer — full at the maintenance threshold, decaying to 0 below ~5% equity and 0 in the bad-debt case. For mainnet consider a protocol-funded liquidation incentive or a reserved slice of the buffer so late liquidations stay profitable.
+## Known gaps / deferred refinements
+- **Payload-aware LP pricing — NOT shipped.** `LiquidityPool.totalAssets()` still reads
+  the cached aggregate mark (`cachedU`), refreshed only on position open/close, so an LP
+  depositing/withdrawing mid-move transacts against a slightly stale share price. The fix
+  is payload-aware LP entry/exit (`depositWithPrice` / `withdrawWithPrice`) that verify a
+  fresh RedStone price and refresh the mark before pricing shares. Fairness only —
+  reserved-liquidity accounting already guarantees solvency independently of the cache.
+- **Liquidator bonus** is drawn only from the collateral buffer — full at the maintenance
+  threshold, decaying to 0 below ~5% equity and 0 in the bad-debt case. For mainnet
+  consider a protocol-funded liquidation incentive or a reserved slice of the buffer so
+  late liquidations stay profitable.
 
-## Backlog (post-MVP, deliberate PRs later)
-- Multi-asset markets (additional feeds).
-- Keeper hardening / monitoring / alerting.
-- Mainnet readiness: audit prep (target builder-program audit credits), production RedStone data service, parameter review, liquidity bootstrapping plan.
+## PHASE 3 — mainnet hardening  (deferred, not started)
+Governance + pause (params are currently immutable; `Ownable` is scoped to markets only),
+per-market exposure caps, oracle fallback / circuit-breaker, production RedStone feed
+(replace the free demo data service), insurance fund for bad debt, LP withdrawal cooldown,
+auto-deleverage, protocol trading fee, keeper bot, event indexing / subgraph, multi-asset
+markets (additional feeds), invariant + fuzz tests, external audit (target builder-program
+audit credits), mainnet deploy + TGE.

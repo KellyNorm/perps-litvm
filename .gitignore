@@ -20,3 +20,6 @@ docs/
 !.env.example
 .env
 node_modules/
+
+# Review-artifact diffs
+*.diff
