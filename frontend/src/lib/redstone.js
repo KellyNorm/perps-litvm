@@ -1,4 +1,5 @@
 import { requestDataPackages, getDataPackagesTimestamp } from "@redstone-finance/sdk";
+import { WrapperBuilder } from "@redstone-finance/evm-connector";
 import { REDSTONE_DATA_SERVICE, REDSTONE_DEMO_SIGNER } from "../config.js";
 
 // Live mark for a feed (e.g. "BTC", "ETH") via the RedStone pull oracle — the same
@@ -17,6 +18,25 @@ export async function fetchMark(feed) {
   const value = list[0].dataPackage.dataPoints[0].toObj().value; // human float
   const tsMs = getDataPackagesTimestamp(pkgs);
   return { price: Number(value), tsMs };
+}
+
+// Package timestamp (SECONDS) for a feed — the on-chain freshness clock. Mirrors
+// scripts/smoke-perps.mjs payloadTimestampSec(): floor(getDataPackagesTimestamp/1000).
+export async function payloadTimestampSec(feed) {
+  return Math.floor((await fetchMark(feed)).tsMs / 1000);
+}
+
+// Wrap a signer-bound contract so the signed RedStone payload is injected into the
+// call's calldata. Used ONLY for executeRequest (the keeper step) — NEVER for the
+// plain request* calls. Identical config to the smoke's `wrap`, but `feed` is the
+// market's data-package id (e.g. "BTC", "ETH") instead of a hard-coded constant.
+export function wrapForExecute(contract, feed) {
+  return WrapperBuilder.wrap(contract).usingDataService({
+    dataServiceId: REDSTONE_DATA_SERVICE,
+    dataPackagesIds: [feed],
+    uniqueSignersCount: 1,
+    authorizedSigners: [REDSTONE_DEMO_SIGNER],
+  });
 }
 
 // Fetch several feeds concurrently; returns { SYMBOL: {price, tsMs} | {error} }.

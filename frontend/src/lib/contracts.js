@@ -27,3 +27,9 @@ export function musdRead() {
 export function musdWrite(signer) {
   return new ethers.Contract(ADDRESSES.musd, MockERC20, signer);
 }
+
+// Signer-bound contracts for the 11b trade loop (request* + executeRequest +
+// cancelRequest + the mUSD approve). The connected wallet signs both legs.
+export function pmWrite(signer) {
+  return new ethers.Contract(ADDRESSES.positionManager, PositionManager, signer);
+}

@@ -44,10 +44,10 @@ export default function LeverageSlider({ value, onChange }) {
           type="range"
           min={MIN_LEVERAGE}
           max={MAX_LEVERAGE}
-          step="0.5"
+          step="1"
           value={value}
           aria-label="Leverage multiplier"
-          onChange={(e) => onChange(parseFloat(e.target.value))}
+          onChange={(e) => onChange(parseInt(e.target.value, 10))}
         />
       </div>
       <div className="lev-marks">

@@ -1,5 +1,4 @@
-import { useEffect, useRef, useState } from "react";
-import { ethers } from "ethers";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { pmRead } from "../lib/contracts.js";
 import { positionKey } from "../lib/marketKey.js";
 import { assetToNum, priceToNum } from "../lib/engine.js";
@@ -14,6 +13,7 @@ export function usePositions(account, supported) {
   const [positions, setPositions] = useState(null); // [] once loaded
   const [error, setError] = useState(null);
   const timer = useRef(null);
+  const pollRef = useRef(null);
 
   const key = account && supported && supported.length ? account + ":" + supported.map((m) => m.symbol).join(",") : "";
 
@@ -62,13 +62,18 @@ export function usePositions(account, supported) {
       }
     }
 
+    pollRef.current = poll;
     poll();
     timer.current = setInterval(poll, POLL_MS);
     return () => {
       cancelled = true;
+      pollRef.current = null;
       clearInterval(timer.current);
     };
   }, [key]);
 
-  return { positions, error };
+  // Manual refresh (e.g. right after a trade fills) so positions don't lag the poll.
+  const refresh = useCallback(() => pollRef.current?.(), []);
+
+  return { positions, error, refresh };
 }

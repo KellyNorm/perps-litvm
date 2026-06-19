@@ -7,7 +7,9 @@ import PositionsTable from "./components/PositionsTable.jsx";
 import VaultPanel from "./components/VaultPanel.jsx";
 import OrderTicket from "./components/OrderTicket.jsx";
 import FaucetModal from "./components/FaucetModal.jsx";
+import TradeStatus from "./components/TradeStatus.jsx";
 import { useWallet } from "./hooks/useWallet.js";
+import { useTrade } from "./hooks/useTrade.js";
 import { useMarkets } from "./hooks/useMarkets.js";
 import { usePrices } from "./hooks/usePrices.js";
 import { useVault } from "./hooks/useVault.js";
@@ -23,7 +25,7 @@ export default function App() {
   const supportedSymbols = useMemo(() => (supported ? supported.map((m) => m.symbol) : []), [supported]);
   const { marks, series, startedAt } = usePrices(supportedSymbols);
   const { data: vault, yourDeposit } = useVault(account);
-  const { positions } = usePositions(account, supported);
+  const { positions, refresh: refreshPositions } = usePositions(account, supported);
   const balances = useBalances(account);
 
   const [selected, setSelected] = useState(null);
@@ -41,6 +43,19 @@ export default function App() {
     setToast({ msg, err, show: true });
     setTimeout(() => setToast((t) => ({ ...t, show: false })), 2600);
   }, []);
+
+  const onTraded = useCallback(() => {
+    refreshPositions();
+    balances.refresh();
+  }, [refreshPositions, balances]);
+
+  const trade = useTrade({
+    account,
+    getSigner: wallet.getSigner,
+    wrongChain,
+    toast: showToast,
+    onTraded,
+  });
 
   const meta = supported && selected ? supported.find((m) => m.symbol === selected) : null;
   const configured = addressesConfigured();

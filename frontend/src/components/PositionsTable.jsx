@@ -1,7 +1,12 @@
 import { fmtUsd, fmt2, fmtSigned } from "../lib/format.js";
 import { signedPnl, liqPrice, health, healthColor } from "../lib/engine.js";
 
-export default function PositionsTable({ account, positions, marks }) {
+// Default slippage for close / partial-close (the order panel carries the selector
+// for opens; closes use a sensible 0.5% bound). The two-step loop auto-cancels +
+// refunds the fee if the fill lands outside this.
+const CLOSE_SLIP = 0.005;
+
+export default function PositionsTable({ account, positions, marks, trade, wrongChain }) {
   const colSpan = 9;
 
   function emptyRow(content) {
@@ -11,6 +16,51 @@ export default function PositionsTable({ account, positions, marks }) {
           {content}
         </td>
       </tr>
+    );
+  }
+
+  // Status line for the row whose close/decrease is currently in-flight.
+  function rowFlowFor(p) {
+    const f = trade?.flow;
+    if (!f || (f.action !== "close" && f.action !== "decrease")) return null;
+    return f.symbol === p.symbol && f.isLong === p.isLong ? f : null;
+  }
+
+  function act(p, action, closeBps) {
+    if (!account || wrongChain || trade?.inProgress) return;
+    trade.submit({ action, symbol: p.symbol, isLong: p.isLong, closeBps, slipFrac: CLOSE_SLIP });
+  }
+
+  function actionCell(p) {
+    const rf = rowFlowFor(p);
+    if (rf) {
+      const working = rf.phase !== "error";
+      return (
+        <span className={"row-status" + (rf.phase === "error" ? " err" : "")}>
+          {working ? <span className="spin" aria-hidden="true" /> : null}
+          {rf.phase === "approving"
+            ? "Approving…"
+            : rf.phase === "executing"
+              ? "Executing…"
+              : rf.phase === "error"
+                ? "Failed — see banner"
+                : "Working…"}
+        </span>
+      );
+    }
+    const disabled = wrongChain || trade?.inProgress;
+    return (
+      <span className="row-acts">
+        <button className="rowbtn" disabled={disabled} onClick={() => act(p, "decrease", 2500)} title="Close 25% of this position">
+          −25%
+        </button>
+        <button className="rowbtn" disabled={disabled} onClick={() => act(p, "decrease", 5000)} title="Close 50% of this position">
+          −50%
+        </button>
+        <button className="rowbtn close" disabled={disabled} onClick={() => act(p, "close")} title="Close the whole position">
+          Close
+        </button>
+      </span>
     );
   }
 
@@ -67,11 +117,7 @@ export default function PositionsTable({ account, positions, marks }) {
           </td>
           <td className={"mono " + (netFunding >= 0 ? "pos" : "neg")}>{fmtSigned(netFunding)}</td>
           <td className={"mono " + (pnl >= 0 ? "pos" : "neg")}>{fmtSigned(pnl)}</td>
-          <td style={{ textAlign: "right" }}>
-            <span className="loading-dim" style={{ fontSize: 11 }}>
-              read-only
-            </span>
-          </td>
+          <td style={{ textAlign: "right" }}>{actionCell(p)}</td>
         </tr>
       );
     });
@@ -89,7 +135,7 @@ export default function PositionsTable({ account, positions, marks }) {
           <th>Health</th>
           <th>Net funding</th>
           <th>uPnL</th>
-          <th></th>
+          <th style={{ textAlign: "right" }}>Manage</th>
         </tr>
       </thead>
       <tbody>{body}</tbody>
