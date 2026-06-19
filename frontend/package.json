@@ -1,0 +1,23 @@
+{
+  "name": "tachyonfi-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "TachyonFi — read-only trading UI for the perps DEX on LitVM (chain 4441).",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@redstone-finance/evm-connector": "^0.9.0",
+    "@redstone-finance/sdk": "^0.9.0",
+    "ethers": "^5.8.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^5.4.11"
+  }
+}
