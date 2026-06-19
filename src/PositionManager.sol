@@ -643,6 +643,42 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
         uint256 executionFee
     );
 
+    // trigger entries (PR-10b)
+
+    /// @dev Emitted when a RESTING trigger OPEN is queued: a limit/stop entry that
+    ///      fills only once the mark crosses `triggerPrice` (side per `triggerAbove`)
+    ///      AND the `acceptablePrice` slippage bound holds; until then a keeper's
+    ///      execute reverts and the request stays active. See {requestTriggerOpen}.
+    event TriggerOpenRequested(
+        uint256 indexed requestId,
+        address indexed owner,
+        bytes32 indexed market,
+        bool isLong,
+        uint256 collateral,
+        uint256 leverage,
+        uint256 acceptablePrice,
+        uint256 triggerPrice,
+        bool triggerAbove,
+        uint256 executionFee
+    );
+
+    /// @dev Emitted when a RESTING trigger INCREASE is queued: a limit add of
+    ///      `addCollateral`/`addLeverage` that fills only once the mark crosses
+    ///      `triggerPrice` (side per `triggerAbove`) AND the slippage bound holds.
+    ///      See {requestTriggerIncrease}.
+    event TriggerIncreaseRequested(
+        uint256 indexed requestId,
+        address indexed owner,
+        bytes32 indexed market,
+        bool isLong,
+        uint256 addCollateral,
+        uint256 addLeverage,
+        uint256 acceptablePrice,
+        uint256 triggerPrice,
+        bool triggerAbove,
+        uint256 executionFee
+    );
+
     event RequestExecuted(uint256 indexed requestId, address indexed keeper, uint256 executionPrice);
 
     /// @dev `slippage` is true when the executor cancels on a bound miss; false on
@@ -1620,6 +1656,172 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
 
         emit TriggerDecreaseRequested(
             requestId, msg.sender, market, isLong, closeBps, acceptablePrice, triggerPrice, triggerAbove, EXECUTION_FEE
+        );
+    }
+
+    /**
+     * @notice Queue a RESTING trigger OPEN: a limit/stop entry. An ordinary deferred
+     *         open PLUS a (triggerPrice, triggerAbove) gate. A keeper's execute fills
+     *         it only once the mark crosses the trigger AND the slippage bound holds;
+     *         until then the execute REVERTS and the request stays active (the keeper
+     *         retries) — it never cancels on the trigger miss. The escrow and fill core
+     *         are identical to {requestOpen}; the only new behavior is the gate, which
+     *         {executeRequest} already applies kind-agnostically from {triggers}.
+     * @dev    Param checks: non-zero acceptablePrice; leverage in [MIN, MAX];
+     *         collateral >= MIN_COLLATERAL; PLUS a non-zero `triggerPrice`. The
+     *         supported-market gate is deferred to the fill: {_openPosition} calls
+     *         {_requireSupportedMarket}, so a market delisted between request and fill
+     *         is rejected at execution rather than rested forever. A position must NOT
+     *         already exist on the key: a limit entry can't sit behind a live position
+     *         on the same key — use a limit INCREASE for that. This is intentionally
+     *         stricter than {requestOpen} (correct for a resting order; the fill would
+     *         otherwise revert {PositionAlreadyOpen} forever).
+     *
+     *         NO {closePending} mutex: an open CREATES a position, it does not edit one,
+     *         so it mirrors {requestOpen} and shares no mutex with closes/decreases/
+     *         increases. CEI: validate -> record request + trigger (state) -> pull the
+     *         collateral + fee escrow (interaction). `nonReentrant`.
+     *
+     *         For a stop-type entry (a breakout buy that fires INTO the move), pass a
+     *         PERMISSIVE `acceptablePrice` so adverse slippage on the gap-through does
+     *         not keep it from firing. See {Trigger}.
+     * @param  market          Market feed id (MARKET_BTC or MARKET_ETH).
+     * @param  isLong          True for long, false for short.
+     * @param  collateral      Collateral to post (asset units, >= MIN_COLLATERAL).
+     * @param  leverage        Leverage multiplier in [MIN_LEVERAGE, MAX_LEVERAGE].
+     * @param  acceptablePrice Directional slippage bound (1e8); see {_withinSlippage}.
+     * @param  triggerPrice    Threshold mark (1e8) the fill price must cross.
+     * @param  triggerAbove    True ⇒ fires at/above the threshold, false ⇒ at/below.
+     * @return requestId       Id of the queued request.
+     */
+    function requestTriggerOpen(
+        bytes32 market,
+        bool isLong,
+        uint256 collateral,
+        uint256 leverage,
+        uint256 acceptablePrice,
+        uint256 triggerPrice,
+        bool triggerAbove
+    ) external nonReentrant returns (uint256 requestId) {
+        if (acceptablePrice == 0) revert InvalidAcceptablePrice();
+        if (leverage < MIN_LEVERAGE || leverage > MAX_LEVERAGE) revert LeverageOutOfRange(leverage);
+        if (collateral < MIN_COLLATERAL) revert CollateralTooLow(collateral, MIN_COLLATERAL);
+        if (triggerPrice == 0) revert InvalidTriggerPrice();
+
+        // A limit entry can't sit behind a live position on the same key — use a
+        // limit INCREASE for that. Intentionally stricter than {requestOpen}: a
+        // resting trigger-open must never overwrite a live position (the fill would
+        // revert {PositionAlreadyOpen} anyway), so reject it up front.
+        bytes32 key = _positionKey(msg.sender, market, isLong);
+        if (positions[key].sizeUsd != 0) revert PositionAlreadyOpen();
+
+        // Effects. No {closePending} mutex: an open creates a position, it does not
+        // edit one (mirror {requestOpen}).
+        requestId = nextRequestId++;
+        requests[requestId] = Request({
+            owner: msg.sender,
+            market: market,
+            isLong: isLong,
+            kind: RequestKind.Open,
+            collateral: collateral,
+            leverage: leverage,
+            acceptablePrice: acceptablePrice,
+            executionFee: EXECUTION_FEE,
+            requestTimestamp: block.timestamp,
+            active: true
+        });
+        triggers[requestId] = Trigger({triggerPrice: triggerPrice, triggerAbove: triggerAbove});
+
+        // Interaction LAST (CEI): escrow collateral + fee like an Open.
+        asset.safeTransferFrom(msg.sender, address(this), collateral + EXECUTION_FEE);
+
+        emit TriggerOpenRequested(
+            requestId,
+            msg.sender,
+            market,
+            isLong,
+            collateral,
+            leverage,
+            acceptablePrice,
+            triggerPrice,
+            triggerAbove,
+            EXECUTION_FEE
+        );
+    }
+
+    /**
+     * @notice Queue a RESTING trigger INCREASE: a limit add to the caller's open
+     *         position. An ordinary deferred increase PLUS a (triggerPrice,
+     *         triggerAbove) gate. Like {requestTriggerOpen}, a keeper's execute fills
+     *         it only once the mark crosses the trigger AND the slippage bound holds;
+     *         until then the execute REVERTS and the request stays active. The escrow,
+     *         mutex, and increase fill core are identical to {requestIncrease}.
+     * @dev    Validation mirrors {requestIncrease} EXACTLY (non-zero acceptablePrice;
+     *         `addLeverage` in [MIN, MAX]; `addCollateral` >= MIN_COLLATERAL; position
+     *         exists; the {closePending} mutex is free) PLUS a non-zero `triggerPrice`.
+     *         CEI: validate -> mark pending & record request + trigger (state) -> pull
+     *         the collateral + fee escrow (interaction). `nonReentrant`. The added
+     *         leverage is carried in the request's OVERLOADED `leverage` field in its
+     *         NATURAL sense (see {Request}).
+     * @param  market          Market feed id.
+     * @param  isLong          Direction of the position to increase.
+     * @param  addCollateral   Collateral to add (asset units, >= MIN_COLLATERAL).
+     * @param  addLeverage     Leverage applied to the added collateral, in
+     *                         [MIN_LEVERAGE, MAX_LEVERAGE].
+     * @param  acceptablePrice Directional slippage bound (1e8); see {_withinSlippage}.
+     * @param  triggerPrice    Threshold mark (1e8) the fill price must cross.
+     * @param  triggerAbove    True ⇒ fires at/above the threshold, false ⇒ at/below.
+     * @return requestId       Id of the queued request.
+     */
+    function requestTriggerIncrease(
+        bytes32 market,
+        bool isLong,
+        uint256 addCollateral,
+        uint256 addLeverage,
+        uint256 acceptablePrice,
+        uint256 triggerPrice,
+        bool triggerAbove
+    ) external nonReentrant returns (uint256 requestId) {
+        if (acceptablePrice == 0) revert InvalidAcceptablePrice();
+        if (addLeverage < MIN_LEVERAGE || addLeverage > MAX_LEVERAGE) revert LeverageOutOfRange(addLeverage);
+        if (addCollateral < MIN_COLLATERAL) revert CollateralTooLow(addCollateral, MIN_COLLATERAL);
+        if (triggerPrice == 0) revert InvalidTriggerPrice();
+
+        bytes32 key = _positionKey(msg.sender, market, isLong);
+        if (positions[key].sizeUsd == 0) revert NoOpenPosition();
+        if (closePending[key]) revert CloseAlreadyPending();
+
+        // Effects.
+        closePending[key] = true;
+        requestId = nextRequestId++;
+        requests[requestId] = Request({
+            owner: msg.sender,
+            market: market,
+            isLong: isLong,
+            kind: RequestKind.Increase,
+            collateral: addCollateral,
+            leverage: addLeverage, // natural meaning (leverage applied to addCollateral)
+            acceptablePrice: acceptablePrice,
+            executionFee: EXECUTION_FEE,
+            requestTimestamp: block.timestamp,
+            active: true
+        });
+        triggers[requestId] = Trigger({triggerPrice: triggerPrice, triggerAbove: triggerAbove});
+
+        // Interaction LAST (CEI): escrow collateral + fee like an Open.
+        asset.safeTransferFrom(msg.sender, address(this), addCollateral + EXECUTION_FEE);
+
+        emit TriggerIncreaseRequested(
+            requestId,
+            msg.sender,
+            market,
+            isLong,
+            addCollateral,
+            addLeverage,
+            acceptablePrice,
+            triggerPrice,
+            triggerAbove,
+            EXECUTION_FEE
         );
     }
 
