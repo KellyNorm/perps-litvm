@@ -38,6 +38,24 @@ contract PositionManagerHarness is PositionManager, AuthorisedMockSignersBase {
     function getAuthorisedSignerIndex(address signerAddress) public view virtual override returns (uint8) {
         return getAuthorisedMockSignerIndex(signerAddress);
     }
+
+    /**
+     * @dev Thin exposers reproducing the OLD direct open/close path exactly:
+     *      they call the price-parameterized cores with `msg.sender` as owner and
+     *      the price passed in directly. PR-6c deleted the external
+     *      {PositionManager.openPosition}/{closePosition}; these let the
+     *      settlement-math tests keep driving the cores with a fixed price (no
+     *      oracle payload), so every numeric assertion is preserved verbatim.
+     *      The cores carry no reentrancy guard of their own (it lives on the
+     *      request/execute surface), so these are TEST-ONLY and never shipped.
+     */
+    function exposed_open(bytes32 market, bool isLong, uint256 collateral, uint256 leverage, uint256 price) external {
+        _openPosition(msg.sender, market, isLong, collateral, leverage, price, true);
+    }
+
+    function exposed_close(bytes32 market, bool isLong, uint256 price) external returns (uint256) {
+        return _closePosition(msg.sender, market, isLong, price);
+    }
 }
 
 contract PositionManagerTest is Test {
@@ -48,6 +66,7 @@ contract PositionManagerTest is Test {
     address internal lp = makeAddr("lp");
     address internal alice = makeAddr("alice");
     address internal bob = makeAddr("bob");
+    address internal keeper = makeAddr("keeper");
 
     bytes32 internal constant BTC = bytes32("BTC");
     bytes32 internal constant ETH = bytes32("ETH");
@@ -58,6 +77,10 @@ contract PositionManagerTest is Test {
     // Mirror of the manager's risk params for assertions.
     uint256 internal constant MIN_COLLATERAL = 10e18;
     uint256 internal constant MAX_PROFIT_FACTOR = 5;
+
+    // Two-step deferred-execution params (the only trader entry post PR-6c).
+    uint256 internal constant EXECUTION_FEE = 0.5e18;
+    uint256 internal constant MIN_EXECUTION_DELAY = 3;
 
     function setUp() public {
         asset = new MockERC20("Mock USD", "mUSD");
@@ -97,6 +120,12 @@ contract PositionManagerTest is Test {
         asset.approve(address(p), amt);
     }
 
+    // Direct open/close via the test-only harness exposers, which call the
+    // price-parameterized cores with the price passed in directly (no oracle
+    // payload). PR-6c deleted the external openPosition/closePosition, but the
+    // cores are unchanged, so every settlement-math test keeps its assertions.
+    // `price` is the human-unit mark; the cores store it at the 1e8 scale the
+    // oracle used, so it is scaled here exactly as RedStone would on-chain.
     function _open(
         PositionManager p,
         address who,
@@ -106,36 +135,50 @@ contract PositionManagerTest is Test {
         uint256 leverage,
         uint256 price
     ) internal {
-        bytes memory payload = _payload(block.timestamp * 1000, market, price);
-        bytes memory data = abi.encodePacked(
-            abi.encodeWithSelector(PositionManager.openPosition.selector, market, isLong, collateral, leverage), payload
-        );
         vm.prank(who);
-        (bool ok,) = address(p).call(data);
-        require(ok, "open failed");
+        PositionManagerHarness(address(p)).exposed_open(market, isLong, collateral, leverage, price * ONE8);
     }
 
     function _close(PositionManager p, address who, bytes32 market, bool isLong, uint256 price) internal {
-        bytes memory payload = _payload(block.timestamp * 1000, market, price);
-        bytes memory data =
-            abi.encodePacked(abi.encodeWithSelector(PositionManager.closePosition.selector, market, isLong), payload);
         vm.prank(who);
-        (bool ok,) = address(p).call(data);
-        require(ok, "close failed");
+        PositionManagerHarness(address(p)).exposed_close(market, isLong, price * ONE8);
     }
 
-    function _openRaw(
+    // --- request / execute helpers (the real oracle-reading entry points) ----
+
+    function _requestOpen(
         PositionManager p,
         address who,
         bytes32 market,
         bool isLong,
         uint256 collateral,
         uint256 leverage,
-        bytes memory payload
+        uint256 acceptablePrice
+    ) internal returns (uint256 id) {
+        vm.prank(who);
+        id = p.requestOpen(market, isLong, collateral, leverage, acceptablePrice);
+    }
+
+    /// @dev Execute a request with a payload stamped at the current block time.
+    function _execute(PositionManager p, address who, uint256 requestId, bytes32 market, uint256 price)
+        internal
+        returns (bool ok, bytes memory ret)
+    {
+        (ok, ret) = _executeAtTs(p, who, requestId, market, price, block.timestamp * 1000);
+    }
+
+    /// @dev Execute a request with an explicitly-stamped payload (freshness tests).
+    function _executeAtTs(
+        PositionManager p,
+        address who,
+        uint256 requestId,
+        bytes32 market,
+        uint256 price,
+        uint256 tsMs
     ) internal returns (bool ok, bytes memory ret) {
-        bytes memory data = abi.encodePacked(
-            abi.encodeWithSelector(PositionManager.openPosition.selector, market, isLong, collateral, leverage), payload
-        );
+        bytes memory payload = _payload(tsMs, market, price);
+        bytes memory data =
+            abi.encodePacked(abi.encodeWithSelector(PositionManager.executeRequest.selector, requestId), payload);
         vm.prank(who);
         (ok, ret) = address(p).call(data);
     }
@@ -259,18 +302,21 @@ contract PositionManagerTest is Test {
         assertEq(entryPrice, ENTRY * ONE8, "entry price scaled 1e8");
     }
 
+    // Param checks now live on requestOpen (the sole open entry); it carries the
+    // identical checks and needs no oracle payload, so they revert before any
+    // escrow moves — same selectors as the deleted openPosition.
     function test_RevertWhen_LeverageZero() public {
         _fund(pm, alice, COL);
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(PositionManager.LeverageOutOfRange.selector, 0));
-        pm.openPosition(BTC, true, COL, 0);
+        pm.requestOpen(BTC, true, COL, 0, ENTRY * ONE8);
     }
 
     function test_RevertWhen_LeverageAboveMax() public {
         _fund(pm, alice, COL);
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(PositionManager.LeverageOutOfRange.selector, 11));
-        pm.openPosition(BTC, true, COL, 11);
+        pm.requestOpen(BTC, true, COL, 11, ENTRY * ONE8);
     }
 
     function test_MinAndMaxLeverageSucceed() public {
@@ -287,7 +333,7 @@ contract PositionManagerTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(PositionManager.CollateralTooLow.selector, MIN_COLLATERAL - 1, MIN_COLLATERAL)
         );
-        pm.openPosition(BTC, true, MIN_COLLATERAL - 1, 2);
+        pm.requestOpen(BTC, true, MIN_COLLATERAL - 1, 2, ENTRY * ONE8);
     }
 
     function test_MinCollateralSucceeds() public {
@@ -302,26 +348,24 @@ contract PositionManagerTest is Test {
         _fund(pm, alice, COL);
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(PositionManager.MarketNotSupported.selector, bytes32("DOGE")));
-        pm.openPosition(bytes32("DOGE"), true, COL, 2);
+        pm.requestOpen(bytes32("DOGE"), true, COL, 2, ENTRY * ONE8);
     }
 
     function test_RevertWhen_DuplicatePosition() public {
         _fund(pm, alice, COL * 2);
         _open(pm, alice, BTC, true, COL, LEV, ENTRY);
-        bytes memory payload = _payload(block.timestamp * 1000, BTC, ENTRY);
-        (bool ok, bytes memory ret) = _openRaw(pm, alice, BTC, true, COL, LEV, payload);
-        assertFalse(ok, "duplicate open should revert");
-        assertEq(bytes4(ret), PositionManager.PositionAlreadyOpen.selector, "duplicate selector");
+        // requestOpen carries the same PositionAlreadyOpen guard and rejects the
+        // second entry for this key before any escrow moves.
+        vm.prank(alice);
+        vm.expectRevert(PositionManager.PositionAlreadyOpen.selector);
+        pm.requestOpen(BTC, true, COL, LEV, ENTRY * ONE8);
     }
 
     function test_RevertWhen_CloseWithoutPosition() public {
-        bytes memory payload = _payload(block.timestamp * 1000, BTC, ENTRY);
-        bytes memory data =
-            abi.encodePacked(abi.encodeWithSelector(PositionManager.closePosition.selector, BTC, true), payload);
+        // requestClose (the sole close entry) reverts NoOpenPosition with no payload.
         vm.prank(alice);
-        (bool ok, bytes memory ret) = address(pm).call(data);
-        assertFalse(ok, "close of missing position should revert");
-        assertEq(bytes4(ret), PositionManager.NoOpenPosition.selector, "no-position selector");
+        vm.expectRevert(PositionManager.NoOpenPosition.selector);
+        pm.requestClose(BTC, true, ENTRY * ONE8);
     }
 
     // =====================================================================
@@ -386,9 +430,13 @@ contract PositionManagerTest is Test {
         _fund(m, alice, COL);
         _open(m, alice, BTC, true, COL, LEV, ENTRY); // reserved 5000 <= 8000 OK
 
-        _fund(m, bob, COL);
-        bytes memory payload = _payload(block.timestamp * 1000, BTC, ENTRY);
-        (bool ok, bytes memory ret) = _openRaw(m, bob, BTC, true, COL, LEV, payload); // 10000 > 8000
+        // The solvency gate lives in the core, so a second open trips it only at
+        // fill time: the keeper's executeRequest reverts ExceedsUtilization
+        // (10000 > 8000) and the whole tx unwinds (the request stays active).
+        _fund(m, bob, COL + EXECUTION_FEE);
+        uint256 id = _requestOpen(m, bob, BTC, true, COL, LEV, ENTRY * ONE8);
+        vm.warp(block.timestamp + MIN_EXECUTION_DELAY);
+        (bool ok, bytes memory ret) = _execute(m, keeper, id, BTC, ENTRY); // fill 60000 <= acceptable
         assertFalse(ok, "over-utilization open should revert");
         assertEq(bytes4(ret), PositionManager.ExceedsUtilization.selector, "utilization selector");
     }
@@ -397,40 +445,48 @@ contract PositionManagerTest is Test {
     // Oracle freshness / integrity
     // =====================================================================
 
+    // Oracle reads now happen only at execution; these exercise executeRequest,
+    // the real oracle-reading entry (request -> warp past the delay -> execute
+    // with the bad payload). Same reverts as the deleted openPosition surfaced.
     function test_RevertWhen_OpenWithoutPayload() public {
-        _fund(pm, alice, COL);
-        // Typed call with valid params but NO appended payload -> oracle read reverts.
-        vm.prank(alice);
+        _fund(pm, alice, COL + EXECUTION_FEE);
+        uint256 id = _requestOpen(pm, alice, BTC, true, COL, LEV, ENTRY * ONE8);
+        vm.warp(block.timestamp + MIN_EXECUTION_DELAY);
+        // Execute with NO appended payload -> the oracle read reverts.
+        vm.prank(keeper);
         vm.expectRevert();
-        pm.openPosition(BTC, true, COL, LEV);
+        pm.executeRequest(id);
     }
 
     function test_RevertWhen_PriceStale() public {
-        _fund(pm, alice, COL);
+        _fund(pm, alice, COL + EXECUTION_FEE);
+        uint256 id = _requestOpen(pm, alice, BTC, true, COL, LEV, ENTRY * ONE8);
+        vm.warp(block.timestamp + MIN_EXECUTION_DELAY);
         // Package 61s older than block time -> beyond MAX_PRICE_AGE (60s).
         uint256 staleTsMs = (block.timestamp - 61) * 1000;
-        bytes memory payload = _payload(staleTsMs, BTC, ENTRY);
-        (bool ok, bytes memory ret) = _openRaw(pm, alice, BTC, true, COL, LEV, payload);
+        (bool ok, bytes memory ret) = _executeAtTs(pm, keeper, id, BTC, ENTRY, staleTsMs);
         assertFalse(ok, "stale price should revert");
         assertEq(bytes4(ret), PositionManager.PriceTooStale.selector, "stale selector");
     }
 
     function test_RevertWhen_PriceFromFuture() public {
-        _fund(pm, alice, COL);
+        _fund(pm, alice, COL + EXECUTION_FEE);
+        uint256 id = _requestOpen(pm, alice, BTC, true, COL, LEV, ENTRY * ONE8);
+        vm.warp(block.timestamp + MIN_EXECUTION_DELAY);
         uint256 futureTsMs = (block.timestamp + 61) * 1000;
-        bytes memory payload = _payload(futureTsMs, BTC, ENTRY);
-        (bool ok, bytes memory ret) = _openRaw(pm, alice, BTC, true, COL, LEV, payload);
+        (bool ok, bytes memory ret) = _executeAtTs(pm, keeper, id, BTC, ENTRY, futureTsMs);
         assertFalse(ok, "future price should revert");
         assertEq(bytes4(ret), PositionManager.PriceFromFuture.selector, "future selector");
     }
 
     function test_RevertWhen_SignerNotAuthorised() public {
         // A NON-harness manager authorises only the real demo signer, so the
-        // mock-signed payload must be rejected.
+        // mock-signed payload must be rejected at execution.
         (, PositionManager plain) = _newPlainSystem(LP_LIQUIDITY);
-        _fund(plain, alice, COL);
-        bytes memory payload = _payload(block.timestamp * 1000, BTC, ENTRY);
-        (bool ok,) = _openRaw(plain, alice, BTC, true, COL, LEV, payload);
+        _fund(plain, alice, COL + EXECUTION_FEE);
+        uint256 id = _requestOpen(plain, alice, BTC, true, COL, LEV, ENTRY * ONE8);
+        vm.warp(block.timestamp + MIN_EXECUTION_DELAY);
+        (bool ok,) = _executeAtTs(plain, keeper, id, BTC, ENTRY, block.timestamp * 1000);
         assertFalse(ok, "unauthorised signer must be rejected");
     }
 
@@ -492,27 +548,30 @@ contract PositionManagerTest is Test {
         evil.approve(address(evilPool), LP_LIQUIDITY);
         evilPool.deposit(LP_LIQUIDITY, lp);
 
-        // Alice opens a long that will close in profit.
-        evil.mint(alice, COL);
+        // Alice opens a long (via the harness exposer) that will close in profit,
+        // and funds the execution fee for the deferred close.
+        evil.mint(alice, COL + EXECUTION_FEE);
         vm.prank(alice);
-        evil.approve(address(evilPm), COL);
-        {
-            bytes memory payload = _payload(block.timestamp * 1000, BTC, ENTRY);
-            bytes memory data = abi.encodePacked(
-                abi.encodeWithSelector(PositionManager.openPosition.selector, BTC, true, COL, LEV), payload
-            );
-            vm.prank(alice);
-            (bool ok,) = address(evilPm).call(data);
-            require(ok, "evil open failed");
-        }
+        evil.approve(address(evilPm), COL + EXECUTION_FEE);
+        vm.prank(alice);
+        evilPm.exposed_open(BTC, true, COL, LEV, ENTRY * ONE8);
 
-        // Arm the token to re-enter closePosition during the profit payout.
-        evil.arm(evilPm, BTC, true);
+        // Queue the close and warp past the execution delay. The reentrancy guard
+        // now lives on executeRequest (the cores carry none), so the close runs
+        // through the keeper-fill path.
+        vm.prank(alice);
+        uint256 id = evilPm.requestClose(BTC, true, ENTRY * ONE8);
+        vm.warp(block.timestamp + MIN_EXECUTION_DELAY);
 
+        // Arm the token to re-enter executeRequest during the profit payout.
+        evil.arm(evilPm, id);
+
+        // Keeper fills the close at +10%; the pool's profit transfer re-enters
+        // executeRequest, whose nonReentrant guard must trip and unwind the tx.
         bytes memory closePayload = _payload(block.timestamp * 1000, BTC, 66_000);
         bytes memory closeData =
-            abi.encodePacked(abi.encodeWithSelector(PositionManager.closePosition.selector, BTC, true), closePayload);
-        vm.prank(alice);
+            abi.encodePacked(abi.encodeWithSelector(PositionManager.executeRequest.selector, id), closePayload);
+        vm.prank(keeper);
         (bool okClose, bytes memory ret) = address(evilPm).call(closeData);
         assertFalse(okClose, "reentrant close must revert");
         assertEq(bytes4(ret), ReentrancyGuard.ReentrancyGuardReentrantCall.selector, "reentrancy selector");
@@ -927,19 +986,13 @@ contract PositionManagerTest is Test {
         evil.approve(address(evilPool), LP_LIQUIDITY);
         evilPool.deposit(LP_LIQUIDITY, lp);
 
-        // Alice opens a long that will be liquidatable at the exit price below.
+        // Alice opens a long (via the harness exposer) that will be liquidatable
+        // at the exit price below.
         evil.mint(alice, COL);
         vm.prank(alice);
         evil.approve(address(evilPm), COL);
-        {
-            bytes memory payload = _payload(block.timestamp * 1000, BTC, ENTRY);
-            bytes memory data = abi.encodePacked(
-                abi.encodeWithSelector(PositionManager.openPosition.selector, BTC, true, COL, LEV), payload
-            );
-            vm.prank(alice);
-            (bool ok,) = address(evilPm).call(data);
-            require(ok, "evil open failed");
-        }
+        vm.prank(alice);
+        evilPm.exposed_open(BTC, true, COL, LEV, ENTRY * ONE8);
 
         // Arm the token to re-enter liquidate during the bounty/refund transfer.
         evil.arm(evilPm, alice, BTC, true);
@@ -1304,14 +1357,14 @@ contract PositionManagerTest is Test {
 }
 
 /**
- * @dev Malicious ERC20 that, once armed, re-enters {PositionManager.closePosition}
- *      on its next `transfer` (the call the pool makes when paying out profit).
- *      The manager's `nonReentrant` guard must trip, reverting the whole close.
+ * @dev Malicious ERC20 that, once armed, re-enters {PositionManager.executeRequest}
+ *      on its next `transfer` (the call the pool makes when paying out profit
+ *      during a keeper-filled close). The manager's `nonReentrant` guard must
+ *      trip — its modifier runs before any body logic — reverting the whole fill.
  */
 contract EvilToken is ERC20 {
     PositionManager internal pm;
-    bytes32 internal market;
-    bool internal isLong;
+    uint256 internal requestId;
     bool internal armed;
 
     constructor() ERC20("Evil", "EVL") {}
@@ -1320,10 +1373,9 @@ contract EvilToken is ERC20 {
         _mint(to, amount);
     }
 
-    function arm(PositionManager pm_, bytes32 market_, bool isLong_) external {
+    function arm(PositionManager pm_, uint256 requestId_) external {
         pm = pm_;
-        market = market_;
-        isLong = isLong_;
+        requestId = requestId_;
         armed = true;
     }
 
@@ -1331,7 +1383,7 @@ contract EvilToken is ERC20 {
         if (armed) {
             armed = false;
             // Re-enter; the manager's guard is active and must revert.
-            pm.closePosition(market, isLong);
+            pm.executeRequest(requestId);
         }
         return super.transfer(to, amount);
     }

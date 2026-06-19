@@ -35,6 +35,20 @@ contract TwoStepHarness is PositionManager, AuthorisedMockSignersBase {
     function getAuthorisedSignerIndex(address signerAddress) public view virtual override returns (uint8) {
         return getAuthorisedMockSignerIndex(signerAddress);
     }
+
+    /**
+     * @dev Thin exposers reproducing the OLD direct open/close path exactly (PR-6c
+     *      deleted the external openPosition/closePosition). Used here only to set
+     *      up positions and to provide the direct-close baseline these two-step
+     *      tests compare against; the cores are unchanged so the comparison holds.
+     */
+    function exposed_open(bytes32 market, bool isLong, uint256 collateral, uint256 leverage, uint256 price) external {
+        _openPosition(msg.sender, market, isLong, collateral, leverage, price, true);
+    }
+
+    function exposed_close(bytes32 market, bool isLong, uint256 price) external returns (uint256) {
+        return _closePosition(msg.sender, market, isLong, price);
+    }
 }
 
 contract TwoStepExecutionTest is Test {
@@ -103,8 +117,10 @@ contract TwoStepExecutionTest is Test {
         asset.approve(address(p), amt);
     }
 
-    // Direct open (used to set up positions for close tests), mirrors the helper
-    // in PositionManager.t.sol.
+    // Direct open/close via the harness exposers (PR-6c deleted the external
+    // openPosition/closePosition; the cores are unchanged). Used to set up
+    // positions and to provide the direct-close baseline for comparison. `price`
+    // is the human-unit mark, scaled to 1e8 as the oracle would on-chain.
     function _open(
         PositionManager p,
         address who,
@@ -114,22 +130,13 @@ contract TwoStepExecutionTest is Test {
         uint256 leverage,
         uint256 price
     ) internal {
-        bytes memory payload = _payload(block.timestamp * 1000, market, price);
-        bytes memory data = abi.encodePacked(
-            abi.encodeWithSelector(PositionManager.openPosition.selector, market, isLong, collateral, leverage), payload
-        );
         vm.prank(who);
-        (bool ok,) = address(p).call(data);
-        require(ok, "open failed");
+        TwoStepHarness(address(p)).exposed_open(market, isLong, collateral, leverage, price * ONE8);
     }
 
     function _closeDirect(PositionManager p, address who, bytes32 market, bool isLong, uint256 price) internal {
-        bytes memory payload = _payload(block.timestamp * 1000, market, price);
-        bytes memory data =
-            abi.encodePacked(abi.encodeWithSelector(PositionManager.closePosition.selector, market, isLong), payload);
         vm.prank(who);
-        (bool ok,) = address(p).call(data);
-        require(ok, "close failed");
+        TwoStepHarness(address(p)).exposed_close(market, isLong, price * ONE8);
     }
 
     // --- request / execute helpers --------------------------------------

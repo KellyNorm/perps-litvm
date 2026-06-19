@@ -21,19 +21,24 @@ import {LiquidityPool} from "./LiquidityPool.sol";
  *         (via {MainDemoConsumerBase}) verifies the signer(s) and the package
  *         timestamp before using the value.
  *
- * @dev    SCOPE (PR-3 + PR-4a + PR-4b + PR-5): open/close of one full position
- *         per (owner, market, direction); P&L settled against the pool; LP-share
- *         valuation via a cached aggregate mark; reserved-liquidity solvency;
- *         a time-based borrow fee (PR-4a) charged on notional, accrued O(1) via
- *         a per-market cumulative index and deducted from payout at close;
- *         peer-to-peer funding (PR-4b) between longs and shorts; permissionless
- *         liquidation (PR-5) of positions that breach the maintenance margin,
- *         with residual bad-debt accounting when a loss (plus accrued fee and
- *         funding) exceeds the trader's collateral.
+ * @dev    SCOPE (PR-3 + PR-4a + PR-4b + PR-5 + PR-6): open/close of one full
+ *         position per (owner, market, direction); P&L settled against the pool;
+ *         LP-share valuation via a cached aggregate mark; reserved-liquidity
+ *         solvency; a time-based borrow fee (PR-4a) charged on notional, accrued
+ *         O(1) via a per-market cumulative index and deducted from payout at
+ *         close; peer-to-peer funding (PR-4b) between longs and shorts;
+ *         permissionless liquidation (PR-5) of positions that breach the
+ *         maintenance margin, with residual bad-debt accounting when a loss (plus
+ *         accrued fee and funding) exceeds the trader's collateral; and two-step
+ *         deferred execution (PR-6) as the ONLY trader entry to open/close — a
+ *         request queues here and a keeper fills it next block at a price relayed
+ *         on-chain at execution, so the fill price is unknowable at request time
+ *         (front-running / MEV protection). There is no direct, same-transaction
+ *         open/close path: only {liquidate} still reads the oracle in the same
+ *         transaction as the action, by design (a liquidator must act on a fresh
+ *         mark, and has no position to front-run).
  *
  *         OUT OF SCOPE — deferred to later PRs:
- *         - Two-step deferred execution / front-running protection (PR-6). This
- *           contract reads the price in the SAME transaction as the action.
  *         - Payload-aware LP deposit/withdraw to close the share-price fairness
  *           gap (its own PR; see TASK.md).
  *
@@ -345,8 +350,8 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
     /// @dev Set ONLY for the duration of {executeRequest}'s oracle read to the
     ///      request's earliest-execution timestamp; the {validateTimestamp}
     ///      override rejects any price stamped before it (replay/freshness guard).
-    ///      Always 0 on the direct open/close and liquidate paths, so their
-    ///      timestamp validation is completely unaffected.
+    ///      Always 0 on the {liquidate} path, so its timestamp validation is
+    ///      completely unaffected.
     uint256 private _minExecutionTimestamp;
 
     // --- errors ----------------------------------------------------------
@@ -488,8 +493,8 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
 
         // Deferred-execution freshness/replay guard (PR-6b): reject any price
         // stamped before the request's earliest-execution floor. This fires ONLY
-        // while {executeRequest} has the slot set; it is 0 on the direct
-        // open/close and liquidate paths, so those are completely unaffected.
+        // while {executeRequest} has the slot set; it is 0 on the {liquidate}
+        // path, so that path is completely unaffected.
         uint256 minTs = _minExecutionTimestamp;
         if (minTs != 0 && receivedSeconds < minTs) revert PriceBeforeRequest(receivedSeconds, minTs);
     }
@@ -497,31 +502,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
     // --- trading ---------------------------------------------------------
 
     /**
-     * @notice Open a leveraged position. The caller MUST append a fresh signed
-     *         RedStone payload for `market` to the transaction calldata.
-     * @dev    CEI: validate -> read & validate price -> reserve & record (state)
-     *         -> pull collateral (interaction). `nonReentrant`.
-     * @param  market   Market feed id (MARKET_BTC or MARKET_ETH).
-     * @param  isLong   True for long, false for short.
-     * @param  collateral Collateral to post (asset units, >= MIN_COLLATERAL).
-     * @param  leverage Leverage multiplier in [MIN_LEVERAGE, MAX_LEVERAGE].
-     */
-    function openPosition(bytes32 market, bool isLong, uint256 collateral, uint256 leverage) external nonReentrant {
-        // Hoist the param-validation checks ahead of the oracle read so that
-        // typed calls with NO appended payload still surface the same revert they
-        // do today (the oracle read would otherwise revert first on a missing
-        // payload). These checks are pure and idempotent; they re-run inside
-        // {_openPosition}, which holds the open logic verbatim.
-        _requireSupportedMarket(market);
-        if (collateral < MIN_COLLATERAL) revert CollateralTooLow(collateral, MIN_COLLATERAL);
-        if (leverage < MIN_LEVERAGE || leverage > MAX_LEVERAGE) revert LeverageOutOfRange(leverage);
-
-        uint256 entryPrice = getOracleNumericValueFromTxMsg(market);
-        _openPosition(msg.sender, market, isLong, collateral, leverage, entryPrice, true);
-    }
-
-    /**
-     * @notice Price-parameterized core of {openPosition}. Holds the current open
+     * @notice Price-parameterized core of the open path. Holds the current open
      *         logic verbatim, with the inline oracle read replaced by the passed
      *         `entryPrice` and the collateral pull gated by `pullCollateral`.
      * @dev    The direct path passes `pullCollateral = true`, so its behavior is
@@ -596,37 +577,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
     }
 
     /**
-     * @notice Close the caller's open position in `market`/`isLong`. The caller
-     *         MUST append a fresh signed RedStone payload for `market`.
-     * @dev    CEI: read & validate price -> compute P&L -> delete & release
-     *         (state) -> settle transfers (interactions). `nonReentrant`.
-     *
-     *         Settlement (S = sizeUsd, E = entry, X = exit):
-     *           long  P&L = S*(X-E)/E ; short P&L = S*(E-X)/E.
-     *         Profit is paid by the pool, capped at MAX_PROFIT_FACTOR*collateral,
-     *         and collateral is returned in full. Loss is capped at collateral
-     *         (any deficit beyond it is left for PR-5); the trader receives
-     *         collateral - loss and the loss is pushed into the pool.
-     *
-     *         BORROW FEE (PR-4a): the position's accrued borrow fee is then
-     *         deducted from the amount the trader would otherwise receive and
-     *         routed to the pool. With A = the trader's pre-fee proceeds
-     *         (profit: collateral + pnl; loss: collateral - pnl) the fee charged
-     *         is `min(fee, A)`, so payout = A - charged floors at 0 and never
-     *         underflows. If the fee alone exceeds A, the uncollected remainder
-     *         is simply not taken — the same bad-debt seam as a loss past
-     *         collateral, owned by PR-5. Net pool flow combines pnl and the fee
-     *         into a single {payProfit}/{receiveLoss} call (no new pool ABI).
-     * @param  market Market feed id.
-     * @param  isLong Direction of the position to close.
-     */
-    function closePosition(bytes32 market, bool isLong) external nonReentrant {
-        uint256 exitPrice = getOracleNumericValueFromTxMsg(market);
-        _closePosition(msg.sender, market, isLong, exitPrice);
-    }
-
-    /**
-     * @notice Price-parameterized core of {closePosition}. Holds the current
+     * @notice Price-parameterized core of the close path. Holds the current
      *         close logic verbatim, with the inline oracle read replaced by the
      *         passed `exitPrice`.
      * @dev    The seam for PR-6b's deferred executor, which supplies the price
@@ -681,7 +632,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      *        bad-debt seam left uncollected (bounded on the liquidation path).
      *
      *      Reduces EXACTLY to the PR-4a behavior when `fundingOwed == 0`. Called
-     *      only from {closePosition} after all state effects, so it runs under
+     *      only from {_closePosition} after all state effects, so it runs under
      *      that function's CEI ordering and `nonReentrant` guard.
      */
     function _settle(Position memory pos, bool profit, uint256 pnl, uint256 borrowFee, int256 fundingOwed)
@@ -843,9 +794,9 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      *         escrowed here now; a keeper fills it later at a price relayed
      *         on-chain at execution (front-running protection — the trader does
      *         not pick the fill price).
-     * @dev    Purely additive: the direct {openPosition} path is unchanged. CEI:
+     * @dev    The sole entry to open a position (front-running protection). CEI:
      *         validate -> record request (state) -> pull escrow (interaction).
-     *         `nonReentrant`. Param checks mirror {openPosition} so a bad request
+     *         `nonReentrant`. Param checks mirror {_openPosition} so a bad request
      *         fails fast before any escrow moves.
      *
      *         ESCROW INVARIANT: the `collateral + EXECUTION_FEE` pulled here leaves
@@ -894,7 +845,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      * @notice Queue a deferred CLOSE of the caller's open position. Only the
      *         {EXECUTION_FEE} is escrowed (the collateral is already held against
      *         the open position). A keeper fills it later at a post-request price.
-     * @dev    Purely additive: the direct {closePosition} path is unchanged. CEI:
+     * @dev    The sole entry to close a position (front-running protection). CEI:
      *         validate -> mark pending & record request (state) -> pull fee
      *         (interaction). `nonReentrant`. One live close request per position
      *         key at a time.
@@ -1061,7 +1012,7 @@ contract PositionManager is MainDemoConsumerBase, ReentrancyGuard {
      *         current block time. View-only: projects the market's index forward
      *         by the elapsed interval without mutating state. Returns 0 if no
      *         such position is open. Uncapped (does not floor against
-     *         collateral); {closePosition} applies the cap on settlement.
+     *         collateral); {_closePosition} applies the cap on settlement.
      */
     function pendingBorrowFee(address owner, bytes32 market, bool isLong) external view returns (uint256) {
         Position memory pos = positions[_positionKey(owner, market, isLong)];
