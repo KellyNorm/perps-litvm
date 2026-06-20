@@ -7,7 +7,9 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SignedMath} from "@openzeppelin/contracts/utils/math/SignedMath.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {MainDemoConsumerBase} from "@redstone-finance/evm-connector/contracts/data-services/MainDemoConsumerBase.sol";
+import {
+    PrimaryProdDataServiceConsumerBase
+} from "@redstone-finance/evm-connector/contracts/data-services/PrimaryProdDataServiceConsumerBase.sol";
 
 import {LiquidityPool} from "./LiquidityPool.sol";
 
@@ -19,8 +21,8 @@ import {LiquidityPool} from "./LiquidityPool.sol";
  *         come from the RedStone Pull-Model oracle: the caller appends a fresh
  *
  *         signed price payload to the transaction calldata, and this contract
- *         (via {MainDemoConsumerBase}) verifies the signer(s) and the package
- *         timestamp before using the value.
+ *         (via {PrimaryProdDataServiceConsumerBase}) verifies the signer(s) and
+ *         the package timestamp before using the value.
  *
  * @dev    SCOPE (PR-3 + PR-4a + PR-4b + PR-5 + PR-6): open/close of one full
  *         position per (owner, market, direction); P&L settled against the pool;
@@ -90,7 +92,7 @@ import {LiquidityPool} from "./LiquidityPool.sol";
  *         sizeUsd * |Δprice| / entryPrice keeps the 1e8 price scale internal and
  *         yields an 18-decimal asset amount, matching the collateral.
  */
-contract PositionManager is MainDemoConsumerBase, ReentrancyGuard, Ownable {
+contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
 
     // --- risk parameters (immutable economics; all constant) -------------

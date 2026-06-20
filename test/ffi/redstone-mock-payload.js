@@ -16,8 +16,12 @@
 // Notes:
 //  * Values use RedStone's default numeric precision (8 decimals), so the
 //    on-chain value for `BTC:67000` is 67000 * 1e8.
-//  * `mockSignersCount` is 1 to match `MainDemoConsumerBase`'s single-signer
-//    threshold; the test contract authorises mock signer index 0.
+//  * `mockSignersCount` is 3 to match the PRODUCTION base
+//    (`PrimaryProdDataServiceConsumerBase`) unique-signers threshold of 3; the
+//    test harness authorises mock signer indices 0..N via its
+//    `getAuthorisedSignerIndex` override (see the *Harness contracts). Three
+//    distinct mock signers (indices 0,1,2) clear the threshold and remain valid
+//    for the demo-based PriceReader too (its threshold of 1 is <= 3).
 //  * The Foundry test must `vm.warp(timestampMs / 1000)` so the package passes
 //    the inherited staleness check.
 
@@ -40,7 +44,7 @@ async function main() {
   });
 
   const wrapper = new SimpleNumericMockWrapper({
-    mockSignersCount: 1,
+    mockSignersCount: 3,
     timestampMilliseconds,
     dataPoints,
   });
