@@ -1,86 +1,189 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { createChart, ColorType, LineStyle, CrosshairMode } from "lightweight-charts";
 import { fmtUsd, fmtPrice } from "../lib/format.js";
+import { useCandles, TIMEFRAMES, DEFAULT_TF, binanceSymbol } from "../hooks/useCandles.js";
+import LiveLineChart from "./LiveLineChart.jsx";
 
-const W = 980;
-const H = 300;
-const PAD = 8;
+const CHART_H = 300;
 
-function timeLabel(ts) {
-  try {
-    return new Date(ts).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
-  } catch {
-    return "";
-  }
+// Palette pulled from the molten/dark theme (index.css :root). lightweight-charts is
+// imperative, so we feed it the literal hex rather than CSS vars.
+const C = {
+  up: "#34c98c", // --pos
+  down: "#ef5b52", // --neg
+  grid: "#141a23", // --line-soft
+  text: "#6e7888", // --muted
+  border: "#1b232f", // --line
+  mark: "#ff8a4c", // --molten
+  liq: "#ef5b52", // --neg
+  trig: "#4c82d8", // --ltc
+};
+
+// Candlestick body — owns the imperative lightweight-charts instance. Candles are
+// INDICATIVE exchange history; the RedStone mark (orange line) is what trades execute
+// against. liq/trigger overlays are drawn as labelled price lines.
+function CandleChart({ candles, markPrice, liqLines, trigLines }) {
+  const elRef = useRef(null);
+  const chartRef = useRef(null);
+  const seriesRef = useRef(null);
+  const linesRef = useRef([]);
+
+  // Create once.
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const chart = createChart(el, {
+      width: el.clientWidth,
+      height: CHART_H,
+      layout: {
+        background: { type: ColorType.Solid, color: "transparent" },
+        textColor: C.text,
+        fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+        fontSize: 11,
+        attributionLogo: false,
+      },
+      grid: {
+        vertLines: { color: C.grid },
+        horzLines: { color: C.grid },
+      },
+      crosshair: { mode: CrosshairMode.Normal },
+      rightPriceScale: { borderColor: C.border },
+      timeScale: { borderColor: C.border, timeVisible: true, secondsVisible: false },
+      handleScale: { axisPressedMouseMove: true },
+    });
+    const series = chart.addCandlestickSeries({
+      upColor: C.up,
+      downColor: C.down,
+      borderUpColor: C.up,
+      borderDownColor: C.down,
+      wickUpColor: C.up,
+      wickDownColor: C.down,
+    });
+    chartRef.current = chart;
+    seriesRef.current = series;
+
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect?.width;
+      if (w) chart.applyOptions({ width: Math.floor(w) });
+    });
+    ro.observe(el);
+
+    return () => {
+      ro.disconnect();
+      chart.remove();
+      chartRef.current = null;
+      seriesRef.current = null;
+      linesRef.current = [];
+    };
+  }, []);
+
+  // Data updates (symbol / timeframe / refresh).
+  useEffect(() => {
+    const s = seriesRef.current;
+    if (!s || !candles || !candles.length) return;
+    s.setData(candles);
+    chartRef.current?.timeScale().fitContent();
+  }, [candles]);
+
+  // Mark + liq/trigger overlay price lines. Rebuilt whenever any input changes.
+  useEffect(() => {
+    const s = seriesRef.current;
+    if (!s) return;
+    for (const pl of linesRef.current) {
+      try {
+        s.removePriceLine(pl);
+      } catch {}
+    }
+    linesRef.current = [];
+    const add = (price, color, title, style) => {
+      if (price == null || !isFinite(price) || price <= 0) return;
+      linesRef.current.push(
+        s.createPriceLine({
+          price,
+          color,
+          lineWidth: style === LineStyle.Solid ? 2 : 1,
+          lineStyle: style,
+          axisLabelVisible: true,
+          title,
+        }),
+      );
+    };
+    // The RedStone mark — the price trades actually execute against.
+    add(markPrice, C.mark, "mark · execution", LineStyle.Solid);
+    for (const l of liqLines) add(l.price, C.liq, l.label || "LIQ", LineStyle.Dashed);
+    for (const t of trigLines) add(t.price, C.trig, t.label || "TRIGGER", LineStyle.Dashed);
+  }, [markPrice, liqLines, trigLines, candles]);
+
+  return <div className="chart-canvas" ref={elRef} />;
 }
 
-// Live mark-price area/line that ACCUMULATES from RedStone polls — sparse at first,
-// fills over time. No synthetic OHLC history; every point is an observed sample.
-export default function Chart({ symbol, series, mark, startedAt }) {
-  const pts = series || [];
-  const view = useMemo(() => {
-    if (pts.length < 2) return null;
-    const prices = pts.map((p) => p.price);
-    let lo = Math.min(...prices);
-    let hi = Math.max(...prices);
-    if (hi === lo) {
-      hi += hi * 0.0005 || 1;
-      lo -= lo * 0.0005 || 1;
-    }
-    const rng = hi - lo;
-    const n = pts.length;
-    const x = (i) => (n === 1 ? W / 2 : (i / (n - 1)) * W);
-    const y = (v) => PAD + (1 - (v - lo) / rng) * (H - PAD * 2);
-    const line = pts.map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(p.price).toFixed(1)}`).join(" ");
-    const area = `${line} L${W},${H - PAD} L0,${H - PAD} Z`;
-    return { line, area, y, lo, hi };
-  }, [pts]);
+export default function Chart({ symbol, series, mark, startedAt, liqLines = [], trigLines = [] }) {
+  const [tf, setTf] = useState(DEFAULT_TF);
+  const { candles, status, pair } = useCandles(symbol, tf);
 
-  const cur = mark && !mark.error ? mark.price : pts.length ? pts[pts.length - 1].price : null;
-  const first = pts.length ? pts[0].price : null;
-  const delta = cur != null && first != null ? cur - first : null;
-  const deltaPct = delta != null && first ? (delta / first) * 100 : null;
-  const up = delta != null && delta >= 0;
+  const markPrice = mark && !mark.error ? mark.price : null;
+
+  // Header price/change off the candle set (last close vs the period's first open),
+  // with the live mark preferred for the headline number when we have it.
+  const head = useMemo(() => {
+    if (!candles || !candles.length) return null;
+    const firstOpen = candles[0].open;
+    const lastClose = candles[candles.length - 1].close;
+    const cur = markPrice != null ? markPrice : lastClose;
+    const delta = cur - firstOpen;
+    const pct = firstOpen ? (delta / firstOpen) * 100 : 0;
+    return { cur, delta, pct, up: delta >= 0 };
+  }, [candles, markPrice]);
+
+  const sourceNote =
+    pair != null
+      ? `Candles: Binance ${pair} spot · indicative reference only. Trades execute against the RedStone mark (the orange “mark · execution” line).`
+      : `RedStone live mark (no exchange candles for ${symbol}).`;
+
+  // Fetch failed (or unmapped market) -> fall back to the live RedStone mark line so
+  // nothing white-screens. The liq/trigger overlays carry over.
+  if (status === "error") {
+    return (
+      <LiveLineChart
+        symbol={symbol}
+        series={series}
+        mark={mark}
+        startedAt={startedAt}
+        liqLines={liqLines}
+        trigLines={trigLines}
+        note={sourceNote + " — exchange candles unavailable, showing the live mark."}
+      />
+    );
+  }
 
   return (
     <div className="chart-wrap">
       <div className="chart-top">
-        <span className="price mono">{cur != null ? fmtUsd(cur) : "—"}</span>
-        {delta != null ? (
-          <span className={"chg mono " + (up ? "pos" : "neg")}>
-            {(up ? "+$" : "−$") + fmtPrice(Math.abs(delta))} ({Math.abs(deltaPct).toFixed(2)}% since {timeLabel(startedAt)})
+        <span className="price mono">{head ? fmtUsd(head.cur) : markPrice != null ? fmtUsd(markPrice) : "—"}</span>
+        {head ? (
+          <span className={"chg mono " + (head.up ? "pos" : "neg")}>
+            {(head.up ? "+$" : "−$") + fmtPrice(Math.abs(head.delta))} ({Math.abs(head.pct).toFixed(2)}% · {tf})
           </span>
         ) : (
-          <span className="chg mono loading-dim">accumulating…</span>
+          <span className="chg mono loading-dim">loading candles…</span>
         )}
-        <span className="chart-badge">
-          <span className="dot"></span> {symbol} live mark · {pts.length} pts
+        <span className="tf">
+          {TIMEFRAMES.map((t) => (
+            <button key={t.key} className={tf === t.key ? "on" : ""} onClick={() => setTf(t.key)} type="button">
+              {t.key}
+            </button>
+          ))}
         </span>
       </div>
 
-      {view ? (
-        <svg className="chart-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
-          <defs>
-            <linearGradient id="markfill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stopColor="rgba(255,138,76,0.28)" />
-              <stop offset="1" stopColor="rgba(255,138,76,0)" />
-            </linearGradient>
-          </defs>
-          {[0, 1, 2, 3, 4].map((g) => {
-            const gy = PAD + (g * (H - PAD * 2)) / 4;
-            return <line key={g} x1="0" y1={gy} x2={W} y2={gy} stroke="#141A23" strokeWidth="1" />;
-          })}
-          <path d={view.area} fill="url(#markfill)" />
-          <path d={view.line} fill="none" stroke="var(--molten)" strokeWidth="1.6" />
-          {cur != null && <line className="mark-line" x1="0" y1={view.y(cur)} x2={W} y2={view.y(cur)} />}
-        </svg>
-      ) : (
-        <div className="chart-empty">
-          <div>Live mark chart — building from RedStone polls.</div>
-          <div className="loading-dim">
-            {pts.length === 0 ? "Waiting for the first price…" : `${pts.length} sample so far, need 2+ to draw a line.`}
-          </div>
-        </div>
-      )}
+      <div className="chart-source">{sourceNote}</div>
+
+      <div className="chart-canvas-wrap">
+        <CandleChart candles={candles} markPrice={markPrice} liqLines={liqLines} trigLines={trigLines} />
+        {status === "loading" && !candles && (
+          <div className="chart-loading loading-dim">Loading {pair || symbol} candles…</div>
+        )}
+      </div>
     </div>
   );
 }

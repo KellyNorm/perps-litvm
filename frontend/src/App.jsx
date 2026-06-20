@@ -19,6 +19,7 @@ import { usePositions } from "./hooks/usePositions.js";
 import { useOrders } from "./hooks/useOrders.js";
 import { useBalances } from "./hooks/useBalances.js";
 import { addressesConfigured } from "./config.js";
+import { liqPrice } from "./lib/engine.js";
 
 export default function App() {
   const wallet = useWallet();
@@ -68,6 +69,32 @@ export default function App() {
   const meta = supported && selected ? supported.find((m) => m.symbol === selected) : null;
   const configured = addressesConfigured();
 
+  // Chart overlays for the selected market: a liq line per open position (priced off the
+  // live snapshot incl. accrued fees) and a trigger line per resting order. Kept as the
+  // chart's liq/trigger overlays regardless of candle vs live-line fallback.
+  const liqLines = useMemo(
+    () =>
+      (positions || [])
+        .filter((p) => p.symbol === selected && p.sizeUsd > 0)
+        .map((p) => ({
+          price: liqPrice(
+            { collateral: p.collateral, sizeUsd: p.sizeUsd, entryPrice: p.entryPrice, isLong: p.isLong },
+            p.borrowFee,
+            p.fundingOwed,
+          ),
+          label: `LIQ ${p.isLong ? "long" : "short"}`,
+        }))
+        .filter((l) => l.price > 0),
+    [positions, selected],
+  );
+  const trigLines = useMemo(
+    () =>
+      (orders.orders || [])
+        .filter((o) => o.symbol === selected && o.triggerPrice > 0)
+        .map((o) => ({ price: o.triggerPrice, label: (o.typeLabel || "TRIGGER").toUpperCase() })),
+    [orders.orders, selected],
+  );
+
   return (
     <>
       <EmberCanvas />
@@ -104,7 +131,14 @@ export default function App() {
 
           <div className="grid">
             <div className="col-main">
-              <Chart symbol={selected} series={series[selected]} mark={marks[selected]} startedAt={startedAt} />
+              <Chart
+                symbol={selected}
+                series={series[selected]}
+                mark={marks[selected]}
+                startedAt={startedAt}
+                liqLines={liqLines}
+                trigLines={trigLines}
+              />
 
               <div className="lower">
                 <div className="tabs">

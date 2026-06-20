@@ -476,11 +476,78 @@ button {
   height: 300px;
   display: block;
 }
+/* Timeframe selector (15m / 1H / 4H / 1D) — mirrors the design reference .tf. */
+.tf {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+}
+.tf button {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+.tf button.on {
+  color: var(--text);
+  background: var(--raised);
+  border-color: var(--line);
+}
+/* Honest source label — candles are indicative exchange history, not the exec price. */
+.chart-source {
+  font-size: 10.5px;
+  color: var(--muted-2);
+  margin: -4px 0 8px;
+  line-height: 1.4;
+}
+.chart-canvas-wrap {
+  position: relative;
+  height: 300px;
+}
+.chart-canvas {
+  width: 100%;
+  height: 300px;
+}
+.chart-loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  pointer-events: none;
+}
 .mark-line {
   stroke: var(--molten);
   stroke-width: 1;
   stroke-dasharray: 2 3;
   opacity: 0.55;
+}
+/* Fallback live-line overlays (candles unavailable). */
+.liq-line {
+  stroke: var(--neg);
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+  opacity: 0.8;
+}
+.liq-flag {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  fill: var(--neg);
+}
+.trig-line {
+  stroke: var(--ltc);
+  stroke-width: 1;
+  stroke-dasharray: 5 3;
+  opacity: 0.8;
+}
+.trig-flag {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  fill: var(--ltc);
 }
 .chart-empty {
   height: 300px;
