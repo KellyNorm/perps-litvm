@@ -2,10 +2,12 @@
 // INDICATIVE reference prices for the chart/PnL display only — trades on this DEX
 // execute against the on-chain RedStone mark, NOT these feeds.
 //
-// Why not Binance: api.binance.com / data-api.binance.vision are geo-blocked in some
-// regions, so the chart would hang on "loading" there. We try globally-reachable,
-// CORS-open exchanges in order and use the first that responds: Kraken → Bybit →
-// Coinbase. Each maps our market symbol to its own spot pair.
+// All exchange calls go through a same-origin proxy at /api/px/<exchange>/... (Vite
+// server.proxy in dev, a Vercel function in prod) so the actual fetch happens server-side.
+// This is required because some users' networks DNS-block these exchange APIs at the ISP
+// level — fetching from the browser fails with ERR_NAME_NOT_RESOLVED, but the server is
+// not blocked. We try the proxied sources in order and use the first that responds:
+// Kraken → Bybit → Coinbase. Each maps our market symbol to its own spot pair.
 
 // Our market symbol -> each source's spot pair. Only mapped symbols get a feed;
 // anything else falls back to the live RedStone mark line.
@@ -74,7 +76,7 @@ const CANDLE_SOURCES = [
     async candles(symbol, tf, perTryMs, signal) {
       const pair = KRAKEN[symbol];
       if (!pair) throw new Error("unmapped");
-      const url = `https://api.kraken.com/0/public/OHLC?pair=${pair}&interval=${tf.krakenInt}`;
+      const url = `/api/px/kraken/0/public/OHLC?pair=${pair}&interval=${tf.krakenInt}`;
       const j = await fetchJson(url, perTryMs, signal);
       if (j?.error?.length) throw new Error(j.error.join(","));
       const result = j?.result || {};
@@ -96,7 +98,7 @@ const CANDLE_SOURCES = [
     async candles(symbol, tf, perTryMs, signal) {
       const pair = BYBIT[symbol];
       if (!pair) throw new Error("unmapped");
-      const url = `https://api.bybit.com/v5/market/kline?category=spot&symbol=${pair}&interval=${tf.bybitInt}&limit=${tf.limit}`;
+      const url = `/api/px/bybit/v5/market/kline?category=spot&symbol=${pair}&interval=${tf.bybitInt}&limit=${tf.limit}`;
       const j = await fetchJson(url, perTryMs, signal);
       const rows = j?.result?.list;
       if (!Array.isArray(rows) || !rows.length) throw new Error("empty");
@@ -115,7 +117,7 @@ const CANDLE_SOURCES = [
     async candles(symbol, tf, perTryMs, signal) {
       const pair = COINBASE[symbol];
       if (!pair) throw new Error("unmapped");
-      const url = `https://api.exchange.coinbase.com/products/${pair}/candles?granularity=${tf.cbGran}`;
+      const url = `/api/px/coinbase/products/${pair}/candles?granularity=${tf.cbGran}`;
       const j = await fetchJson(url, perTryMs, signal);
       if (!Array.isArray(j) || !j.length) throw new Error("empty");
       // newest-first: [time(s), low, high, open, close, volume]
@@ -161,7 +163,7 @@ const LIVE_SOURCES = [
     async tickers(symbols, signal) {
       const pairs = symbols.map((s) => KRAKEN[s]).filter(Boolean).join(",");
       if (!pairs) return {};
-      const j = await fetchJson(`https://api.kraken.com/0/public/Ticker?pair=${pairs}`, LIVE_TIMEOUT, signal);
+      const j = await fetchJson(`/api/px/kraken/0/public/Ticker?pair=${pairs}`, LIVE_TIMEOUT, signal);
       if (j?.error?.length) throw new Error(j.error.join(","));
       const result = j?.result || {};
       const keys = Object.keys(result);
@@ -185,7 +187,7 @@ const LIVE_SOURCES = [
           if (!pair) return [s, NaN];
           try {
             const j = await fetchJson(
-              `https://api.bybit.com/v5/market/tickers?category=spot&symbol=${pair}`,
+              `/api/px/bybit/v5/market/tickers?category=spot&symbol=${pair}`,
               LIVE_TIMEOUT,
               signal,
             );
@@ -209,7 +211,7 @@ const LIVE_SOURCES = [
           if (!pair) return [s, NaN];
           try {
             const j = await fetchJson(
-              `https://api.exchange.coinbase.com/products/${pair}/ticker`,
+              `/api/px/coinbase/products/${pair}/ticker`,
               LIVE_TIMEOUT,
               signal,
             );

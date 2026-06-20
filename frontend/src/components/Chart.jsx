@@ -22,11 +22,14 @@ const C = {
 // Candlestick body — owns the imperative lightweight-charts instance. Candles are
 // INDICATIVE exchange history; the RedStone mark (orange line) is what trades execute
 // against. liq/trigger overlays are drawn as labelled price lines.
-function CandleChart({ candles, markPrice, liqLines, trigLines }) {
+function CandleChart({ candles, livePrice, markPrice, liqLines, trigLines }) {
   const elRef = useRef(null);
   const chartRef = useRef(null);
   const seriesRef = useRef(null);
   const linesRef = useRef([]);
+  // The forming (last) bar, kept in sync so live ticks can extend it in place between
+  // the slower OHLC refetches without mutating the candles array from props.
+  const lastBarRef = useRef(null);
 
   // Create once.
   useEffect(() => {
@@ -82,8 +85,30 @@ function CandleChart({ candles, markPrice, liqLines, trigLines }) {
     const s = seriesRef.current;
     if (!s || !candles || !candles.length) return;
     s.setData(candles);
+    // Seed the forming bar from the freshly-loaded last candle (copy, never mutate props).
+    lastBarRef.current = { ...candles[candles.length - 1] };
     chartRef.current?.timeScale().fitContent();
   }, [candles]);
+
+  // Live tick: move the CURRENT candle in place — close tracks the live price, high/low
+  // extend if the tick pierces them. This makes the forming bar glide between the slower
+  // OHLC refetches instead of only jumping when a new bar starts. Display-only.
+  useEffect(() => {
+    const s = seriesRef.current;
+    const bar = lastBarRef.current;
+    if (!s || !bar || livePrice == null || !isFinite(livePrice) || livePrice <= 0) return;
+    const updated = {
+      time: bar.time,
+      open: bar.open,
+      high: Math.max(bar.high, livePrice),
+      low: Math.min(bar.low, livePrice),
+      close: livePrice,
+    };
+    lastBarRef.current = updated;
+    try {
+      s.update(updated);
+    } catch {}
+  }, [livePrice]);
 
   // Mark + liq/trigger overlay price lines. Rebuilt whenever any input changes.
   useEffect(() => {
@@ -123,7 +148,7 @@ export default function Chart({ symbol, series, mark, live, liveSource, startedA
 
   const markPrice = mark && !mark.error ? mark.price : null;
   // Fast DISPLAY price from the public-exchange ticker — the headline number and the
-  // chart's "current price" track this so they tick smoothly (~1.5s). The RedStone mark
+  // chart's "current price" track this so they tick smoothly (~1s). The RedStone mark
   // stays the orange "mark · execution" line below.
   const livePrice = live && isFinite(live.price) ? live.price : null;
 
@@ -183,7 +208,7 @@ export default function Chart({ symbol, series, mark, live, liveSource, startedA
       <div className="chart-source">{sourceNote}</div>
 
       <div className="chart-canvas-wrap">
-        <CandleChart candles={candles} markPrice={markPrice} liqLines={liqLines} trigLines={trigLines} />
+        <CandleChart candles={candles} livePrice={livePrice} markPrice={markPrice} liqLines={liqLines} trigLines={trigLines} />
         {status === "loading" && !candles && (
           <div className="chart-loading loading-dim">Loading {symbol} candles…</div>
         )}
