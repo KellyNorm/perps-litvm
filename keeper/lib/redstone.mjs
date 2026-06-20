@@ -10,9 +10,18 @@ import { ethers } from "ethers";
 import { WrapperBuilder } from "@redstone-finance/evm-connector";
 import { requestDataPackages, getDataPackagesTimestamp } from "@redstone-finance/sdk";
 
-// The single authorised signer behind the free redstone-main-demo data service
-// (same constant the smoke pins). Production feeds would list the real signer set.
-export const DEMO_SIGNER = "0x0C39486f770B26F5527BBBf942726537986Cd7eb";
+// Production RedStone signer set (redstone-primary-prod) — mirrors the on-chain
+// authorised set in PrimaryProdDataServiceConsumerBase (same constants the smoke
+// pins). The contract requires 3 unique signers, so the SDK requests packages
+// from this set.
+export const PROD_SIGNERS = [
+  "0x8BB8F32Df04c8b654987DAaeD53D6B6091e3B774",
+  "0xdEB22f54738d54976C4c0fe5ce6d408E40d88499",
+  "0x51Ce04Be4b3E32572C4Ec9135221d0691Ba7d202",
+  "0xDD682daEC5A90dD295d14DA4b0bec9281017b5bE",
+  "0x9c5AE89C4Af6aA32cE58588DBaF90d18a855B6de",
+];
+export const UNIQUE_SIGNERS = 3;
 
 // Markets are stored on-chain as bytes32 feed ids (formatBytes32String("BTC")),
 // which is exactly the RedStone data-package id. Decode straight back to "BTC"/"ETH".
@@ -22,14 +31,14 @@ export function feedOf(marketBytes32) {
 
 // Wrap a contract so the signed RedStone payload for `feed` is injected into the
 // call's calldata. Used ONLY for executeRequest (the keeper step) — never for a
-// plain view/read. `dataServiceId` selects the feed source (redstone-main-demo).
+// plain view/read. `dataServiceId` selects the feed source (redstone-primary-prod).
 export function makeWrap(dataServiceId) {
   return (contract, feed) =>
     WrapperBuilder.wrap(contract).usingDataService({
       dataServiceId,
       dataPackagesIds: [feed],
-      uniqueSignersCount: 1,
-      authorizedSigners: [DEMO_SIGNER],
+      uniqueSignersCount: UNIQUE_SIGNERS,
+      authorizedSigners: PROD_SIGNERS,
     });
 }
 
@@ -39,8 +48,8 @@ export async function fetchMark(dataServiceId, feed) {
   const pkgs = await requestDataPackages({
     dataServiceId,
     dataPackagesIds: [feed],
-    uniqueSignersCount: 1,
-    authorizedSigners: [DEMO_SIGNER],
+    uniqueSignersCount: UNIQUE_SIGNERS,
+    authorizedSigners: PROD_SIGNERS,
   });
   const ts = Math.floor(getDataPackagesTimestamp(pkgs) / 1000);
   const value = pkgs[feed][0].dataPackage.dataPoints[0].toObj().value; // human float
@@ -70,7 +79,7 @@ export async function waitForFreshPayload(dataServiceId, feed, floor, provider, 
     log(`waiting for fresh payload: pkg ts ${pkgTs}, block ts ${blockTs}, need >= ${floor}`);
     if (pkgTs >= floor && blockTs >= floor) return;
     if (Date.now() - start > TIMEOUT_MS) {
-      throw new Error(`timed out waiting for a demo payload stamped >= ${floor} (last pkg ts ${pkgTs})`);
+      throw new Error(`timed out waiting for a prod payload stamped >= ${floor} (last pkg ts ${pkgTs})`);
     }
     await new Promise((r) => setTimeout(r, POLL_MS));
   }

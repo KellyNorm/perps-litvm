@@ -151,7 +151,7 @@ export async function sendRequest(pm, action, market, isLong, params) {
   return { id, requestTs, rcpt };
 }
 
-// Poll the demo feed until a payload exists that the contract's freshness guard will
+// Poll the prod feed until a payload exists that the contract's freshness guard will
 // accept for a request queued at `requestTs`: a package stamped >= floor (else
 // PriceBeforeRequest) AND the chain clock past the same floor (else TooEarlyToExecute).
 // Identical to the smoke's waitForFreshPayload; onTick reports progress to the UI.
@@ -170,7 +170,7 @@ export async function waitForFreshPayload(feed, requestTs, onTick) {
     if (pkgTs >= floor && blockTs >= floor) return;
     if (Date.now() - start > TIMEOUT_MS) {
       throw new Error(
-        `timed out waiting for a fresh ${feed} payload stamped >= ${floor} (last pkg ts ${pkgTs}); the demo feed updates slowly — retry`,
+        `timed out waiting for a fresh ${feed} payload stamped >= ${floor} (last pkg ts ${pkgTs}); the prod feed updates slowly — retry`,
       );
     }
     await sleep(POLL_MS);

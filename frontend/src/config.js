@@ -12,10 +12,19 @@ export const ADDRESSES = {
   positionManager: (env.VITE_POSITION_MANAGER_ADDRESS || "").trim(),
 };
 
-export const REDSTONE_DATA_SERVICE = env.VITE_REDSTONE_DATA_SERVICE || "redstone-main-demo";
+export const REDSTONE_DATA_SERVICE = env.VITE_REDSTONE_DATA_SERVICE || "redstone-primary-prod";
 
-// RedStone redstone-main-demo single demo signer (same as scripts/smoke-perps.mjs).
-export const REDSTONE_DEMO_SIGNER = "0x0C39486f770B26F5527BBBf942726537986Cd7eb";
+// Production RedStone signer set (redstone-primary-prod) — mirrors the on-chain
+// authorised set in PrimaryProdDataServiceConsumerBase (same as
+// scripts/smoke-perps.mjs). The contract requires 3 unique signers.
+export const REDSTONE_PROD_SIGNERS = [
+  "0x8BB8F32Df04c8b654987DAaeD53D6B6091e3B774",
+  "0xdEB22f54738d54976C4c0fe5ce6d408E40d88499",
+  "0x51Ce04Be4b3E32572C4Ec9135221d0691Ba7d202",
+  "0xDD682daEC5A90dD295d14DA4b0bec9281017b5bE",
+  "0x9c5AE89C4Af6aA32cE58588DBaF90d18a855B6de",
+];
+export const REDSTONE_UNIQUE_SIGNERS = 3;
 
 // LiteForge chain params for wallet_addEthereumChain.
 export const LITEFORGE_CHAIN = {

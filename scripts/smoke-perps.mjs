@@ -33,7 +33,7 @@
 // convention the frontend uses to derive the boolean from a user-picked threshold:
 //   triggerAbove = (triggerPrice >= mark)   (above mark fires UP=true, below fires DOWN=false)
 // matching the contract gate: true => fill once price >= trigger, false => once price <= trigger.
-// The live redstone-main-demo feed can't be driven across a threshold mid-run, so we
+// The live redstone-primary-prod feed can't be driven across a threshold mid-run, so we
 // can't rest an order and wait for a real cross. Instead each step places its threshold
 // on the ALREADY-MET side (the inverse of where a resting order sits) so the gate fires
 // same-block: TRUE gate met with trigger = P*0.9 (below mark, price >= trigger holds);
@@ -47,7 +47,7 @@
 // executeRequest WITH a fresh signed RedStone payload (the keeper step).
 //
 // SKIPPED: on-chain liquidation (PR-5). There is no way to force an adverse price on
-// the live redstone-main-demo feed, so liquidation is covered by the PR-5 forge tests.
+// the live redstone-primary-prod feed, so liquidation is covered by the PR-5 forge tests.
 //
 // Prices on-chain are 1e8-scaled; mUSD is 18 decimals. All triggers and slippage bounds
 // are parameterized off the live mark P so the smoke works at any price. The bounds are
@@ -64,8 +64,18 @@ import { ethers } from "ethers";
 import { WrapperBuilder } from "@redstone-finance/evm-connector";
 import { requestDataPackages, getDataPackagesTimestamp } from "@redstone-finance/sdk";
 
-const DEMO_SIGNER = "0x0C39486f770B26F5527BBBf942726537986Cd7eb";
-const DATA_SERVICE_ID = process.env.REDSTONE_DATA_SERVICE || "redstone-main-demo";
+// Production RedStone signer set (redstone-primary-prod) — mirrors the on-chain
+// authorised set in PrimaryProdDataServiceConsumerBase. The contract requires 3
+// unique signers, so the SDK must request packages from this set.
+const PROD_SIGNERS = [
+  "0x8BB8F32Df04c8b654987DAaeD53D6B6091e3B774",
+  "0xdEB22f54738d54976C4c0fe5ce6d408E40d88499",
+  "0x51Ce04Be4b3E32572C4Ec9135221d0691Ba7d202",
+  "0xDD682daEC5A90dD295d14DA4b0bec9281017b5bE",
+  "0x9c5AE89C4Af6aA32cE58588DBaF90d18a855B6de",
+];
+const UNIQUE_SIGNERS = 3;
+const DATA_SERVICE_ID = process.env.REDSTONE_DATA_SERVICE || "redstone-primary-prod";
 const FEED = "BTC";
 
 // Contract constants (must match PositionManager / MockERC20).
@@ -157,8 +167,8 @@ const wrap = (c) =>
   WrapperBuilder.wrap(c).usingDataService({
     dataServiceId: DATA_SERVICE_ID,
     dataPackagesIds: [FEED],
-    uniqueSignersCount: 1,
-    authorizedSigners: [DEMO_SIGNER],
+    uniqueSignersCount: UNIQUE_SIGNERS,
+    authorizedSigners: PROD_SIGNERS,
   });
 
 function findEvent(contract, receipt, name) {
@@ -198,8 +208,8 @@ async function fetchMark() {
   const pkgs = await requestDataPackages({
     dataServiceId: DATA_SERVICE_ID,
     dataPackagesIds: [FEED],
-    uniqueSignersCount: 1,
-    authorizedSigners: [DEMO_SIGNER],
+    uniqueSignersCount: UNIQUE_SIGNERS,
+    authorizedSigners: PROD_SIGNERS,
   });
   const ts = Math.floor(getDataPackagesTimestamp(pkgs) / 1000);
   const value = pkgs[FEED][0].dataPackage.dataPoints[0].toObj().value; // human price (float)
@@ -322,10 +332,10 @@ async function main() {
   console.log(`mUSD:                      ${musd}`);
   console.log(`wallet mUSD start:         ${f18(initialBalance)}\n`);
 
-  // Poll the demo feed until a payload exists that the contract's freshness guard will
+  // Poll the prod feed until a payload exists that the contract's freshness guard will
   // accept for a request queued at `requestTs`: a package stamped >= requestTs +
   // MIN_EXECUTION_DELAY (else PriceBeforeRequest) AND the chain clock past the same floor
-  // (else TooEarlyToExecute). The redstone-main-demo feed updates slowly, hence the poll.
+  // (else TooEarlyToExecute). The redstone-primary-prod feed updates slowly, hence the poll.
   async function waitForFreshPayload(requestTs) {
     const floor = requestTs + MIN_EXECUTION_DELAY;
     const TIMEOUT_MS = 180_000;
@@ -341,7 +351,7 @@ async function main() {
       if (pkgTs >= floor && blockTs >= floor) return;
       if (Date.now() - start > TIMEOUT_MS) {
         throw new Error(
-          `timed out waiting for a demo payload stamped >= ${floor} (last pkg ts ${pkgTs}); the redstone-main-demo feed updates slowly — rerun or raise TIMEOUT_MS`,
+          `timed out waiting for a prod payload stamped >= ${floor} (last pkg ts ${pkgTs}); the redstone-primary-prod feed updates slowly — rerun or raise TIMEOUT_MS`,
         );
       }
       await sleep(POLL_MS);
@@ -750,7 +760,7 @@ async function main() {
     passStep(name, `size 0, fill ${f8(fill)} <= trigger ${f8(TRIG_UP)} (FALSE gate fired)`);
   }
 
-  console.log("\nNote: on-chain liquidation (PR-5) is intentionally SKIPPED — the live demo feed");
+  console.log("\nNote: on-chain liquidation (PR-5) is intentionally SKIPPED — the live prod feed");
   console.log("cannot be forced to an adverse mark. Liquidation is covered by the PR-5 forge tests.\n");
 
   await printSummary();

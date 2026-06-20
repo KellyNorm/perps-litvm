@@ -65,7 +65,7 @@ async function main() {
     await (await musd.approve(pmAddr, ethers.constants.MaxUint256)).wait();
   }
 
-  const { price1e8: P } = await fetchMark(process.env.REDSTONE_DATA_SERVICE || "redstone-main-demo", FEED);
+  const { price1e8: P } = await fetchMark(process.env.REDSTONE_DATA_SERVICE || "redstone-primary-prod", FEED);
   console.log(`live ${FEED} mark P = ${f8(P)}`);
 
   const ceiling = pct(P, 105); // generous BUY cap so a market open fills

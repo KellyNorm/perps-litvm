@@ -42,7 +42,7 @@ const cfg = {
   pk: process.env.KEEPER_PRIVATE_KEY,
   pmAddr: process.env.POSITION_MANAGER_ADDRESS,
   musdAddr: process.env.MUSD_ADDRESS,
-  dataService: process.env.REDSTONE_DATA_SERVICE || "redstone-main-demo",
+  dataService: process.env.REDSTONE_DATA_SERVICE || "redstone-primary-prod",
   startBlock: process.env.START_BLOCK ? Number(process.env.START_BLOCK) : undefined,
   loopMs: process.env.KEEPER_LOOP_MS ? Number(process.env.KEEPER_LOOP_MS) : 2500,
 };

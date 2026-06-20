@@ -1,6 +1,6 @@
 import { requestDataPackages, getDataPackagesTimestamp } from "@redstone-finance/sdk";
 import { WrapperBuilder } from "@redstone-finance/evm-connector";
-import { REDSTONE_DATA_SERVICE, REDSTONE_DEMO_SIGNER } from "../config.js";
+import { REDSTONE_DATA_SERVICE, REDSTONE_PROD_SIGNERS, REDSTONE_UNIQUE_SIGNERS } from "../config.js";
 
 // Live mark for a feed (e.g. "BTC", "ETH") via the RedStone pull oracle — the same
 // request + decode scripts/smoke-perps.mjs uses to read P. Returns the human price
@@ -10,8 +10,8 @@ export async function fetchMark(feed) {
   const pkgs = await requestDataPackages({
     dataServiceId: REDSTONE_DATA_SERVICE,
     dataPackagesIds: [feed],
-    uniqueSignersCount: 1,
-    authorizedSigners: [REDSTONE_DEMO_SIGNER],
+    uniqueSignersCount: REDSTONE_UNIQUE_SIGNERS,
+    authorizedSigners: REDSTONE_PROD_SIGNERS,
   });
   const list = pkgs[feed];
   if (!list || !list.length) throw new Error(`no RedStone package for ${feed}`);
@@ -34,8 +34,8 @@ export function wrapForExecute(contract, feed) {
   return WrapperBuilder.wrap(contract).usingDataService({
     dataServiceId: REDSTONE_DATA_SERVICE,
     dataPackagesIds: [feed],
-    uniqueSignersCount: 1,
-    authorizedSigners: [REDSTONE_DEMO_SIGNER],
+    uniqueSignersCount: REDSTONE_UNIQUE_SIGNERS,
+    authorizedSigners: REDSTONE_PROD_SIGNERS,
   });
 }
 
