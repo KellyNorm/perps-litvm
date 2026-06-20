@@ -1,0 +1,19 @@
+{
+  "name": "perps-litvm-keeper",
+  "version": "1.0.0",
+  "description": "Standalone keeper service for the perps stack on LitVM (chain 4441): watches PositionManager and fills pending requests / resting triggers with executeRequest carrying a fresh signed RedStone price.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "perps-keeper": "keeper.mjs"
+  },
+  "scripts": {
+    "start": "node keeper.mjs",
+    "create-request": "node scripts/create-request.mjs"
+  },
+  "dependencies": {
+    "@redstone-finance/evm-connector": "^0.9.0",
+    "@redstone-finance/sdk": "^0.9.0",
+    "ethers": "^5.8.0"
+  }
+}

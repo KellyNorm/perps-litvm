@@ -1,0 +1,5 @@
+# Keeper secrets — never commit. Only the example template is tracked.
+.env
+.env.*
+!.env.example
+node_modules/
