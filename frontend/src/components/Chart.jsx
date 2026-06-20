@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createChart, ColorType, LineStyle, CrosshairMode } from "lightweight-charts";
 import { fmtUsd, fmtPrice } from "../lib/format.js";
-import { useCandles, TIMEFRAMES, DEFAULT_TF, binanceSymbol } from "../hooks/useCandles.js";
+import { useCandles, TIMEFRAMES, DEFAULT_TF, hasExchangeFeed } from "../hooks/useCandles.js";
 import LiveLineChart from "./LiveLineChart.jsx";
 
 const CHART_H = 300;
@@ -117,37 +117,41 @@ function CandleChart({ candles, markPrice, liqLines, trigLines }) {
   return <div className="chart-canvas" ref={elRef} />;
 }
 
-export default function Chart({ symbol, series, mark, startedAt, liqLines = [], trigLines = [] }) {
+export default function Chart({ symbol, series, mark, live, liveSource, startedAt, liqLines = [], trigLines = [] }) {
   const [tf, setTf] = useState(DEFAULT_TF);
-  const { candles, status, pair } = useCandles(symbol, tf);
+  const { candles, status, source } = useCandles(symbol, tf);
 
   const markPrice = mark && !mark.error ? mark.price : null;
+  // Fast DISPLAY price from the public-exchange ticker — the headline number and the
+  // chart's "current price" track this so they tick smoothly (~1.5s). The RedStone mark
+  // stays the orange "mark · execution" line below.
+  const livePrice = live && isFinite(live.price) ? live.price : null;
 
   // Header price/change off the candle set (last close vs the period's first open),
-  // with the live mark preferred for the headline number when we have it.
+  // with the live ticker preferred for the headline number, then the RedStone mark.
   const head = useMemo(() => {
     if (!candles || !candles.length) return null;
     const firstOpen = candles[0].open;
     const lastClose = candles[candles.length - 1].close;
-    const cur = markPrice != null ? markPrice : lastClose;
+    const cur = livePrice != null ? livePrice : markPrice != null ? markPrice : lastClose;
     const delta = cur - firstOpen;
     const pct = firstOpen ? (delta / firstOpen) * 100 : 0;
     return { cur, delta, pct, up: delta >= 0 };
-  }, [candles, markPrice]);
+  }, [candles, livePrice, markPrice]);
 
-  const sourceNote =
-    pair != null
-      ? `Candles: Binance ${pair} spot · indicative reference only. Trades execute against the RedStone mark (the orange “mark · execution” line).`
-      : `RedStone live mark (no exchange candles for ${symbol}).`;
+  const sourceNote = hasExchangeFeed(symbol)
+    ? `Candles & live price: ${source || liveSource || "Kraken/Bybit/Coinbase"} spot · indicative real-time. Trades execute & realize against the RedStone mark (the orange “mark · execution” line).`
+    : `RedStone live mark (no exchange feed for ${symbol}).`;
 
-  // Fetch failed (or unmapped market) -> fall back to the live RedStone mark line so
-  // nothing white-screens. The liq/trigger overlays carry over.
+  // Fetch failed / timed out (or unmapped market) -> fall back to the live mark line so
+  // nothing hangs on "loading". The liq/trigger overlays carry over.
   if (status === "error") {
     return (
       <LiveLineChart
         symbol={symbol}
         series={series}
         mark={mark}
+        live={live}
         startedAt={startedAt}
         liqLines={liqLines}
         trigLines={trigLines}
@@ -159,7 +163,7 @@ export default function Chart({ symbol, series, mark, startedAt, liqLines = [], 
   return (
     <div className="chart-wrap">
       <div className="chart-top">
-        <span className="price mono">{head ? fmtUsd(head.cur) : markPrice != null ? fmtUsd(markPrice) : "—"}</span>
+        <span className="price mono">{head ? fmtUsd(head.cur) : livePrice != null ? fmtUsd(livePrice) : markPrice != null ? fmtUsd(markPrice) : "—"}</span>
         {head ? (
           <span className={"chg mono " + (head.up ? "pos" : "neg")}>
             {(head.up ? "+$" : "−$") + fmtPrice(Math.abs(head.delta))} ({Math.abs(head.pct).toFixed(2)}% · {tf})
@@ -181,7 +185,7 @@ export default function Chart({ symbol, series, mark, startedAt, liqLines = [], 
       <div className="chart-canvas-wrap">
         <CandleChart candles={candles} markPrice={markPrice} liqLines={liqLines} trigLines={trigLines} />
         {status === "loading" && !candles && (
-          <div className="chart-loading loading-dim">Loading {pair || symbol} candles…</div>
+          <div className="chart-loading loading-dim">Loading {symbol} candles…</div>
         )}
       </div>
     </div>

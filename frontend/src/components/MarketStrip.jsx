@@ -8,11 +8,20 @@ function Price({ mark }) {
   return <>{fmtUsd(mark.price)}</>;
 }
 
-export default function MarketStrip({ supported, selected, onSelect, marks, states }) {
+// Live price for a symbol: prefer the fast exchange ticker, fall back to the RedStone
+// mark. Returns a {price}|{error}-shaped object so the <Price> renderer is reused.
+function displayMark(symbol, marks, live) {
+  const lv = live && live[symbol];
+  if (lv && isFinite(lv.price)) return { price: lv.price };
+  return marks[symbol];
+}
+
+export default function MarketStrip({ supported, selected, onSelect, marks, live, liveSource, states }) {
   const [open, setOpen] = useState(false);
   const selRef = useRef(null);
   const meta = supported.find((m) => m.symbol === selected) || supported[0];
-  const mark = marks[selected];
+  const mark = marks[selected]; // RedStone mark · execution
+  const liveMark = displayMark(selected, marks, live); // fast display price
   const st = states[selected];
 
   useEffect(() => {
@@ -68,7 +77,7 @@ export default function MarketStrip({ supported, selected, onSelect, marks, stat
           <div className="dropdown">
             <div className="dd-search">Markets · RedStone feeds</div>
             {supported.map((m) => {
-              const mk = marks[m.symbol];
+              const mk = displayMark(m.symbol, marks, live);
               return (
                 <button
                   key={m.symbol}
@@ -95,15 +104,9 @@ export default function MarketStrip({ supported, selected, onSelect, marks, stat
       </div>
 
       <div className="stat">
-        <span className="k">Mark price</span>
-        <span className="v big mono">
-          <Price mark={mark} />
-        </span>
-      </div>
-      <div className="stat">
-        <span className="k">24h change</span>
-        <span className="v mono loading-dim" title="No 24h history source on-chain yet — only the live mark is read.">
-          —
+        <span className="k">Live price{liveSource ? ` · ${liveSource}` : ""}</span>
+        <span className="v big mono" title="Indicative real-time price from a public exchange feed. Trades execute & realize at the RedStone mark.">
+          <Price mark={liveMark} />
         </span>
       </div>
       <div className="stat">
@@ -111,8 +114,8 @@ export default function MarketStrip({ supported, selected, onSelect, marks, stat
         <span className="v mono">{fmtPct(borrowDayFrac(), 3)}</span>
       </div>
       <div className="stat">
-        <span className="k">Index (RedStone)</span>
-        <span className="v mono">
+        <span className="k">Mark · execution (RedStone)</span>
+        <span className="v mono" title="The on-chain RedStone mark — the price your trades actually execute and realize against.">
           <Price mark={mark} />
         </span>
       </div>

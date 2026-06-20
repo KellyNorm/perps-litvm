@@ -7,8 +7,19 @@ import { KIND_INCREASE } from "../lib/triggers.js";
 // refunds the fee if the fill lands outside this.
 const CLOSE_SLIP = 0.005;
 
-export default function PositionsTable({ account, positions, marks, orders, trade, wrongChain, onAddTpSl }) {
+export default function PositionsTable({ account, positions, marks, live, orders, trade, wrongChain, onAddTpSl }) {
   const colSpan = 9;
+
+  // Display price for PnL / the Live column: prefer the fast exchange ticker (so PnL
+  // ticks smoothly), fall back to the RedStone mark, then entry. INDICATIVE — positions
+  // execute & realize against the RedStone mark, not this feed.
+  function displayPrice(p) {
+    const lv = live && live[p.symbol];
+    if (lv && isFinite(lv.price)) return { price: lv.price, ok: true };
+    const mk = marks[p.symbol];
+    if (mk && !mk.error) return { price: mk.price, ok: true };
+    return { price: p.entryPrice, ok: false };
+  }
 
   // A resting trigger-edit on this position — a TP/SL exit OR a trigger increase. Both
   // take the engine's closePending mutex at request time, so while one rests the market
@@ -131,8 +142,8 @@ export default function PositionsTable({ account, positions, marks, orders, trad
     );
   } else {
     body = positions.map((p) => {
-      const mk = marks[p.symbol];
-      const mark = mk && !mk.error ? mk.price : p.entryPrice;
+      const dp = displayPrice(p);
+      const mark = dp.price;
       const lev = p.collateral > 0 ? p.sizeUsd / p.collateral : 0;
       const pnl = signedPnl(p, mark);
       const liq = liqPrice(p, p.borrowFee, p.fundingOwed);
@@ -151,7 +162,7 @@ export default function PositionsTable({ account, positions, marks, orders, trad
           </td>
           <td className="mono">{fmtUsd(p.sizeUsd)}</td>
           <td className="mono">{fmtUsd(p.entryPrice)}</td>
-          <td className="mono">{mk && !mk.error ? fmtUsd(mark) : <span className="loading-dim">…</span>}</td>
+          <td className="mono">{dp.ok ? fmtUsd(mark) : <span className="loading-dim">…</span>}</td>
           <td className="mono neg">{fmtUsd(liq)}</td>
           <td>
             <span className="health">
@@ -172,21 +183,29 @@ export default function PositionsTable({ account, positions, marks, orders, trad
   }
 
   return (
-    <table>
-      <thead>
-        <tr>
-          <th>Market</th>
-          <th>Size</th>
-          <th>Entry</th>
-          <th>Mark</th>
-          <th>Liq. price</th>
-          <th>Health</th>
-          <th>Net funding</th>
-          <th>uPnL</th>
-          <th style={{ textAlign: "right" }}>Manage</th>
-        </tr>
-      </thead>
-      <tbody>{body}</tbody>
-    </table>
+    <>
+      <table>
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th>Size</th>
+            <th>Entry</th>
+            <th>Live</th>
+            <th>Liq. price</th>
+            <th>Health</th>
+            <th>Net funding</th>
+            <th>uPnL</th>
+            <th style={{ textAlign: "right" }}>Manage</th>
+          </tr>
+        </thead>
+        <tbody>{body}</tbody>
+      </table>
+      {positions && positions.length > 0 && (
+        <div className="chart-source" style={{ margin: "8px 2px 0" }}>
+          Live price &amp; uPnL are indicative real-time (public-exchange feed). Liquidation, triggers, and actual
+          execution / realized PnL settle against the RedStone mark · execution price.
+        </div>
+      )}
+    </>
   );
 }

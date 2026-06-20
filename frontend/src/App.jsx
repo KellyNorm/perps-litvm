@@ -14,6 +14,7 @@ import { useWallet } from "./hooks/useWallet.js";
 import { useTrade } from "./hooks/useTrade.js";
 import { useMarkets } from "./hooks/useMarkets.js";
 import { usePrices } from "./hooks/usePrices.js";
+import { useLiveFeed } from "./hooks/useLiveFeed.js";
 import { useVault } from "./hooks/useVault.js";
 import { usePositions } from "./hooks/usePositions.js";
 import { useOrders } from "./hooks/useOrders.js";
@@ -28,6 +29,10 @@ export default function App() {
 
   const supportedSymbols = useMemo(() => (supported ? supported.map((m) => m.symbol) : []), [supported]);
   const { marks, series, startedAt } = usePrices(supportedSymbols);
+  // Fast DISPLAY feed (public exchanges, ~1.5s) — drives the shown price, the chart's
+  // current price, and position PnL so they tick smoothly. RedStone `marks` stay the
+  // labeled "mark · execution" reference (what trades actually settle against).
+  const { live, source: liveSource } = useLiveFeed(supportedSymbols);
   const { data: vault, yourDeposit } = useVault(account);
   const { positions, refresh: refreshPositions } = usePositions(account, supported);
   const balances = useBalances(account);
@@ -127,7 +132,7 @@ export default function App() {
 
       {meta ? (
         <>
-          <MarketStrip supported={supported} selected={selected} onSelect={setSelected} marks={marks} states={states} />
+          <MarketStrip supported={supported} selected={selected} onSelect={setSelected} marks={marks} live={live} liveSource={liveSource} states={states} />
 
           <div className="grid">
             <div className="col-main">
@@ -135,6 +140,8 @@ export default function App() {
                 symbol={selected}
                 series={series[selected]}
                 mark={marks[selected]}
+                live={live[selected]}
+                liveSource={liveSource}
                 startedAt={startedAt}
                 liqLines={liqLines}
                 trigLines={trigLines}
@@ -158,6 +165,7 @@ export default function App() {
                     account={account}
                     positions={positions}
                     marks={marks}
+                    live={live}
                     orders={orders.orders}
                     trade={trade}
                     wrongChain={wrongChain}

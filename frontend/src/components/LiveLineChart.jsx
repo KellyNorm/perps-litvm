@@ -17,9 +17,12 @@ function timeLabel(ts) {
 // area/line that ACCUMULATES from RedStone polls — sparse at first, fills over time. No
 // synthetic OHLC; every point is an observed sample. Keeps the liq/trigger overlay
 // lines so the position context survives even without candles.
-export default function LiveLineChart({ symbol, series, mark, startedAt, liqLines = [], trigLines = [], note }) {
+export default function LiveLineChart({ symbol, series, mark, live, startedAt, liqLines = [], trigLines = [], note }) {
   const pts = series || [];
   const markPrice = mark && !mark.error ? mark.price : null;
+  // Fast DISPLAY price (public-exchange ticker) for the headline number; the orange
+  // accumulation line + the horizontal mark-line stay the RedStone execution mark.
+  const livePrice = live && isFinite(live.price) ? live.price : null;
 
   const view = useMemo(() => {
     if (pts.length < 2) return null;
@@ -40,7 +43,10 @@ export default function LiveLineChart({ symbol, series, mark, startedAt, liqLine
     return { line, area, y, lo, hi };
   }, [pts, liqLines, trigLines]);
 
-  const cur = markPrice != null ? markPrice : pts.length ? pts[pts.length - 1].price : null;
+  const lastPt = pts.length ? pts[pts.length - 1].price : null;
+  // Header tracks the fast live ticker; the horizontal mark-line tracks RedStone.
+  const cur = livePrice != null ? livePrice : markPrice != null ? markPrice : lastPt;
+  const markCur = markPrice != null ? markPrice : lastPt;
   const first = pts.length ? pts[0].price : null;
   const delta = cur != null && first != null ? cur - first : null;
   const deltaPct = delta != null && first ? (delta / first) * 100 : null;
@@ -78,7 +84,7 @@ export default function LiveLineChart({ symbol, series, mark, startedAt, liqLine
           })}
           <path d={view.area} fill="url(#markfill)" />
           <path d={view.line} fill="none" stroke="var(--molten)" strokeWidth="1.6" />
-          {cur != null && <line className="mark-line" x1="0" y1={view.y(cur)} x2={W} y2={view.y(cur)} />}
+          {markCur != null && <line className="mark-line" x1="0" y1={view.y(markCur)} x2={W} y2={view.y(markCur)} />}
           {liqLines.map((l, i) =>
             l.price > 0 ? (
               <g key={"liq" + i}>
