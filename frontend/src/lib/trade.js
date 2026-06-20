@@ -217,6 +217,53 @@ export async function executeRequest(pmSigner, feed, id) {
   return { outcome: classifyExecute(pmSigner, rcpt), rcpt };
 }
 
+// Read the live resolution state of a request WITHOUT a local receipt — the keeper
+// (or another caller) sent the execute, so the frontend has no receipt of its own and
+// must read the outcome from chain state + emitted events. Returns:
+//   { active: true }                              -> still pending (keeper not done yet)
+//   { active: false, outcome: { kind, ... } }     -> resolved; classify from events
+// `active` is the source of truth for "is it still pending"; the event scan only
+// LABELS a resolved request (filled vs slippage-refund vs owner-cancel). If the
+// request is gone but no event lands in the scanned window, kind is "unknown" — still
+// a resolution, just unlabelled, so the caller refreshes and moves on.
+export async function readRequestState(pmReadCtr, id, fromBlock) {
+  const r = await pmReadCtr.requests(id);
+  if (r.active) return { active: true };
+  return { active: false, outcome: await readRequestOutcome(pmReadCtr, id, fromBlock) };
+}
+
+// Scan RequestExecuted / RequestCancelled for a single request id and classify it.
+// fromBlock bounds the getLogs range (public RPCs cap it); when absent we look back a
+// bounded recent window, mirroring orders.js's event-scan resilience.
+const OUTCOME_LOOKBACK = 120_000;
+export async function readRequestOutcome(pmReadCtr, id, fromBlock) {
+  const idBn = ethers.BigNumber.from(String(id));
+  let from = fromBlock;
+  if (from == null) {
+    try {
+      const latest = await pmReadCtr.provider.getBlockNumber();
+      from = Math.max(0, latest - OUTCOME_LOOKBACK);
+    } catch {
+      from = 0;
+    }
+  }
+  try {
+    const [executed, cancelled] = await Promise.all([
+      pmReadCtr.queryFilter(pmReadCtr.filters.RequestExecuted(idBn), from, "latest"),
+      pmReadCtr.queryFilter(pmReadCtr.filters.RequestCancelled(idBn), from, "latest"),
+    ]);
+    if (executed.length) return { kind: "filled", executionPrice: executed[executed.length - 1].args.executionPrice };
+    if (cancelled.length) {
+      const ev = cancelled[cancelled.length - 1];
+      return { kind: ev.args.slippage ? "slippage" : "cancelled" };
+    }
+  } catch {
+    // range too wide / RPC hiccup — fall through to "unknown"; the request is gone
+    // either way, so the caller still refreshes and stops watching.
+  }
+  return { kind: "unknown" };
+}
+
 // Owner-reclaim a stale/abandoned request after CANCEL_DELAY (manual fallback).
 export async function cancelRequest(pmSigner, id) {
   try {

@@ -117,7 +117,10 @@ export default function OrderTicket({ meta, mark, state, musdBalance, nativeBala
   // while any resting trigger-edit (increase or exit) rests on this position.
   const blockedOpen = isTrigger && action === "open" && Boolean(restingOpenHere);
   const blockedIncrease = action === "increase" && Boolean(restingEditHere);
-  const blocked = blockedOpen || blockedIncrease;
+  // A market request is one-at-a-time per wallet and is currently being watched for the
+  // keeper — block a second market submit until it resolves (the hook toasts otherwise).
+  const pendingMarket = !isTrigger && Boolean(trade.pending);
+  const blocked = blockedOpen || blockedIncrease || pendingMarket;
   const canSubmit =
     account && !wrongChain && !needsTokens && price != null && !tooSmall && !overBalance && !busy && trigValid && !blocked;
 
@@ -143,6 +146,7 @@ export default function OrderTicket({ meta, mark, state, musdBalance, nativeBala
   else if (needsGas) btnLabel = "Get zkLTC gas to trade →";
   else if (needsMusd) btnLabel = "Get mUSD to trade →";
   else if (busy && myFlow) btnLabel = myFlow.phase === "approving" ? "Approving…" : myFlow.phase === "executing" ? "Executing…" : "Working…";
+  else if (pendingMarket) btnLabel = "Waiting for keeper…";
   else if (blockedOpen) btnLabel = "Open already resting";
   else if (blockedIncrease) btnLabel = "Position has a resting trigger-edit";
   else btnLabel = `${verb} ${side} · ${meta.symbol}`;
@@ -330,7 +334,7 @@ export default function OrderTicket({ meta, mark, state, musdBalance, nativeBala
 
       {myFlow && (
         <div className={"ticket-status" + (myFlow.phase === "error" ? " err" : "")}>
-          {myFlow.phase === "approving" || myFlow.phase === "requesting" || myFlow.phase === "waiting" || myFlow.phase === "executing" ? (
+          {myFlow.phase === "approving" || myFlow.phase === "requesting" || myFlow.phase === "waiting" || myFlow.phase === "executing" || myFlow.phase === "watching" ? (
             <span className="spin" aria-hidden="true" />
           ) : null}
           <span>{myFlow.message}</span>
@@ -339,8 +343,8 @@ export default function OrderTicket({ meta, mark, state, musdBalance, nativeBala
 
       <div className="panel-foot">
         {isTrigger
-          ? "Collateral + the 0.5 mUSD fee are escrowed now; the order rests on-chain until the mark crosses your trigger, then your browser keeper fills it. Cancel for a full refund after 180s."
-          : "Collateral + the 0.5 mUSD keeper fee are escrowed at request and settled against the RedStone mark at execute. Two-step keeper execution protects the fill price."}
+          ? "Collateral + the 0.5 mUSD fee are escrowed now; the order rests on-chain until the mark crosses your trigger, then the keeper fills it (fall back to filling it yourself if the keeper's down). Cancel for a full refund after 180s."
+          : "One signature: collateral + the 0.5 mUSD keeper fee are escrowed at request, then the keeper executes it against the RedStone mark next block. If the keeper's down you can execute it yourself. Two-step execution protects the fill price."}
       </div>
     </div>
   );

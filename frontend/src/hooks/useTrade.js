@@ -1,12 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ethers } from "ethers";
 import { ADDRESSES } from "../config.js";
-import { pmWrite, musdWrite } from "../lib/contracts.js";
+import { pmWrite, musdWrite, pmRead } from "../lib/contracts.js";
 import { loadPending, savePending, clearPending } from "../lib/pending.js";
 import * as trade from "../lib/trade.js";
 
 const VERBING = { open: "Opening", increase: "Increasing", close: "Closing", decrease: "Decreasing" };
 const IN_PROGRESS = ["approving", "requesting", "waiting", "executing"];
+
+// Keeper-deferral tuning. After leg 1 the request is the keeper's to fill; we WATCH
+// (read-only) and only fall back to self-execute if the keeper doesn't resolve it.
+const WATCH_POLL_MS = 4_000; // requests(id).active + event reconcile cadence
+const KEEPER_GRACE_SEC = 28; // unresolved past this -> surface the self-execute fallback
+
+const nowSec = () => Math.floor(Date.now() / 1000);
 
 // Drives the whole two-step market-order loop for the connected wallet acting as its
 // own keeper: approve (if needed) -> request (leg 1) -> wait for a fresh payload ->
@@ -21,7 +28,10 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
   const busyRef = useRef(false);
   const clearTimer = useRef(null);
 
-  // On connect / account switch, surface any unfinished order so the user can resume.
+  // On connect / account switch, resume WATCHING any unfinished request. The keeper
+  // may have already filled it while we were away, so the watcher effect reconciles
+  // immediately; if it's old enough that the keeper clearly isn't coming, the
+  // self-execute fallback is offered right away.
   useEffect(() => {
     clearTimeout(clearTimer.current);
     if (!account) {
@@ -34,9 +44,10 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
     setFlow(
       crumb
         ? {
-            phase: "resume",
+            phase: "watching",
             ...crumb,
-            message: "You have an unfinished order. Finish it to apply, or cancel for a refund once the window opens.",
+            fallbackReady: nowSec() - (crumb.requestTs || 0) >= KEEPER_GRACE_SEC,
+            message: "Unfinished order — checking whether the keeper filled it…",
           }
         : null,
     );
@@ -47,9 +58,76 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
     clearTimer.current = setTimeout(() => setFlow(null), ms);
   }, []);
 
-  // Leg 2 (shared by submit and resume): append a fresh payload, executeRequest, then
-  // tell the outcome from the receipt's events. Throws on revert (caller keeps the
-  // breadcrumb and offers resume / cancel).
+  // Apply a resolution read from chain state/events (no local receipt — the keeper
+  // sent the execute). A fill bumps lastFill so the trade button glows.
+  const applyOutcome = useCallback(
+    (crumb, outcome) => {
+      clearPending(account);
+      setPending(null);
+      if (outcome?.kind === "filled") {
+        setFlow({ phase: "done", ...crumb, ok: true, message: `${crumb.verb} ${crumb.symbol} ✓` });
+        toast(`${crumb.verb} ${crumb.symbol} ✓`);
+        setLastFill((s) => ({ n: s.n + 1, action: crumb.action, isLong: crumb.isLong, symbol: crumb.symbol }));
+      } else if (outcome?.kind === "slippage") {
+        setFlow({ phase: "done", ...crumb, ok: false, message: "Price moved past your limit — refunded." });
+        toast("Price moved past your limit — refunded.", true);
+      } else if (outcome?.kind === "cancelled") {
+        setFlow({ phase: "done", ...crumb, ok: true, message: "Order cancelled — refunded." });
+        toast("Order cancelled — refunded.");
+      } else {
+        // Resolved but unlabelled (event window missed) — still refresh on-chain truth.
+        setFlow({ phase: "done", ...crumb, ok: true, message: `${crumb.verb || "Order"} ${crumb.symbol || ""} — resolved.` });
+      }
+      onTraded?.();
+      scheduleClear();
+    },
+    [account, toast, onTraded, scheduleClear],
+  );
+
+  // WATCH a pending market request for keeper resolution. Read-only: polls
+  // requests(id).active and reconciles the outcome from events — no signature, no gas.
+  // Pauses while a manual leg (self-execute / cancel) holds busyRef so the two don't
+  // race. After KEEPER_GRACE_SEC unresolved, exposes the self-execute fallback; the
+  // watcher keeps running, so a late keeper fill still wins the race.
+  useEffect(() => {
+    if (!account || !pending) return;
+    let stopped = false;
+
+    const graceAt = (pending.requestTs || nowSec()) + KEEPER_GRACE_SEC;
+    const graceMs = Math.max(0, graceAt - nowSec()) * 1000;
+    const graceTimer = setTimeout(() => {
+      if (stopped) return;
+      setFlow((f) =>
+        f && f.phase === "watching" && f.id === pending.id
+          ? { ...f, fallbackReady: true, message: "Keeper hasn't filled this yet. Keep waiting, or execute it yourself." }
+          : f,
+      );
+    }, graceMs);
+
+    async function poll() {
+      if (stopped || busyRef.current) return; // a manual leg is driving — stand down
+      let state;
+      try {
+        state = await trade.readRequestState(pmRead(), pending.id, pending.fromBlock);
+      } catch {
+        return; // transient RPC hiccup — try again next tick
+      }
+      if (stopped || busyRef.current || state.active) return;
+      applyOutcome(pending, state.outcome);
+    }
+
+    poll(); // reconcile immediately (keeper may have filled within seconds / while away)
+    const iv = setInterval(poll, WATCH_POLL_MS);
+    return () => {
+      stopped = true;
+      clearTimeout(graceTimer);
+      clearInterval(iv);
+    };
+  }, [account, pending, applyOutcome]);
+
+  // Leg 2 self-execute (the manual fallback path): append a fresh payload,
+  // executeRequest, then tell the outcome from THIS receipt's events. Throws on revert
+  // (caller keeps the breadcrumb and offers execute-it-yourself / cancel).
   const runExecute = useCallback(
     async (crumb) => {
       setFlow((f) => ({ ...(f || {}), ...crumb, phase: "executing", message: "Step 2 of 2 — confirm the execute in your wallet…" }));
@@ -89,10 +167,11 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
       setFlow({
         phase: "error",
         ...crumb,
+        fallbackReady: true,
         error: reason,
         message: err?.rejected
-          ? "You dismissed the wallet prompt — your order is still pending. Resume to finish it."
-          : `Execute reverted: ${reason.slice(0, 120)}`,
+          ? "You dismissed the wallet prompt — your order is still pending. The keeper may still fill it, or execute it yourself."
+          : `Self-execute reverted: ${reason.slice(0, 120)}. The keeper may still fill it.`,
       });
     },
     [account, toast],
@@ -134,53 +213,64 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
 
         // 3) Leg 1 — send the request.
         setFlow((f) => ({ ...f, phase: "requesting", message: `Step 1 of 2 — ${VERBING[p.action].toLowerCase()}: confirm the request in your wallet…` }));
-        const { id, requestTs } = await trade.sendRequest(pm, p.action, market, p.isLong, {
+        const { id, requestTs, rcpt } = await trade.sendRequest(pm, p.action, market, p.isLong, {
           collateral: collateral1e18,
           leverage: a.needsCollateral ? Math.round(p.leverage) : 0,
           acceptablePrice: acceptable,
           closeBps: p.closeBps || 0,
         });
 
-        const crumb = { id: id.toString(), requestTs, action: p.action, symbol: p.symbol, feed, isLong: p.isLong, verb: a.verb };
+        // Persist the breadcrumb (incl. the block to scan events from) so a refresh
+        // resumes watching, then hand off to the KEEPER — no auto-execute. The watcher
+        // effect (keyed on `pending`) takes it from here.
+        const crumb = { id: id.toString(), requestTs, fromBlock: rcpt.blockNumber, action: p.action, symbol: p.symbol, feed, isLong: p.isLong, verb: a.verb };
         savePending(account, crumb);
+        setFlow({ phase: "watching", ...crumb, fallbackReady: false, message: "Submitted — waiting for the keeper to fill it…" });
         setPending(crumb);
-
-        // 4) Wait out MIN_EXECUTION_DELAY + a fresh payload.
-        setFlow((f) => ({ ...f, ...crumb, phase: "waiting", message: "Step 2 of 2 — fetching a fresh price for the keeper…" }));
-        await trade.waitForFreshPayload(feed, requestTs, ({ pkgTs, floor }) =>
-          setFlow((f) => (f && f.phase === "waiting" ? { ...f, message: `Step 2 of 2 — waiting for a fresh price (pkg ${pkgTs || "…"} · need ≥ ${floor})` } : f)),
-        );
-
-        // 5) Leg 2 — auto-prompt the execute.
-        await runExecute(crumb);
       } catch (err) {
         handleError(err, p.action);
       } finally {
         busyRef.current = false;
       }
     },
-    [account, wrongChain, getSigner, toast, runExecute, handleError],
+    [account, wrongChain, getSigner, toast, handleError],
   );
 
-  // Resume an unfinished order's leg 2 (after a refresh or a dismissed prompt).
-  const resume = useCallback(async () => {
+  // MANUAL FALLBACK (keeper down / not running): execute the request yourself. Same
+  // self-execute path as before keeper deferral — fetch a fresh payload, then send
+  // executeRequest with the connected wallet acting as its own keeper. If the keeper
+  // (or anyone) filled it between the watcher's last poll and this send, executeRequest
+  // reverts RequestNotActive; we reconcile that as a resolution rather than an error,
+  // so the fallback never strands a request the keeper already handled.
+  const executeNow = useCallback(async () => {
     if (busyRef.current) return;
     const crumb = pending || loadPending(account);
     if (!crumb) return;
     busyRef.current = true;
     clearTimeout(clearTimer.current);
     try {
-      setFlow({ ...crumb, phase: "waiting", message: "Resuming — fetching a fresh price for the keeper…" });
+      setFlow({ ...crumb, phase: "waiting", message: "Executing it yourself — fetching a fresh price…" });
       await trade.waitForFreshPayload(crumb.feed, crumb.requestTs, ({ pkgTs, floor }) =>
-        setFlow((f) => (f && f.phase === "waiting" ? { ...f, message: `Resuming — waiting for a fresh price (pkg ${pkgTs || "…"} · need ≥ ${floor})` } : f)),
+        setFlow((f) => (f && f.phase === "waiting" ? { ...f, message: `Executing it yourself — waiting for a fresh price (pkg ${pkgTs || "…"} · need ≥ ${floor})` } : f)),
       );
       await runExecute(crumb);
     } catch (err) {
+      const reason = err?.message || String(err);
+      if (!err?.rejected && /RequestNotActive/.test(reason)) {
+        // The keeper beat us to it — read the real outcome and present THAT.
+        try {
+          const state = await trade.readRequestState(pmRead(), crumb.id, crumb.fromBlock);
+          applyOutcome(crumb, state.active ? { kind: "unknown" } : state.outcome);
+          return;
+        } catch {
+          /* fall through to the generic handler */
+        }
+      }
       handleError(err, crumb.action);
     } finally {
       busyRef.current = false;
     }
-  }, [pending, account, runExecute, handleError]);
+  }, [pending, account, runExecute, handleError, applyOutcome]);
 
   // Manual fallback: owner-reclaim the request after CANCEL_DELAY (collateral+fee for
   // open/increase, fee for close/decrease — the contract decides which).
@@ -440,9 +530,20 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
   const dismiss = useCallback(() => {
     clearTimeout(clearTimer.current);
     const crumb = loadPending(account);
-    setFlow(crumb ? { phase: "resume", ...crumb, message: "Unfinished order — resume to apply or cancel for a refund." } : null);
+    setFlow(
+      crumb
+        ? {
+            phase: "watching",
+            ...crumb,
+            fallbackReady: nowSec() - (crumb.requestTs || 0) >= KEEPER_GRACE_SEC,
+            message: "Waiting for the keeper — execute it yourself or cancel for a refund once the window opens.",
+          }
+        : null,
+    );
   }, [account]);
 
+  // "watching" is NOT in-progress: the wallet is idle, the keeper is working, and the
+  // user may freely interact (or invoke the self-execute fallback).
   const inProgress = Boolean(flow && IN_PROGRESS.includes(flow.phase));
 
   return {
@@ -451,7 +552,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
     lastFill,
     inProgress,
     submit,
-    resume,
+    executeNow,
     cancelPending,
     dismiss,
     submitTriggerEntry,

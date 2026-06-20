@@ -51,11 +51,13 @@ export default function PositionsTable({ account, positions, marks, orders, trad
           {working ? <span className="spin" aria-hidden="true" /> : null}
           {rf.phase === "approving"
             ? "Approving…"
-            : rf.phase === "executing"
-              ? "Executing…"
-              : rf.phase === "error"
-                ? "Failed — see banner"
-                : "Working…"}
+            : rf.phase === "watching"
+              ? "Waiting for keeper…"
+              : rf.phase === "executing"
+                ? "Executing…"
+                : rf.phase === "error"
+                  ? "Failed — see banner"
+                  : "Working…"}
         </span>
       );
     }

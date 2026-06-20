@@ -180,7 +180,7 @@ export default function App() {
       <TradeStatus
         flow={trade.flow}
         cancelDelay={trade.CANCEL_DELAY}
-        onResume={trade.resume}
+        onExecute={trade.executeNow}
         onCancel={trade.cancelPending}
         onDismiss={trade.dismiss}
       />

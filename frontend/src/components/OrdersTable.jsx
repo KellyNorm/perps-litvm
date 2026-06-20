@@ -47,10 +47,20 @@ export default function OrdersTable({ account, orders, readiness, trade, wrongCh
     }
     const state = readiness[o.id];
     const disabled = wrongChain || trade?.inProgress;
+    // Trigger met, within grace — the keeper should fill it. No button yet; we defer.
+    if (state === "filling") {
+      return (
+        <span className="row-status" title="Trigger met — waiting for the keeper to fill it">
+          <span className="spin" aria-hidden="true" />
+          Keeper filling…
+        </span>
+      );
+    }
+    // Grace lapsed and still unfilled — surface the manual fallback.
     if (state === "ready") {
       return (
-        <button className="rowbtn fill" disabled={disabled} onClick={() => trade.fillOrder(o)} title="The keeper poll says this would fill now — send the execute">
-          Fill now ⚡
+        <button className="rowbtn fill" disabled={disabled} onClick={() => trade.fillOrder(o)} title="Keeper hasn't filled it — send the execute yourself">
+          Fill it yourself ⚡
         </button>
       );
     }
@@ -132,8 +142,8 @@ export default function OrdersTable({ account, orders, readiness, trade, wrongCh
     <>
       {account && orders && orders.length > 0 && (
         <div className="orders-note">
-          Resting orders are watched <b>only while this tab is open</b> — your browser plays keeper (a read-only fillability poll;
-          no gas, no prompt). A standalone keeper bot is Phase 3.
+          The <b>keeper</b> fills resting orders automatically. This tab only <b>watches</b> (a read-only fillability poll; no gas,
+          no prompt) — if the keeper is down and a met order stays unfilled, a <b>Fill it yourself</b> button appears as a fallback.
         </div>
       )}
       <table>
