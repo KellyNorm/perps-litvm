@@ -7,6 +7,7 @@ import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.so
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Governance} from "./Governance.sol";
 
 /**
  * @notice Minimal view surface the {LiquidityPool} reads from the trusted
@@ -89,6 +90,12 @@ contract LiquidityPool is ERC4626, ReentrancyGuard {
     ///         permitted to perform the one-shot {setPositionManager} link.
     address public immutable deployer;
 
+    /// @notice External governance contract this pool READS for the global pause.
+    ///         Set immutably at construction; the pool never writes to it. Only
+    ///         {deposit}/{mint} are gated on its pause flag — withdraw/redeem are
+    ///         always allowed so LPs can exit even while paused.
+    Governance public immutable governance;
+
     /// @notice The trusted perp engine allowed to call {payProfit} and
     ///         {receiveLoss}, and whose accounting drives {totalAssets} and
     ///         {freeAssets}. Set exactly once via {setPositionManager}.
@@ -114,6 +121,9 @@ contract LiquidityPool is ERC4626, ReentrancyGuard {
     /// @dev {setPositionManager} called with the zero address.
     error ZeroAddress();
 
+    /// @dev A deposit/mint was attempted while governance is paused.
+    error Paused();
+
     /// @notice Emitted once when the PositionManager is linked.
     event PositionManagerSet(address indexed positionManager);
 
@@ -130,13 +140,19 @@ contract LiquidityPool is ERC4626, ReentrancyGuard {
     }
 
     /**
-     * @param asset_  The ERC20 collateral asset LPs deposit (e.g. Mock USD on
-     *                testnet). Stored immutably by the ERC4626 base.
-     * @param name_   Name of the LP share token (e.g. "Perps LP").
-     * @param symbol_ Symbol of the LP share token (e.g. "pLP").
+     * @param asset_      The ERC20 collateral asset LPs deposit (e.g. Mock USD on
+     *                    testnet). Stored immutably by the ERC4626 base.
+     * @param name_       Name of the LP share token (e.g. "Perps LP").
+     * @param symbol_     Symbol of the LP share token (e.g. "pLP").
+     * @param governance_ External {Governance} the pool reads for the global
+     *                    pause. Immutable; the pool never writes to it.
      */
-    constructor(IERC20 asset_, string memory name_, string memory symbol_) ERC20(name_, symbol_) ERC4626(asset_) {
+    constructor(IERC20 asset_, string memory name_, string memory symbol_, Governance governance_)
+        ERC20(name_, symbol_)
+        ERC4626(asset_)
+    {
         deployer = msg.sender;
+        governance = governance_;
     }
 
     /**
@@ -264,6 +280,7 @@ contract LiquidityPool is ERC4626, ReentrancyGuard {
      *      the money path.
      */
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override nonReentrant {
+        if (governance.paused()) revert Paused();
         if (assets == 0 || shares == 0) revert ZeroAmount();
         super._deposit(caller, receiver, assets, shares);
     }

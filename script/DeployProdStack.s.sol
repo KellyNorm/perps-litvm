@@ -6,6 +6,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 import {LiquidityPool} from "../src/LiquidityPool.sol";
 import {PositionManager} from "../src/PositionManager.sol";
+import {Governance} from "../src/Governance.sol";
 
 /**
  * @title DeployProdStack
@@ -40,7 +41,7 @@ contract DeployProdStack is Script {
     ///      Matches the original DeployPerps seed.
     uint256 internal constant SEED_LIQUIDITY = 100_000e18;
 
-    function run() external returns (LiquidityPool pool, PositionManager positionManager) {
+    function run() external returns (Governance governance, LiquidityPool pool, PositionManager positionManager) {
         uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerKey);
 
@@ -50,16 +51,20 @@ contract DeployProdStack is Script {
 
         vm.startBroadcast(deployerKey);
 
-        // 1. Fresh GLP-style pool over the EXISTING mUSD.
-        pool = new LiquidityPool(IERC20(MUSD), "Perps LP", "pLP");
+        // 1. Governance first: the deployer is the initial owner (pause + param
+        //    authority). Pool + engine then read it immutably.
+        governance = new Governance(deployer);
 
-        // 2. Fresh prod-base position engine, wired to the new pool.
-        positionManager = new PositionManager(pool);
+        // 2. Fresh GLP-style pool over the EXISTING mUSD, reading governance.
+        pool = new LiquidityPool(IERC20(MUSD), "Perps LP", "pLP", governance);
 
-        // 3. One-shot link: new pool trusts the new PositionManager.
+        // 3. Fresh prod-base position engine, wired to the new pool + governance.
+        positionManager = new PositionManager(pool, governance);
+
+        // 4. One-shot link: new pool trusts the new PositionManager.
         pool.setPositionManager(address(positionManager));
 
-        // 4. Seed LP liquidity so the pool can cover payouts and pass the
+        // 5. Seed LP liquidity so the pool can cover payouts and pass the
         //    utilization gate on the first trade.
         musd.mint(deployer, SEED_LIQUIDITY);
         musd.approve(address(pool), SEED_LIQUIDITY);
@@ -69,6 +74,7 @@ contract DeployProdStack is Script {
 
         console.log("chain id:            ", block.chainid);
         console.log("mUSD (reused):       ", MUSD);
+        console.log("Governance (new):    ", address(governance));
         console.log("LiquidityPool (new): ", address(pool));
         console.log("PositionManager (new):", address(positionManager));
         console.log("seed liquidity:      ", SEED_LIQUIDITY);

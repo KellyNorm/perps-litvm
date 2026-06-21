@@ -5,6 +5,7 @@ import {Script, console} from "forge-std/Script.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 import {LiquidityPool} from "../src/LiquidityPool.sol";
 import {PositionManager} from "../src/PositionManager.sol";
+import {Governance} from "../src/Governance.sol";
 
 /**
  * @title DeployPerps
@@ -27,7 +28,10 @@ contract DeployPerps is Script {
     /// @dev Seed LP liquidity deposited into the pool by the deployer (18 dp).
     uint256 internal constant SEED_LIQUIDITY = 100_000e18;
 
-    function run() external returns (MockERC20 musd, LiquidityPool pool, PositionManager positionManager) {
+    function run()
+        external
+        returns (Governance governance, MockERC20 musd, LiquidityPool pool, PositionManager positionManager)
+    {
         uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerKey);
 
@@ -36,16 +40,19 @@ contract DeployPerps is Script {
         // 1. Collateral asset: Mock USD, 18 decimals (OZ ERC20 default).
         musd = new MockERC20("Mock USD", "mUSD");
 
-        // 2. GLP-style liquidity pool over mUSD.
-        pool = new LiquidityPool(musd, "Perps LP", "pLP");
+        // 2. Governance: the deployer is the initial owner (pause + param authority).
+        governance = new Governance(deployer);
 
-        // 3. Position engine, wired to the pool.
-        positionManager = new PositionManager(pool);
+        // 3. GLP-style liquidity pool over mUSD, reading governance.
+        pool = new LiquidityPool(musd, "Perps LP", "pLP", governance);
 
-        // 4. One-shot link: pool trusts this PositionManager.
+        // 4. Position engine, wired to the pool + governance.
+        positionManager = new PositionManager(pool, governance);
+
+        // 5. One-shot link: pool trusts this PositionManager.
         pool.setPositionManager(address(positionManager));
 
-        // 5. Seed LP liquidity: mint mUSD to the deployer and deposit it so the
+        // 6. Seed LP liquidity: mint mUSD to the deployer and deposit it so the
         //    pool can cover trader payouts and satisfy the utilization gate.
         musd.mint(deployer, SEED_LIQUIDITY);
         musd.approve(address(pool), SEED_LIQUIDITY);
@@ -55,6 +62,7 @@ contract DeployPerps is Script {
 
         console.log("chain id:        ", block.chainid);
         console.log("MockERC20 (mUSD):", address(musd));
+        console.log("Governance:      ", address(governance));
         console.log("LiquidityPool:   ", address(pool));
         console.log("PositionManager: ", address(positionManager));
         console.log("seed liquidity:  ", SEED_LIQUIDITY);

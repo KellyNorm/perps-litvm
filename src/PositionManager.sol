@@ -12,6 +12,7 @@ import {
 } from "@redstone-finance/evm-connector/contracts/data-services/PrimaryProdDataServiceConsumerBase.sol";
 
 import {LiquidityPool} from "./LiquidityPool.sol";
+import {Governance} from "./Governance.sol";
 
 /**
  * @title PositionManager
@@ -209,6 +210,13 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
 
     /// @notice The collateral asset (must equal the pool's asset).
     IERC20 public immutable asset;
+
+    /// @notice External governance contract this manager READS for the global
+    ///         pause. Set immutably at construction; the manager never writes to
+    ///         it. Only new-risk entries (open/increase, incl. their resting
+    ///         trigger variants) are gated on its pause flag — close, decrease,
+    ///         cancel, and liquidate are always allowed.
+    Governance public immutable governance;
 
     // --- position & aggregate state --------------------------------------
 
@@ -476,6 +484,9 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
     error TriggerNotMet(uint256 price, uint256 triggerPrice, bool triggerAbove);
     error SlippageNotMet(uint256 price, uint256 acceptablePrice);
 
+    // governance pause (PR-9)
+    error Paused();
+
     // --- events ----------------------------------------------------------
 
     event PositionOpened(
@@ -693,7 +704,11 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
     event MarketRemoved(bytes32 indexed market);
 
     /**
-     * @param pool_ The deployed {LiquidityPool} counterparty.
+     * @param pool_       The deployed {LiquidityPool} counterparty.
+     * @param governance_ External {Governance} the manager reads for the global
+     *                    pause. Immutable; the manager never writes to it. The
+     *                    pause/param authority is `governance.owner()`, separate
+     *                    from this contract's own {Ownable} market-registry admin.
      * @dev   Reads the pool's asset and pre-approves the pool to pull absorbed
      *        losses via {LiquidityPool.receiveLoss}. The pool must be linked to
      *        this manager separately via {LiquidityPool.setPositionManager}. The
@@ -701,14 +716,30 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
      *        admin (see {addMarket}/{removeMarket}); it has no other privilege.
      *        BTC and ETH are seeded as supported so existing behavior is preserved.
      */
-    constructor(LiquidityPool pool_) Ownable(msg.sender) {
+    constructor(LiquidityPool pool_, Governance governance_) Ownable(msg.sender) {
         pool = pool_;
         IERC20 asset_ = IERC20(pool_.asset());
         asset = asset_;
+        governance = governance_;
         asset_.forceApprove(address(pool_), type(uint256).max);
 
         supportedMarkets[MARKET_BTC] = true;
         supportedMarkets[MARKET_ETH] = true;
+    }
+
+    // --- governance pause (PR-9) -----------------------------------------
+
+    /**
+     * @notice Revert with {Paused} if the external governance pause is engaged.
+     * @dev    A single `governance.paused()` staticcall. Applied ONLY to
+     *         new-risk entries (open/increase requests and their resting trigger
+     *         variants, plus the execution of OPEN/INCREASE requests). Every
+     *         risk-reducing or fund-returning path — close, decrease, cancel,
+     *         liquidate — never calls this, so positions can always be wound down
+     *         and escrow always reclaimed while paused.
+     */
+    function _requireNotPaused() internal view {
+        if (governance.paused()) revert Paused();
     }
 
     // --- oracle staleness override ---------------------------------------
@@ -1328,6 +1359,7 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
         nonReentrant
         returns (uint256 requestId)
     {
+        _requireNotPaused();
         _requireSupportedMarket(market);
         if (collateral < MIN_COLLATERAL) revert CollateralTooLow(collateral, MIN_COLLATERAL);
         if (leverage < MIN_LEVERAGE || leverage > MAX_LEVERAGE) revert LeverageOutOfRange(leverage);
@@ -1497,6 +1529,7 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
         uint256 addLeverage,
         uint256 acceptablePrice
     ) external nonReentrant returns (uint256 requestId) {
+        _requireNotPaused();
         if (acceptablePrice == 0) revert InvalidAcceptablePrice();
         if (addLeverage < MIN_LEVERAGE || addLeverage > MAX_LEVERAGE) revert LeverageOutOfRange(addLeverage);
         if (addCollateral < MIN_COLLATERAL) revert CollateralTooLow(addCollateral, MIN_COLLATERAL);
@@ -1705,6 +1738,7 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
         uint256 triggerPrice,
         bool triggerAbove
     ) external nonReentrant returns (uint256 requestId) {
+        _requireNotPaused();
         if (acceptablePrice == 0) revert InvalidAcceptablePrice();
         if (leverage < MIN_LEVERAGE || leverage > MAX_LEVERAGE) revert LeverageOutOfRange(leverage);
         if (collateral < MIN_COLLATERAL) revert CollateralTooLow(collateral, MIN_COLLATERAL);
@@ -1784,6 +1818,7 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
         uint256 triggerPrice,
         bool triggerAbove
     ) external nonReentrant returns (uint256 requestId) {
+        _requireNotPaused();
         if (acceptablePrice == 0) revert InvalidAcceptablePrice();
         if (addLeverage < MIN_LEVERAGE || addLeverage > MAX_LEVERAGE) revert LeverageOutOfRange(addLeverage);
         if (addCollateral < MIN_COLLATERAL) revert CollateralTooLow(addCollateral, MIN_COLLATERAL);
@@ -1849,6 +1884,12 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
     function executeRequest(uint256 requestId) external nonReentrant {
         Request memory r = requests[requestId];
         if (!r.active) revert RequestNotActive();
+
+        // Gate by KIND, not by entry: a paused engine refuses to ADD risk, so
+        // OPEN/INCREASE fills revert here (rolling back the whole tx, leaving the
+        // request active → owner reclaims the escrow via {cancelRequest}). CLOSE,
+        // DECREASE, and exits always execute, so positions can still be wound down.
+        if (r.kind == RequestKind.Open || r.kind == RequestKind.Increase) _requireNotPaused();
 
         uint256 earliest = r.requestTimestamp + MIN_EXECUTION_DELAY;
         if (block.timestamp < earliest) revert TooEarlyToExecute(block.timestamp, earliest);

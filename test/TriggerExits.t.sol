@@ -29,6 +29,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {LiquidityPool} from "../src/LiquidityPool.sol";
 import {PositionManager} from "../src/PositionManager.sol";
+import {Governance} from "../src/Governance.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 import {AuthorisedMockSignersBase} from "@redstone-finance/evm-connector/contracts/mocks/AuthorisedMockSignersBase.sol";
 
@@ -40,7 +41,7 @@ import {AuthorisedMockSignersBase} from "@redstone-finance/evm-connector/contrac
  *      unchanged so the comparison holds.
  */
 contract TriggerExitsHarness is PositionManager, AuthorisedMockSignersBase {
-    constructor(LiquidityPool pool_) PositionManager(pool_) {}
+    constructor(LiquidityPool pool_, Governance governance_) PositionManager(pool_, governance_) {}
 
     function getAuthorisedSignerIndex(address signerAddress) public view virtual override returns (uint8) {
         return getAuthorisedMockSignerIndex(signerAddress);
@@ -90,8 +91,9 @@ contract TriggerExitsTest is Test {
     // --- system / payload helpers ---------------------------------------
 
     function _newSystem(uint256 liq) internal returns (LiquidityPool p, TriggerExitsHarness m) {
-        p = new LiquidityPool(IERC20(address(asset)), "Perps LP", "pLP");
-        m = new TriggerExitsHarness(p);
+        Governance gov = new Governance(address(this));
+        p = new LiquidityPool(IERC20(address(asset)), "Perps LP", "pLP", gov);
+        m = new TriggerExitsHarness(p, gov);
         p.setPositionManager(address(m));
         asset.mint(address(this), liq);
         asset.approve(address(p), liq);

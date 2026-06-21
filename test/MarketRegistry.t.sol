@@ -22,6 +22,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 import {LiquidityPool} from "../src/LiquidityPool.sol";
 import {PositionManager} from "../src/PositionManager.sol";
+import {Governance} from "../src/Governance.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 import {AuthorisedMockSignersBase} from "@redstone-finance/evm-connector/contracts/mocks/AuthorisedMockSignersBase.sol";
 
@@ -31,7 +32,7 @@ import {AuthorisedMockSignersBase} from "@redstone-finance/evm-connector/contrac
  *      deployer (the test contract) is the {Ownable} owner.
  */
 contract RegistryHarness is PositionManager, AuthorisedMockSignersBase {
-    constructor(LiquidityPool pool_) PositionManager(pool_) {}
+    constructor(LiquidityPool pool_, Governance governance_) PositionManager(pool_, governance_) {}
 
     function getAuthorisedSignerIndex(address signerAddress) public view virtual override returns (uint8) {
         return getAuthorisedMockSignerIndex(signerAddress);
@@ -64,8 +65,9 @@ contract MarketRegistryTest is Test {
 
     function setUp() public {
         asset = new MockERC20("Mock USD", "mUSD");
-        pool = new LiquidityPool(IERC20(address(asset)), "Perps LP", "pLP");
-        pm = new RegistryHarness(pool); // deployer == owner == address(this)
+        Governance gov = new Governance(address(this));
+        pool = new LiquidityPool(IERC20(address(asset)), "Perps LP", "pLP", gov);
+        pm = new RegistryHarness(pool, gov); // deployer == owner == address(this)
         pool.setPositionManager(address(pm));
         asset.mint(address(this), LP_LIQUIDITY);
         asset.approve(address(pool), LP_LIQUIDITY);

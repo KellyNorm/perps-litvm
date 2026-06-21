@@ -8,6 +8,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {LiquidityPool} from "../src/LiquidityPool.sol";
+import {Governance} from "../src/Governance.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 
 /**
@@ -20,6 +21,7 @@ import {MockERC20} from "../src/mocks/MockERC20.sol";
 contract LiquidityPoolTest is Test {
     MockERC20 internal asset;
     LiquidityPool internal pool;
+    Governance internal governance;
 
     address internal alice = makeAddr("alice");
     address internal bob = makeAddr("bob");
@@ -32,7 +34,8 @@ contract LiquidityPoolTest is Test {
 
     function setUp() public {
         asset = new MockERC20("Mock USD", "mUSD");
-        pool = new LiquidityPool(IERC20(address(asset)), "Perps LP", "pLP");
+        governance = new Governance(address(this));
+        pool = new LiquidityPool(IERC20(address(asset)), "Perps LP", "pLP", governance);
     }
 
     // --- helpers ---------------------------------------------------------
@@ -132,7 +135,8 @@ contract LiquidityPoolTest is Test {
 
     function test_ReentrancyBlockedOnDeposit() public {
         ReentrantToken evil = new ReentrantToken();
-        LiquidityPool evilPool = new LiquidityPool(IERC20(address(evil)), "Evil LP", "eLP");
+        LiquidityPool evilPool =
+            new LiquidityPool(IERC20(address(evil)), "Evil LP", "eLP", new Governance(address(this)));
         evil.configure(evilPool);
 
         evil.mint(attacker, 10e18);
@@ -147,7 +151,8 @@ contract LiquidityPoolTest is Test {
 
     function test_ReentrancyBlockedOnWithdraw() public {
         ReentrantToken evil = new ReentrantToken();
-        LiquidityPool evilPool = new LiquidityPool(IERC20(address(evil)), "Evil LP", "eLP");
+        LiquidityPool evilPool =
+            new LiquidityPool(IERC20(address(evil)), "Evil LP", "eLP", new Governance(address(this)));
         evil.configure(evilPool);
 
         evil.mint(attacker, 10e18);

@@ -23,6 +23,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 import {LiquidityPool} from "../src/LiquidityPool.sol";
 import {PositionManager} from "../src/PositionManager.sol";
+import {Governance} from "../src/Governance.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 import {AuthorisedMockSignersBase} from "@redstone-finance/evm-connector/contracts/mocks/AuthorisedMockSignersBase.sol";
 
@@ -33,7 +34,7 @@ import {AuthorisedMockSignersBase} from "@redstone-finance/evm-connector/contrac
  *      as in production.
  */
 contract PositionManagerHarness is PositionManager, AuthorisedMockSignersBase {
-    constructor(LiquidityPool pool_) PositionManager(pool_) {}
+    constructor(LiquidityPool pool_, Governance governance_) PositionManager(pool_, governance_) {}
 
     function getAuthorisedSignerIndex(address signerAddress) public view virtual override returns (uint8) {
         return getAuthorisedMockSignerIndex(signerAddress);
@@ -91,8 +92,9 @@ contract PositionManagerTest is Test {
     // --- system / payload helpers ---------------------------------------
 
     function _newSystem(uint256 liq) internal returns (LiquidityPool p, PositionManagerHarness m) {
-        p = new LiquidityPool(IERC20(address(asset)), "Perps LP", "pLP");
-        m = new PositionManagerHarness(p);
+        Governance gov = new Governance(address(this));
+        p = new LiquidityPool(IERC20(address(asset)), "Perps LP", "pLP", gov);
+        m = new PositionManagerHarness(p, gov);
         p.setPositionManager(address(m)); // this contract is the deployer
         asset.mint(address(this), liq);
         asset.approve(address(p), liq);
@@ -491,8 +493,9 @@ contract PositionManagerTest is Test {
     }
 
     function _newPlainSystem(uint256 liq) internal returns (LiquidityPool p, PositionManager m) {
-        p = new LiquidityPool(IERC20(address(asset)), "Perps LP", "pLP");
-        m = new PositionManager(p);
+        Governance gov = new Governance(address(this));
+        p = new LiquidityPool(IERC20(address(asset)), "Perps LP", "pLP", gov);
+        m = new PositionManager(p, gov);
         p.setPositionManager(address(m));
         asset.mint(address(this), liq);
         asset.approve(address(p), liq);
@@ -521,14 +524,14 @@ contract PositionManagerTest is Test {
     }
 
     function test_RevertWhen_SetPositionManagerByNonDeployer() public {
-        LiquidityPool fresh = new LiquidityPool(IERC20(address(asset)), "x", "x");
+        LiquidityPool fresh = new LiquidityPool(IERC20(address(asset)), "x", "x", new Governance(address(this)));
         vm.prank(alice);
         vm.expectRevert(LiquidityPool.NotDeployer.selector);
         fresh.setPositionManager(address(0xBEEF));
     }
 
     function test_RevertWhen_SetPositionManagerZero() public {
-        LiquidityPool fresh = new LiquidityPool(IERC20(address(asset)), "x", "x");
+        LiquidityPool fresh = new LiquidityPool(IERC20(address(asset)), "x", "x", new Governance(address(this)));
         vm.expectRevert(LiquidityPool.ZeroAddress.selector);
         fresh.setPositionManager(address(0));
     }
@@ -539,8 +542,9 @@ contract PositionManagerTest is Test {
 
     function test_ReentrancyBlockedOnClosePayout() public {
         EvilToken evil = new EvilToken();
-        LiquidityPool evilPool = new LiquidityPool(IERC20(address(evil)), "Evil LP", "eLP");
-        PositionManagerHarness evilPm = new PositionManagerHarness(evilPool);
+        Governance evilGov = new Governance(address(this));
+        LiquidityPool evilPool = new LiquidityPool(IERC20(address(evil)), "Evil LP", "eLP", evilGov);
+        PositionManagerHarness evilPm = new PositionManagerHarness(evilPool, evilGov);
         evilPool.setPositionManager(address(evilPm));
 
         // Seed the pool with LP liquidity.
@@ -978,8 +982,9 @@ contract PositionManagerTest is Test {
 
     function test_Liquidate_ReentrancyBlocked() public {
         ReenterLiquidateToken evil = new ReenterLiquidateToken();
-        LiquidityPool evilPool = new LiquidityPool(IERC20(address(evil)), "Evil LP", "eLP");
-        PositionManagerHarness evilPm = new PositionManagerHarness(evilPool);
+        Governance evilGov = new Governance(address(this));
+        LiquidityPool evilPool = new LiquidityPool(IERC20(address(evil)), "Evil LP", "eLP", evilGov);
+        PositionManagerHarness evilPm = new PositionManagerHarness(evilPool, evilGov);
         evilPool.setPositionManager(address(evilPm));
 
         evil.mint(address(this), LP_LIQUIDITY);
