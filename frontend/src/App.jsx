@@ -19,6 +19,7 @@ import { useVault } from "./hooks/useVault.js";
 import { usePositions } from "./hooks/usePositions.js";
 import { useOrders } from "./hooks/useOrders.js";
 import { useBalances } from "./hooks/useBalances.js";
+import { useRpcHealth } from "./hooks/useRpcHealth.js";
 import { addressesConfigured } from "./config.js";
 import { liqPrice } from "./lib/engine.js";
 
@@ -36,6 +37,7 @@ export default function App() {
   const { data: vault, yourDeposit } = useVault(account);
   const { positions, refresh: refreshPositions } = usePositions(account, supported);
   const balances = useBalances(account);
+  const rpcDegraded = useRpcHealth();
 
   const [selected, setSelected] = useState(null);
   const [tab, setTab] = useState("pos");
@@ -226,6 +228,13 @@ export default function App() {
         onCancel={trade.cancelPending}
         onDismiss={trade.dismiss}
       />
+
+      {rpcDegraded && (
+        <div className="rpc-reconnect" role="status" aria-live="polite" title="The RPC is throttling — retrying. Showing the last good data.">
+          <span className="dot" aria-hidden="true" />
+          reconnecting…
+        </div>
+      )}
 
       <div className={"toast" + (toast.show ? " show" : "") + (toast.err ? " err" : "")}>{toast.msg}</div>
       <div className="demo-tag">

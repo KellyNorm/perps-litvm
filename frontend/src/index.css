@@ -1306,6 +1306,41 @@ tbody tr.danger {
   color: var(--muted-2);
 }
 
+/* Transient-RPC indicator: small, non-blocking — the last good data stays on screen. */
+.rpc-reconnect {
+  position: fixed;
+  bottom: 14px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--molten-hot);
+  z-index: 60;
+  background: rgba(255, 138, 76, 0.08);
+  border: 1px solid rgba(255, 138, 76, 0.35);
+  border-radius: 100px;
+  padding: 6px 12px;
+  backdrop-filter: blur(6px);
+}
+.rpc-reconnect .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--molten-hot);
+  animation: rpc-pulse 1.1s ease-in-out infinite;
+}
+@keyframes rpc-pulse {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 @media (max-width: 920px) {
   .grid {
     grid-template-columns: 1fr;

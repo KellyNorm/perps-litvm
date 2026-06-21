@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ethers } from "ethers";
 import { musdRead, readProvider } from "../lib/contracts.js";
 import { assetToNum } from "../lib/engine.js";
+import { withRetry } from "../lib/withRetry.js";
 
 const POLL_MS = 15_000;
 
@@ -19,9 +20,9 @@ export function useBalances(account) {
     try {
       const token = musdRead();
       const [balBn, natBn, availBn] = await Promise.all([
-        token.balanceOf(account),
-        readProvider().getBalance(account),
-        token.faucetAvailableAt(account),
+        withRetry(() => token.balanceOf(account)),
+        withRetry(() => readProvider().getBalance(account)),
+        withRetry(() => token.faucetAvailableAt(account)),
       ]);
       setMusd(assetToNum(balBn));
       setNative(parseFloat(ethers.utils.formatEther(natBn)));

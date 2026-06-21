@@ -1,14 +1,21 @@
 import { ethers } from "ethers";
-import { RPC_URL, ADDRESSES } from "../config.js";
+import { RPC_URL, CHAIN_ID, ADDRESSES } from "../config.js";
 import { PositionManager, LiquidityPool, MockERC20 } from "../abi/index.js";
 
 // A single read-only provider on the LiteForge RPC so the dashboard loads with NO
 // wallet. All reads (markets, prices-on-chain state, vault, positions, balances)
 // go through this; only the faucet write needs an injected signer.
+//
+// StaticJsonRpcProvider (not JsonRpcProvider) pinned to an EXPLICIT network: the public
+// RPC intermittently throttles/drops requests, and a plain JsonRpcProvider re-runs
+// eth_chainId network detection on reconnect — when that probe fails it throws
+// "could not detect network" (NETWORK_ERROR) and wedges every in-flight read. Static +
+// a hard-coded {chainId,name} never re-detects, so a transient drop is just one failed
+// call (retried by withRetry) instead of a provider-wide stall.
 let _readProvider = null;
 export function readProvider() {
   if (!_readProvider) {
-    _readProvider = new ethers.providers.JsonRpcProvider(RPC_URL);
+    _readProvider = new ethers.providers.StaticJsonRpcProvider(RPC_URL, { chainId: CHAIN_ID, name: "litvm" });
   }
   return _readProvider;
 }

@@ -9,6 +9,7 @@ import { ethers } from "ethers";
 import { CHAIN_ID } from "../config.js";
 import { assetToNum, priceToNum } from "./engine.js";
 import { KIND, orderLabel } from "./triggers.js";
+import { withRetry } from "./withRetry.js";
 
 const KEY = (account) => `tachyonfi:orders:${CHAIN_ID}:${(account || "").toLowerCase()}`;
 
@@ -50,7 +51,7 @@ const TRIGGER_EVENTS = ["TriggerOpenRequested", "TriggerCloseRequested", "Trigge
 
 export async function scanOrderIds(pm, account) {
   if (!account) return [];
-  const latest = await pm.provider.getBlockNumber();
+  const latest = await withRetry(() => pm.provider.getBlockNumber());
   const fromBlock = Math.max(0, latest - SCAN_LOOKBACK);
   const ids = new Set();
   for (const ev of TRIGGER_EVENTS) {
@@ -68,12 +69,10 @@ export async function scanOrderIds(pm, account) {
 // resting trigger owned by `account` (filled, cancelled, expired, market order, or
 // a different owner). triggers(id).triggerPrice == 0 means "not a resting trigger".
 export async function readOrder(pm, id, account) {
-  let r, t;
-  try {
-    [r, t] = await Promise.all([pm.requests(id), pm.triggers(id)]);
-  } catch {
-    return null;
-  }
+  // A TRANSIENT transport failure must NOT look like "order gone" — that would untrack
+  // a still-live order. withRetry rides out a hiccup; if it still fails it THROWS, and
+  // the caller (useOrders.refresh) keeps the prior list rather than dropping the id.
+  const [r, t] = await Promise.all([withRetry(() => pm.requests(id)), withRetry(() => pm.triggers(id))]);
   if (!r.active) return null;
   if (t.triggerPrice.isZero()) return null; // a plain market two-step request, not resting
   if (account && r.owner.toLowerCase() !== account.toLowerCase()) return null;

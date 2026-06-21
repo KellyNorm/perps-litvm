@@ -10,8 +10,13 @@ const IN_PROGRESS = ["approving", "requesting", "waiting", "executing"];
 
 // Keeper-deferral tuning. After leg 1 the request is the keeper's to fill; we WATCH
 // (read-only) and only fall back to self-execute if the keeper doesn't resolve it.
-const WATCH_POLL_MS = 4_000; // requests(id).active + event reconcile cadence
+const WATCH_POLL_MS = 4_000; // steady requests(id).active reconcile cadence
 const KEEPER_GRACE_SEC = 28; // unresolved past this -> surface the self-execute fallback
+// Short post-submit BURST so a keeper fill clears the "waiting…" UI promptly. This is a
+// bounded one-shot (1.5s for ~20s after the request lands), NOT a faster steady poll —
+// the background watcher stays at WATCH_POLL_MS once the burst lapses.
+const BURST_POLL_MS = 1_500;
+const BURST_WINDOW_MS = 20_000;
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 
@@ -92,6 +97,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
   useEffect(() => {
     if (!account || !pending) return;
     let stopped = false;
+    const pm = pmRead();
 
     const graceAt = (pending.requestTs || nowSec()) + KEEPER_GRACE_SEC;
     const graceMs = Math.max(0, graceAt - nowSec()) * 1000;
@@ -108,7 +114,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
       if (stopped || busyRef.current) return; // a manual leg is driving — stand down
       let state;
       try {
-        state = await trade.readRequestState(pmRead(), pending.id, pending.fromBlock);
+        state = await trade.readRequestState(pm, pending.id, pending.fromBlock);
       } catch {
         return; // transient RPC hiccup — try again next tick
       }
@@ -116,12 +122,45 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
       applyOutcome(pending, state.outcome);
     }
 
+    // EVENT-DRIVEN completion (preferred): the keeper's executeRequest emits
+    // RequestExecuted; a slippage/owner cancel emits RequestCancelled. Either fires the
+    // reconcile immediately so the "waiting for the keeper…" banner clears the moment the
+    // fill lands instead of waiting for the next poll tick.
+    let execFilter, cancelFilter;
+    const onResolved = () => poll();
+    try {
+      const idBn = ethers.BigNumber.from(String(pending.id));
+      execFilter = pm.filters.RequestExecuted(idBn);
+      cancelFilter = pm.filters.RequestCancelled(idBn);
+      pm.on(execFilter, onResolved);
+      pm.on(cancelFilter, onResolved);
+    } catch {
+      // filter unsupported on this provider — the polls below still cover us.
+    }
+
+    // BACKSTOP burst: poll requests(id).active fast (1.5s) for a short window after submit
+    // so a fill clears promptly even if the event subscription misses it. Bounded — it
+    // self-clears after BURST_WINDOW_MS and never speeds up the steady background watcher.
+    const burstStart = Date.now();
+    const burst = setInterval(() => {
+      if (stopped || Date.now() - burstStart > BURST_WINDOW_MS) {
+        clearInterval(burst);
+        return;
+      }
+      poll();
+    }, BURST_POLL_MS);
+
     poll(); // reconcile immediately (keeper may have filled within seconds / while away)
     const iv = setInterval(poll, WATCH_POLL_MS);
     return () => {
       stopped = true;
       clearTimeout(graceTimer);
       clearInterval(iv);
+      clearInterval(burst);
+      try {
+        if (execFilter) pm.off(execFilter, onResolved);
+        if (cancelFilter) pm.off(cancelFilter, onResolved);
+      } catch {}
     };
   }, [account, pending, applyOutcome]);
 

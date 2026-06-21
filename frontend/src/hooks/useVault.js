@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ethers } from "ethers";
 import { pmRead, poolRead, musdRead } from "../lib/contracts.js";
 import { assetToNum } from "../lib/engine.js";
+import { withRetry } from "../lib/withRetry.js";
 import { addressesConfigured } from "../config.js";
 
 const POLL_MS = 15_000;
@@ -24,10 +25,10 @@ export function useVault(account) {
     async function poll() {
       try {
         const [totalAssetsBn, totalSupplyBn, reservedBn, balanceBn] = await Promise.all([
-          pool.totalAssets(),
-          pool.totalSupply(),
-          pm.totalReserved(),
-          musd.balanceOf(pool.address),
+          withRetry(() => pool.totalAssets()),
+          withRetry(() => pool.totalSupply()),
+          withRetry(() => pm.totalReserved()),
+          withRetry(() => musd.balanceOf(pool.address)),
         ]);
         const totalAssets = assetToNum(totalAssetsBn);
         const totalSupply = assetToNum(totalSupplyBn);
@@ -38,8 +39,8 @@ export function useVault(account) {
 
         let deposit = null;
         if (account) {
-          const sharesBn = await pool.balanceOf(account);
-          const assetsBn = await pool.convertToAssets(sharesBn);
+          const sharesBn = await withRetry(() => pool.balanceOf(account));
+          const assetsBn = await withRetry(() => pool.convertToAssets(sharesBn));
           deposit = { shares: assetToNum(sharesBn), assets: assetToNum(assetsBn) };
         }
         if (cancelled) return;

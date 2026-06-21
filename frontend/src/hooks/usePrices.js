@@ -24,7 +24,17 @@ export function usePrices(symbols) {
     async function poll() {
       const result = await fetchMarks(feeds);
       if (cancelled) return;
-      setMarks(result);
+      // Keep the last GOOD mark per feed: only surface {error} for a feed we never had a
+      // price for. A transient gateway blip must not blank an already-shown mark.
+      setMarks((prev) => {
+        const next = { ...prev };
+        for (const f of feeds) {
+          const r = result[f];
+          if (r && typeof r.price === "number" && isFinite(r.price)) next[f] = r;
+          else if (next[f] == null) next[f] = r;
+        }
+        return next;
+      });
       const now = Date.now();
       const next = { ...seriesRef.current };
       for (const f of feeds) {

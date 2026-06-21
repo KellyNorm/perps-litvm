@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { pmRead } from "../lib/contracts.js";
 import { positionKey } from "../lib/marketKey.js";
 import { assetToNum, priceToNum } from "../lib/engine.js";
+import { withRetry } from "../lib/withRetry.js";
 
 const POLL_MS = 12_000;
 
@@ -34,11 +35,11 @@ export function usePositions(account, supported) {
             jobs.push(
               (async () => {
                 const pkey = positionKey(owner, m.key, isLong);
-                const p = await pm.positions(pkey);
+                const p = await withRetry(() => pm.positions(pkey));
                 if (p.sizeUsd.isZero()) return null;
                 const [feeBn, fundBn] = await Promise.all([
-                  pm.pendingBorrowFee(owner, m.key, isLong),
-                  pm.pendingFunding(owner, m.key, isLong),
+                  withRetry(() => pm.pendingBorrowFee(owner, m.key, isLong)),
+                  withRetry(() => pm.pendingFunding(owner, m.key, isLong)),
                 ]);
                 return {
                   symbol: m.symbol,

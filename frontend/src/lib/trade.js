@@ -14,6 +14,7 @@ import { marketKey } from "./marketKey.js";
 import { readProvider } from "./contracts.js";
 import { payloadTimestampSec, fetchMark, wrapForExecute } from "./redstone.js";
 import { revertReason, isUserRejection } from "./revert.js";
+import { withRetry } from "./withRetry.js";
 
 // Contract constants (must match PositionManager.sol).
 export const EXECUTION_FEE = ethers.utils.parseUnits("0.5", 18); // EXECUTION_FEE = 0.5e18
@@ -227,7 +228,7 @@ export async function executeRequest(pmSigner, feed, id) {
 // request is gone but no event lands in the scanned window, kind is "unknown" — still
 // a resolution, just unlabelled, so the caller refreshes and moves on.
 export async function readRequestState(pmReadCtr, id, fromBlock) {
-  const r = await pmReadCtr.requests(id);
+  const r = await withRetry(() => pmReadCtr.requests(id));
   if (r.active) return { active: true };
   return { active: false, outcome: await readRequestOutcome(pmReadCtr, id, fromBlock) };
 }

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { pmRead } from "../lib/contracts.js";
 import { marketKey } from "../lib/marketKey.js";
 import { assetToNum, priceToNum } from "../lib/engine.js";
+import { withRetry } from "../lib/withRetry.js";
 import { CANDIDATE_MARKETS, addressesConfigured } from "../config.js";
 
 const STATE_POLL_MS = 15_000;
@@ -29,7 +30,7 @@ export function useMarkets() {
           CANDIDATE_MARKETS.map(async (m) => {
             const key = marketKey(m.symbol);
             try {
-              const ok = await pm.supportedMarkets(key);
+              const ok = await withRetry(() => pm.supportedMarkets(key));
               return ok ? { ...m, key } : null;
             } catch {
               return null;
@@ -59,7 +60,7 @@ export function useMarkets() {
       try {
         const entries = await Promise.all(
           supported.map(async (m) => {
-            const s = await pm.markets(m.key);
+            const s = await withRetry(() => pm.markets(m.key));
             return [
               m.symbol,
               {
