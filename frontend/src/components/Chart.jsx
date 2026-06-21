@@ -27,6 +27,9 @@ function CandleChart({ candles, markPrice, liqLines, trigLines }) {
   const chartRef = useRef(null);
   const seriesRef = useRef(null);
   const linesRef = useRef([]);
+  // Latest candle set, read by the autoscale provider so the Y-range tracks price
+  // action only (kept in a ref because the series is created once, before data lands).
+  const candlesRef = useRef(null);
 
   // Create once.
   useEffect(() => {
@@ -58,6 +61,24 @@ function CandleChart({ candles, markPrice, liqLines, trigLines }) {
       borderDownColor: C.down,
       wickUpColor: C.up,
       wickDownColor: C.down,
+      // Scale the Y-axis to PRICE ACTION ONLY. By default lightweight-charts folds
+      // createPriceLine() values into the autoscale, so a far-away liq line (e.g. a 1x
+      // long's liq ~10x below entry) would stretch the range and flatten the candles.
+      // Compute the range from candle highs/lows alone; liq/trigger/mark lines render on
+      // top and clamp to the axis edge instead of expanding it.
+      autoscaleInfoProvider: () => {
+        const data = candlesRef.current;
+        if (!data || !data.length) return null;
+        let min = Infinity;
+        let max = -Infinity;
+        for (const c of data) {
+          if (c.low < min) min = c.low;
+          if (c.high > max) max = c.high;
+        }
+        if (!isFinite(min) || !isFinite(max)) return null;
+        const pad = (max - min) * 0.08 || max * 0.0005;
+        return { priceRange: { minValue: min - pad, maxValue: max + pad } };
+      },
     });
     chartRef.current = chart;
     seriesRef.current = series;
@@ -81,6 +102,7 @@ function CandleChart({ candles, markPrice, liqLines, trigLines }) {
   useEffect(() => {
     const s = seriesRef.current;
     if (!s || !candles || !candles.length) return;
+    candlesRef.current = candles; // set before setData so the autoscale provider sees it
     s.setData(candles);
     chartRef.current?.timeScale().fitContent();
   }, [candles]);
