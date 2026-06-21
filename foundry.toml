@@ -10,4 +10,9 @@ ffi = true
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
 
 optimizer = true
-optimizer_runs = 200
+# Tuned for deployed-bytecode size, not runtime gas: PositionManager sits just
+# under the EIP-170 24,576-byte limit, so we optimize for small code (runs = 1)
+# to buy headroom for upcoming governance/pause + initializer machinery. The
+# runtime-gas cost is negligible at LitVM's sub-cent gas, and the keeper's
+# execution gas stays well within the EXECUTION_FEE.
+optimizer_runs = 1
