@@ -27,12 +27,21 @@ const nowSec = () => Math.floor(Date.now() / 1000);
 // in-flight at a time (the contract serializes a position's lifecycle anyway), so a
 // single `flow` powers the global status banner. A pending breadcrumb is persisted to
 // localStorage after leg 1 so a refresh / abandoned wallet prompt can resume leg 2.
-export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addOrderId }) {
+export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addOrderId, positions }) {
   const [flow, setFlow] = useState(null);
   const [pending, setPending] = useState(null);
   const [lastFill, setLastFill] = useState({ n: 0 }); // bumps per fill -> ignite the button
   const busyRef = useRef(false);
   const clearTimer = useRef(null);
+
+  // onTraded closes over hook objects (useOrders/useBalances) that get a fresh identity
+  // every App render, so it changes every render. Keep it behind a ref so the callbacks
+  // and the watcher effect below DON'T churn on every render — otherwise the watcher
+  // tears down & re-subscribes its event listener + restarts the bounded burst poll on
+  // each render, turning a 20s burst into perpetual RPC polling for the whole pending
+  // window (which saturates the flaky RPC). Read the latest via onTradedRef.current.
+  const onTradedRef = useRef(onTraded);
+  onTradedRef.current = onTraded;
 
   // On connect / account switch, resume WATCHING any unfinished request. The keeper
   // may have already filled it while we were away, so the watcher effect reconciles
@@ -84,10 +93,10 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
         // Resolved but unlabelled (event window missed) — still refresh on-chain truth.
         setFlow({ phase: "done", ...crumb, ok: true, message: `${crumb.verb || "Order"} ${crumb.symbol || ""} — resolved.` });
       }
-      onTraded?.();
+      onTradedRef.current?.();
       scheduleClear();
     },
-    [account, toast, onTraded, scheduleClear],
+    [account, toast, scheduleClear],
   );
 
   // WATCH a pending market request for keeper resolution. Read-only: polls
@@ -165,6 +174,22 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
     };
   }, [account, pending, applyOutcome]);
 
+  // POSITION-GONE BACKSTOP for a market CLOSE: the keeper's on-chain close is the source
+  // of truth, and once it lands the position vanishes from `positions` (size 0 / absent).
+  // That signal is INDEPENDENT of the requests(id)/event reads the watcher relies on, so
+  // it reliably clears the "waiting for the keeper…" popup even when a flaky RPC keeps
+  // dropping those reads. A market close is what the user hit spinning forever; a partial
+  // decrease leaves the position open (size > 0), so this only fires once it's fully gone
+  // — the watcher's active-flip/event still handles partial decreases. No read, no gas.
+  useEffect(() => {
+    if (!pending || !positions || busyRef.current) return;
+    if (pending.action !== "close" && pending.action !== "decrease") return;
+    const stillOpen = positions.some(
+      (p) => p.symbol === pending.symbol && p.isLong === pending.isLong && p.sizeUsd > 0,
+    );
+    if (!stillOpen) applyOutcome(pending, { kind: "filled" });
+  }, [pending, positions, applyOutcome]);
+
   // Leg 2 self-execute (the manual fallback path): append a fresh payload,
   // executeRequest, then tell the outcome from THIS receipt's events. Throws on revert
   // (caller keeps the breadcrumb and offers execute-it-yourself / cancel).
@@ -186,10 +211,10 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
         setFlow({ phase: "done", ...crumb, ok: true, message: "Executed." });
         toast("Executed.");
       }
-      onTraded?.();
+      onTradedRef.current?.();
       scheduleClear();
     },
-    [account, getSigner, toast, onTraded, scheduleClear],
+    [account, getSigner, toast, scheduleClear],
   );
 
   // Centralized failure handling: if a breadcrumb exists (leg 1 already landed), keep
@@ -327,10 +352,17 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
       setPending(null);
       setFlow({ phase: "done", ...crumb, ok: true, message: "Order cancelled — refunded." });
       toast("Order cancelled — refunded.");
-      onTraded?.();
+      onTradedRef.current?.();
       scheduleClear();
     } catch (err) {
       const reason = err?.message || String(err);
+      // The request already executed (the keeper filled it between render and this
+      // cancel): cancelRequest reverts RequestNotActive. That's not a failure — reconcile
+      // it as resolved and clear, instead of surfacing a raw revert + a dead Cancel path.
+      if (!err?.rejected && /RequestNotActive/.test(reason)) {
+        applyOutcome(crumb, { kind: "filled" });
+        return;
+      }
       setFlow({
         phase: "error",
         ...crumb,
@@ -343,7 +375,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
     } finally {
       busyRef.current = false;
     }
-  }, [pending, account, getSigner, toast, onTraded, scheduleClear]);
+  }, [pending, account, getSigner, toast, scheduleClear, applyOutcome]);
 
   // --- 11c resting orders -------------------------------------------------------
   // Place a RESTING trigger ENTRY — limit/stop OPEN (no position yet) OR limit/stop
@@ -396,7 +428,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
 
         setFlow({ phase: "done", ok: true, symbol: p.symbol, isLong: p.isLong, message: `${label} ${noun} resting until ${p.symbol} ${triggerAbove ? "≥" : "≤"} ${fmtUsdPx(p.triggerPrice)}.` });
         toast(`${label} ${noun} placed ✓`);
-        onTraded?.();
+        onTradedRef.current?.();
         scheduleClear();
       } catch (err) {
         const reason = err?.message || String(err);
@@ -419,7 +451,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
         busyRef.current = false;
       }
     },
-    [account, wrongChain, getSigner, toast, onTraded, scheduleClear, addOrderId],
+    [account, wrongChain, getSigner, toast, scheduleClear, addOrderId],
   );
 
   // Place a RESTING trigger EXIT (TP / SL) on an open position: requestTriggerClose
@@ -463,7 +495,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
 
         setFlow({ phase: "done", ok: true, symbol: p.symbol, isLong: p.isLong, message: `${label} resting until ${p.symbol} ${triggerAbove ? "≥" : "≤"} ${fmtUsdPx(p.triggerPrice)}.` });
         toast(`${label} placed ✓`);
-        onTraded?.();
+        onTradedRef.current?.();
         scheduleClear();
       } catch (err) {
         const reason = err?.message || String(err);
@@ -479,7 +511,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
         busyRef.current = false;
       }
     },
-    [account, wrongChain, getSigner, toast, onTraded, scheduleClear, addOrderId],
+    [account, wrongChain, getSigner, toast, scheduleClear, addOrderId],
   );
 
   // The keeper FILL leg for a resting order, triggered once the static poll says it
@@ -508,7 +540,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
           // refresh and let the list reflect on-chain truth.
           setFlow({ phase: "done", ...crumb, ok: false, message: "Order did not fill — still resting." });
         }
-        onTraded?.();
+        onTradedRef.current?.();
         scheduleClear();
       } catch (err) {
         const reason = err?.message || String(err);
@@ -524,12 +556,12 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
           toast("Fill reverted.", true);
           scheduleClear();
         }
-        onTraded?.();
+        onTradedRef.current?.();
       } finally {
         busyRef.current = false;
       }
     },
-    [account, wrongChain, getSigner, toast, onTraded, scheduleClear],
+    [account, wrongChain, getSigner, toast, scheduleClear],
   );
 
   // Cancel a resting order and refund its escrow. Locked until CANCEL_DELAY (180s)
@@ -546,7 +578,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
         await trade.cancelRequest(pmWrite(getSigner()), order.id);
         setFlow({ phase: "done", ok: true, symbol: order.symbol, message: "Order cancelled — escrow refunded." });
         toast("Order cancelled — refunded.");
-        onTraded?.();
+        onTradedRef.current?.();
         scheduleClear();
       } catch (err) {
         const reason = err?.message || String(err);
@@ -562,7 +594,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
         busyRef.current = false;
       }
     },
-    [account, wrongChain, getSigner, toast, onTraded, scheduleClear],
+    [account, wrongChain, getSigner, toast, scheduleClear],
   );
 
   // Hide the transient banner. Keeps any on-chain pending intact (it reappears as a

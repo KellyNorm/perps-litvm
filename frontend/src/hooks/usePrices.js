@@ -22,7 +22,12 @@ export function usePrices(symbols) {
     let cancelled = false;
 
     async function poll() {
-      const result = await fetchMarks(feeds);
+      let result;
+      try {
+        result = await fetchMarks(feeds);
+      } catch {
+        return; // never let a throw kill the interval — the chart keeps the last series
+      }
       if (cancelled) return;
       // Keep the last GOOD mark per feed: only surface {error} for a feed we never had a
       // price for. A transient gateway blip must not blank an already-shown mark.

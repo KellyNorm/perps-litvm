@@ -242,7 +242,7 @@ export async function readRequestOutcome(pmReadCtr, id, fromBlock) {
   let from = fromBlock;
   if (from == null) {
     try {
-      const latest = await pmReadCtr.provider.getBlockNumber();
+      const latest = await withRetry(() => pmReadCtr.provider.getBlockNumber());
       from = Math.max(0, latest - OUTCOME_LOOKBACK);
     } catch {
       from = 0;
@@ -250,8 +250,8 @@ export async function readRequestOutcome(pmReadCtr, id, fromBlock) {
   }
   try {
     const [executed, cancelled] = await Promise.all([
-      pmReadCtr.queryFilter(pmReadCtr.filters.RequestExecuted(idBn), from, "latest"),
-      pmReadCtr.queryFilter(pmReadCtr.filters.RequestCancelled(idBn), from, "latest"),
+      withRetry(() => pmReadCtr.queryFilter(pmReadCtr.filters.RequestExecuted(idBn), from, "latest")),
+      withRetry(() => pmReadCtr.queryFilter(pmReadCtr.filters.RequestCancelled(idBn), from, "latest")),
     ]);
     if (executed.length) return { kind: "filled", executionPrice: executed[executed.length - 1].args.executionPrice };
     if (cancelled.length) {

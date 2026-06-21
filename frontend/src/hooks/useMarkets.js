@@ -72,9 +72,14 @@ export function useMarkets() {
             ];
           }),
         );
-        if (!cancelled) setStates(Object.fromEntries(entries));
-      } catch (e) {
-        if (!cancelled) setError(e?.message || String(e));
+        if (!cancelled) {
+          setStates(Object.fromEntries(entries));
+          setError(null); // a good poll clears any earlier discovery error
+        }
+      } catch {
+        // Transient RPC drop (already retried by withRetry). Keep the last good states
+        // and let the global "reconnecting…" indicator show — do NOT raise a hard red
+        // "Market read failed" banner that wipes a working dashboard on a passing blip.
       }
     }
 

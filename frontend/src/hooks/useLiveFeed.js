@@ -26,7 +26,12 @@ export function useLiveFeed(symbols) {
     const ctrl = new AbortController();
 
     async function poll() {
-      const { prices, source: src } = await fetchLiveTickers(feeds, sourceRef.current, ctrl.signal);
+      let prices, src;
+      try {
+        ({ prices, source: src } = await fetchLiveTickers(feeds, sourceRef.current, ctrl.signal));
+      } catch {
+        return; // never let a throw kill the interval — the live line keeps ticking
+      }
       if (cancelled) return;
       if (src) {
         sourceRef.current = src;

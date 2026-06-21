@@ -71,6 +71,7 @@ export default function App() {
     toast: showToast,
     onTraded,
     addOrderId: orders.addOrderId,
+    positions,
   });
 
   const meta = supported && selected ? supported.find((m) => m.symbol === selected) : null;
