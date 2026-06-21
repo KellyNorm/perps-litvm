@@ -3,7 +3,7 @@
 
 const env = import.meta.env;
 
-export const RPC_URL = env.VITE_RPC_URL || "https://liteforge.rpc.caldera.xyz/http";
+export const RPC_URL = env.VITE_RPC_URL || "https://liteforge.rpc.caldera.xyz/infra-partner-http";
 export const CHAIN_ID = Number(env.VITE_CHAIN_ID || 4441);
 
 export const ADDRESSES = {
