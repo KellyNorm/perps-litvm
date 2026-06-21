@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { fmtUsd, fmtUsd2, countdown } from "../lib/format.js";
+import { fmtUsd, fmtUsd2, fmtUsdPx, countdown } from "../lib/format.js";
 
 // Resting-orders table (Orders tab). Lists the wallet's open trigger orders, surfaces
 // the browser-keeper readiness (a "Fill now" appears only when the read-only poll says
@@ -128,7 +128,7 @@ export default function OrdersTable({ account, orders, readiness, trade, wrongCh
         </td>
         <td className="mono">
           {o.triggerAbove ? "≥ " : "≤ "}
-          {fmtUsd(o.triggerPrice)}
+          {fmtUsdPx(o.triggerPrice)}
         </td>
         <td className="mono">{sizeCell(o)}</td>
         <td className="mono">{fmtUsd2(o.locked)} mUSD</td>

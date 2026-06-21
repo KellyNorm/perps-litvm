@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createChart, ColorType, LineStyle, CrosshairMode } from "lightweight-charts";
-import { fmtUsd, fmtPrice } from "../lib/format.js";
+import { fmtUsdPx, fmtPrice } from "../lib/format.js";
 import { useCandles, TIMEFRAMES, DEFAULT_TF, hasExchangeFeed } from "../hooks/useCandles.js";
 import LiveLineChart from "./LiveLineChart.jsx";
 
@@ -163,7 +163,7 @@ export default function Chart({ symbol, series, mark, live, liveSource, startedA
   return (
     <div className="chart-wrap">
       <div className="chart-top">
-        <span className="price mono">{head ? fmtUsd(head.cur) : livePrice != null ? fmtUsd(livePrice) : markPrice != null ? fmtUsd(markPrice) : "—"}</span>
+        <span className="price mono">{head ? fmtUsdPx(head.cur) : livePrice != null ? fmtUsdPx(livePrice) : markPrice != null ? fmtUsdPx(markPrice) : "—"}</span>
         {head ? (
           <span className={"chg mono " + (head.up ? "pos" : "neg")}>
             {(head.up ? "+$" : "−$") + fmtPrice(Math.abs(head.delta))} ({Math.abs(head.pct).toFixed(2)}% · {tf})

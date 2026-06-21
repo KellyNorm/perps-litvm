@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import LeverageSlider from "./LeverageSlider.jsx";
-import { fmtUsd, fmt2 } from "../lib/format.js";
+import { fmtUsd, fmtUsdPx, fmt2 } from "../lib/format.js";
 import { borrowDayFrac, fundingDayFrac, liqPrice, MIN_COLLATERAL } from "../lib/engine.js";
 import { SLIPPAGE_OPTIONS } from "../lib/trade.js";
 import { KIND_OPEN, KIND_INCREASE } from "../lib/triggers.js";
@@ -235,7 +235,7 @@ export default function OrderTicket({ meta, mark, state, musdBalance, nativeBala
           <div className="field-head">
             <label htmlFor="trigInput">Trigger price</label>
             <span className="bal" style={{ cursor: "default" }}>
-              Mark <b>{price != null ? fmtUsd(price) : "—"}</b>
+              Mark <b>{price != null ? fmtUsdPx(price) : "—"}</b>
             </span>
           </div>
           <div className="input-wrap">
@@ -277,7 +277,7 @@ export default function OrderTicket({ meta, mark, state, musdBalance, nativeBala
             <span className="v">
               {trigValid && trig > 0 ? (
                 <>
-                  {restsAs} {isLong ? "long" : "short"} · fires mark {triggerAbove ? "≥" : "≤"} {fmtUsd(trig)}
+                  {restsAs} {isLong ? "long" : "short"} · fires mark {triggerAbove ? "≥" : "≤"} {fmtUsdPx(trig)}
                 </>
               ) : (
                 <span className="loading-dim">enter a trigger</span>
@@ -291,13 +291,13 @@ export default function OrderTicket({ meta, mark, state, musdBalance, nativeBala
         </div>
         <div className="row">
           <span className="k">{isTrigger ? "Entry (at trigger)" : "Entry price (live mark)"}</span>
-          <span className="v">{entryPreview != null ? fmtUsd(entryPreview) : <span className="loading-dim">…</span>}</span>
+          <span className="v">{entryPreview != null ? fmtUsdPx(entryPreview) : <span className="loading-dim">…</span>}</span>
         </div>
         <div className="row">
           <span className="k">
             Est. liquidation price <span className="hint" title="At the 10% maintenance margin, fees excluded at entry">?</span>
           </span>
-          <span className="v liq">{liq != null ? fmtUsd(liq) : <span className="loading-dim">…</span>}</span>
+          <span className="v liq">{liq != null ? fmtUsdPx(liq) : <span className="loading-dim">…</span>}</span>
         </div>
         <div className="row">
           <span className="k">

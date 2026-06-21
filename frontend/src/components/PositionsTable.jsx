@@ -1,4 +1,4 @@
-import { fmtUsd, fmtSigned } from "../lib/format.js";
+import { fmtUsd, fmtUsdPx, fmtSigned } from "../lib/format.js";
 import { signedPnl, liqPrice, health, healthColor, MIN_COLLATERAL } from "../lib/engine.js";
 import { KIND_INCREASE } from "../lib/triggers.js";
 
@@ -112,8 +112,8 @@ export default function PositionsTable({ account, positions, marks, live, orders
           title={
             locked
               ? isExit
-                ? `${resting.typeLabel} resting at $${resting.triggerPrice} — one resting trigger-edit per position`
-                : `A trigger increase is resting at $${resting.triggerPrice} — one resting trigger-edit per position (cancel it first)`
+                ? `${resting.typeLabel} resting at ${fmtUsdPx(resting.triggerPrice)} — one resting trigger-edit per position`
+                : `A trigger increase is resting at ${fmtUsdPx(resting.triggerPrice)} — one resting trigger-edit per position (cancel it first)`
               : "Add a resting take-profit / stop-loss"
           }
         >
@@ -161,9 +161,9 @@ export default function PositionsTable({ account, positions, marks, live, orders
             <span className="lev">{lev.toFixed(lev % 1 ? 1 : 0)}×</span>
           </td>
           <td className="mono">{fmtUsd(p.sizeUsd)}</td>
-          <td className="mono">{fmtUsd(p.entryPrice)}</td>
-          <td className="mono">{dp.ok ? fmtUsd(mark) : <span className="loading-dim">…</span>}</td>
-          <td className="mono neg">{fmtUsd(liq)}</td>
+          <td className="mono">{fmtUsdPx(p.entryPrice)}</td>
+          <td className="mono">{dp.ok ? fmtUsdPx(mark) : <span className="loading-dim">…</span>}</td>
+          <td className="mono neg">{fmtUsdPx(liq)}</td>
           <td>
             <span className="health">
               <span className="health-track">

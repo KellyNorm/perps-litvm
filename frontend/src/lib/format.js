@@ -14,6 +14,19 @@ export function fmtUsd(n) {
   return "$" + fmtPrice(n);
 }
 
+// Asset PRICES — mark, execution, entry, trigger — shown to 5 decimals. This is the
+// single place price precision lives; route every price display through fmtUsdPx so they
+// stay consistent. DISPLAY ONLY: stored/contract precision is unchanged, and mUSD/size
+// notional keeps its coarser fmtUsd styling (do NOT use this for sizes).
+export function fmtPx(n) {
+  if (n == null || !isFinite(n)) return "—";
+  return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 5 });
+}
+
+export function fmtUsdPx(n) {
+  return "$" + fmtPx(n);
+}
+
 export function fmtUsd2(n) {
   return "$" + fmt2(n);
 }

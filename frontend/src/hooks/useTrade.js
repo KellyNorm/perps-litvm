@@ -4,6 +4,7 @@ import { ADDRESSES } from "../config.js";
 import { pmWrite, musdWrite, pmRead } from "../lib/contracts.js";
 import { loadPending, savePending, clearPending } from "../lib/pending.js";
 import * as trade from "../lib/trade.js";
+import { fmtUsdPx } from "../lib/format.js";
 
 const VERBING = { open: "Opening", increase: "Increasing", close: "Closing", decrease: "Decreasing" };
 const IN_PROGRESS = ["approving", "requesting", "waiting", "executing"];
@@ -393,7 +394,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
         });
         addOrderId?.(account, id.toString());
 
-        setFlow({ phase: "done", ok: true, symbol: p.symbol, isLong: p.isLong, message: `${label} ${noun} resting until ${p.symbol} ${triggerAbove ? "≥" : "≤"} $${p.triggerPrice}.` });
+        setFlow({ phase: "done", ok: true, symbol: p.symbol, isLong: p.isLong, message: `${label} ${noun} resting until ${p.symbol} ${triggerAbove ? "≥" : "≤"} ${fmtUsdPx(p.triggerPrice)}.` });
         toast(`${label} ${noun} placed ✓`);
         onTraded?.();
         scheduleClear();
@@ -460,7 +461,7 @@ export function useTrade({ account, getSigner, wrongChain, toast, onTraded, addO
         });
         addOrderId?.(account, id.toString());
 
-        setFlow({ phase: "done", ok: true, symbol: p.symbol, isLong: p.isLong, message: `${label} resting until ${p.symbol} ${triggerAbove ? "≥" : "≤"} $${p.triggerPrice}.` });
+        setFlow({ phase: "done", ok: true, symbol: p.symbol, isLong: p.isLong, message: `${label} resting until ${p.symbol} ${triggerAbove ? "≥" : "≤"} ${fmtUsdPx(p.triggerPrice)}.` });
         toast(`${label} placed ✓`);
         onTraded?.();
         scheduleClear();

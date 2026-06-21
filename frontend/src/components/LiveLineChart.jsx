@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { fmtUsd, fmtPrice } from "../lib/format.js";
+import { fmtUsdPx, fmtPrice } from "../lib/format.js";
 
 const W = 980;
 const H = 300;
@@ -55,7 +55,7 @@ export default function LiveLineChart({ symbol, series, mark, live, startedAt, l
   return (
     <div className="chart-wrap">
       <div className="chart-top">
-        <span className="price mono">{cur != null ? fmtUsd(cur) : "—"}</span>
+        <span className="price mono">{cur != null ? fmtUsdPx(cur) : "—"}</span>
         {delta != null ? (
           <span className={"chg mono " + (up ? "pos" : "neg")}>
             {(up ? "+$" : "−$") + fmtPrice(Math.abs(delta))} ({Math.abs(deltaPct).toFixed(2)}% since {timeLabel(startedAt)})
@@ -90,7 +90,7 @@ export default function LiveLineChart({ symbol, series, mark, live, startedAt, l
               <g key={"liq" + i}>
                 <line className="liq-line" x1="0" y1={view.y(l.price)} x2={W} y2={view.y(l.price)} />
                 <text className="liq-flag" x="8" y={view.y(l.price) - 5}>
-                  {(l.label || "LIQ") + " " + fmtUsd(l.price)}
+                  {(l.label || "LIQ") + " " + fmtUsdPx(l.price)}
                 </text>
               </g>
             ) : null,
@@ -100,7 +100,7 @@ export default function LiveLineChart({ symbol, series, mark, live, startedAt, l
               <g key={"trig" + i}>
                 <line className="trig-line" x1="0" y1={view.y(t.price)} x2={W} y2={view.y(t.price)} />
                 <text className="trig-flag" x={W - 160} y={view.y(t.price) - 5}>
-                  {(t.label || "TRIGGER") + " " + fmtUsd(t.price)}
+                  {(t.label || "TRIGGER") + " " + fmtUsdPx(t.price)}
                 </text>
               </g>
             ) : null,

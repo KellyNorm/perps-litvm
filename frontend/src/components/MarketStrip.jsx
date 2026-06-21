@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { fmtUsd, fmtCompact, fmtPct } from "../lib/format.js";
+import { fmtUsdPx, fmtCompact, fmtPct } from "../lib/format.js";
 import { borrowDayFrac, fundingDayFrac } from "../lib/engine.js";
 
 function Price({ mark }) {
   if (!mark) return <span className="loading-dim">loading…</span>;
   if (mark.error) return <span className="neg">unavailable</span>;
-  return <>{fmtUsd(mark.price)}</>;
+  return <>{fmtUsdPx(mark.price)}</>;
 }
 
 // Live price for a symbol: prefer the fast exchange ticker, fall back to the RedStone
@@ -95,7 +95,7 @@ export default function MarketStrip({ supported, selected, onSelect, marks, live
                     <div className="di-name">{m.symbol}-PERP</div>
                     <div className="di-full">{m.full}</div>
                   </span>
-                  <span className="di-price">{mk && !mk.error ? fmtUsd(mk.price) : "…"}</span>
+                  <span className="di-price">{mk && !mk.error ? fmtUsdPx(mk.price) : "…"}</span>
                 </button>
               );
             })}

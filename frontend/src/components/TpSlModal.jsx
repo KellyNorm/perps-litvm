@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { fmtUsd } from "../lib/format.js";
+import { fmtUsd, fmtUsdPx } from "../lib/format.js";
 import { MIN_COLLATERAL, signedPnl } from "../lib/engine.js";
 
 // "Add TP/SL" modal for an open position. Places a single RESTING exit (take-profit
@@ -93,7 +93,7 @@ export default function TpSlModal({ position, mark, trade, onClose }) {
             <div className="field-head">
               <label htmlFor="trigInput">Trigger price</label>
               <span className="bal" style={{ cursor: "default" }}>
-                Mark <b>{mark != null ? fmtUsd(mark) : "—"}</b>
+                Mark <b>{mark != null ? fmtUsdPx(mark) : "—"}</b>
               </span>
             </div>
             <div className="input-wrap">
@@ -136,7 +136,7 @@ export default function TpSlModal({ position, mark, trade, onClose }) {
             </div>
             <div className="row">
               <span className="k">Gate</span>
-              <span className="v mono">{valid ? `mark ${triggerAbove ? "≥" : "≤"} ${fmtUsd(trig)}` : "—"}</span>
+              <span className="v mono">{valid ? `mark ${triggerAbove ? "≥" : "≤"} ${fmtUsdPx(trig)}` : "—"}</span>
             </div>
             <div className="row">
               <span className="k">Est. P&L at trigger</span>
