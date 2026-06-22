@@ -33,7 +33,7 @@
 
 import { ethers } from "ethers";
 import { PM_ABI, ERC20_ABI } from "./lib/abi.mjs";
-import { makeWrap, feedOf, fetchMark, payloadTimestampSec } from "./lib/redstone.mjs";
+import { fetchPackages, wrapWithPackages, feedOf, fetchMark } from "./lib/redstone.mjs";
 import { revertReason, staticExecuteCheck } from "./lib/revert.mjs";
 
 // ---- config ---------------------------------------------------------------
@@ -55,7 +55,6 @@ for (const [k, v] of Object.entries({
   if (!v) throw new Error(`missing env ${k}`);
 }
 
-const wrap = makeWrap(cfg.dataService);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const f18 = (v) => ethers.utils.formatUnits(v, 18);
 const f8 = (v) => ethers.utils.formatUnits(v, 8);
@@ -72,6 +71,28 @@ function logId(id, phase, msg = "") {
 }
 function logSys(msg) {
   console.log(`[${ts()}] ${msg}`);
+}
+
+// ---- lifecycle stage timing (baseline telemetry, STEP 1 task B) ------------
+// Pure observation — no behavior change. Each active entry carries an `t` object
+// of wall-clock-ms stamps captured the FIRST time each stage is reached:
+//   seen        — discovered into the active set (reconcile)
+//   windowOpen  — first tick where blockTs >= requestTs + MIN_EXECUTION_DELAY
+//   payload     — a usable RedStone payload (market: pkg ts past the floor;
+//                 trigger: static-probe says fillable) is in hand
+//   submitted   — executeRequest broadcast (tx hash returned)
+//   confirmed   — receipt mined
+// On confirm we print the per-stage deltas so we can see which segment dominates.
+const dt = (a, b) => (a && b ? `${((b - a) / 1000).toFixed(2)}s` : "n/a");
+function logTiming(entry) {
+  const t = entry.t || {};
+  logId(
+    entry.id.toString(),
+    "timing",
+    `seen→open ${dt(t.seen, t.windowOpen)} | open→payload ${dt(t.windowOpen, t.payload)} | ` +
+      `payload→submit ${dt(t.payload, t.submitted)} | submit→confirm ${dt(t.submitted, t.confirmed)} || ` +
+      `TOTAL seen→confirm ${dt(t.seen, t.confirmed)}`,
+  );
 }
 
 async function main() {
@@ -128,7 +149,7 @@ async function main() {
     const feed = feedOf(req.market);
     if (!active.has(key)) {
       const kind = ["Open", "Close", "Decrease", "Increase"][req.kind] ?? `kind${req.kind}`;
-      active.set(key, { id, req, isTrigger, feed, phase: null });
+      active.set(key, { id, req, isTrigger, feed, phase: null, t: { seen: Date.now() } });
       logId(
         key,
         "discovered",
@@ -192,23 +213,111 @@ async function main() {
     nonce = await provider.getTransactionCount(wallet.address, "latest");
   }
 
-  // Send a real executeRequest for one id and classify the receipt. The contract
-  // decides the outcome — we just report it. Returns nothing; updates fee/fill
-  // counters and re-reconciles the id (which drops it once inactive).
-  async function execute(entry) {
+  // ---- cached gas limit + fee data (keep the submit hot path RPC-free) -----
+  // Left to ethers, every sendTransaction does eth_estimateGas + eth_getFeeData
+  // before broadcasting — two RPCs on the critical path. We cache both so the hot
+  // path is just eth_sendRawTransaction:
+  //   gasLimit — estimated ONCE off the first real fill (guaranteed fillable, so
+  //              the estimate can't revert), then held at estimate×2 (with a
+  //              generous floor) for every later fill. On sub-cent gas an
+  //              over-provided cap is free — you pay for gas used, not the cap — so
+  //              the 2× headroom covers the worst-case path (liquidation / large
+  //              position) without re-estimating. A low-gas send drops the cache so
+  //              the next fill re-estimates.
+  //   feeData  — primed at startup and refreshed on a 30s timer (and on any send
+  //              error), bumped 2× so a base-fee move inside the window can't
+  //              underprice us. Hot path reads the cached override, never the RPC.
+  const GAS_FLOOR = ethers.BigNumber.from(2_000_000); // generous worst-case ceiling
+  let cachedGasLimit = null;
+  async function ensureGasLimit(txReq) {
+    if (cachedGasLimit) return cachedGasLimit;
+    const est = await wallet.estimateGas(txReq);
+    cachedGasLimit = est.mul(2);
+    if (cachedGasLimit.lt(GAS_FLOOR)) cachedGasLimit = GAS_FLOOR;
+    logSys(`gas limit cached @ ${cachedGasLimit} (estimate ${est} ×2, floor ${GAS_FLOOR})`);
+    return cachedGasLimit;
+  }
+  let feeOverride = null;
+  async function refreshFee() {
+    try {
+      const fd = await provider.getFeeData();
+      if (fd.maxFeePerGas && fd.maxPriorityFeePerGas) {
+        feeOverride = {
+          maxFeePerGas: fd.maxFeePerGas.mul(2),
+          maxPriorityFeePerGas: fd.maxPriorityFeePerGas.mul(2),
+        };
+      } else if (fd.gasPrice) {
+        feeOverride = { gasPrice: fd.gasPrice.mul(2) };
+      }
+    } catch (err) {
+      logSys(`fee refresh failed (keeping cached): ${err.message}`);
+    }
+  }
+  await refreshFee(); // prime before the first fill
+  setInterval(refreshFee, 30_000).unref?.(); // background refresh; never blocks a fill
+
+  // Stamp the cached nonce, gas limit, and fee override onto a built tx so
+  // sendTransaction skips eth_estimateGas and eth_getFeeData.
+  async function readyTx(txReq) {
+    txReq.nonce = nonce;
+    txReq.gasLimit = await ensureGasLimit(txReq);
+    if (feeOverride) Object.assign(txReq, feeOverride);
+    return txReq;
+  }
+
+  // Build the payload-bearing executeRequest tx from ALREADY-FETCHED packages.
+  // The wrapper only appends the signed payload to calldata here (no gas estimate,
+  // no network) — gas is estimated later at sendTransaction — so this is safe to
+  // pre-build even for a resting trigger that wouldn't fill.
+  async function buildTx(entry, pkgs) {
+    const wrapped = wrapWithPackages(pm, pkgs);
+    return wrapped.populateTransaction.executeRequest(entry.id);
+  }
+
+  // Send a real executeRequest for one id and classify the receipt. `txReq` is the
+  // tx pre-built from the package fetched at the freshness gate / probe — so the
+  // critical path here is just sign + broadcast, NOT a second RedStone round-trip.
+  // The contract decides the outcome — we just report it. Updates fee/fill counters
+  // and re-reconciles the id (which drops it once inactive).
+  async function execute(entry, txReq) {
     const key = entry.id.toString();
     if (inFlight.has(key)) return;
     inFlight.add(key);
     try {
-      // Build the payload-bearing tx once (same wrap path the static probe used),
-      // then send it with an explicit nonce.
-      const wrapped = wrap(pm, entry.feed);
-      const txReq = await wrapped.populateTransaction.executeRequest(entry.id);
-      txReq.nonce = nonce;
+      await readyTx(txReq);
       logId(key, "executing", `nonce ${nonce}`);
-      const sent = await wallet.sendTransaction(txReq);
+      let sent;
+      try {
+        sent = await wallet.sendTransaction(txReq);
+      } catch (err) {
+        // ONE retry covering the two benign send-time rejections of a cached path:
+        //   stale  — the reused package is only ~1s old, so on-chain freshness
+        //            should always pass; if it's ever rejected, refetch + rebuild.
+        //   reprice/regas — a cached fee underpriced by a base-fee move, or a cached
+        //            gas limit too low for this path: drop both caches, refresh, and
+        //            re-ready so the retry re-estimates. (Neither hit in test fills.)
+        const reason = revertReason(pm.interface, err);
+        const stale = /Timestamp|Stale|TooOld|TooLongFuture/i.test(reason);
+        const repriceRegas = /out of gas|intrinsic gas|gas required exceeds|underpriced|max fee per gas|fee too low/i.test(
+          reason,
+        );
+        if (!stale && !repriceRegas) throw err;
+        logId(key, "submit-retry", `${stale ? "stale pkg" : "reprice/regas"} (${reason})`);
+        cachedGasLimit = null; // force a fresh estimate
+        await refreshFee(); // force a fresh price
+        await resyncNonce();
+        if (stale) {
+          const { pkgs } = await fetchPackages(cfg.dataService, entry.feed);
+          txReq = await buildTx(entry, pkgs);
+        }
+        await readyTx(txReq);
+        sent = await wallet.sendTransaction(txReq);
+      }
       nonce++;
+      entry.t.submitted = Date.now();
       const rcpt = await sent.wait();
+      entry.t.confirmed = Date.now();
+      logTiming(entry);
 
       // Outcome from the receipt only. A fill emits RequestExecuted; a MARKET
       // slippage miss emits RequestCancelled(slippage=true) (the tx still
@@ -270,6 +379,7 @@ async function main() {
     const key = entry.id.toString();
     if (inFlight.has(key)) return;
     const earliest = entry.req.requestTimestamp.toNumber() + MIN_DELAY;
+    if (blockTs >= earliest) entry.t.windowOpen ??= Date.now(); // delay window has opened
 
     if (entry.isTrigger) {
       // Resting order: never blind-send. Static-probe fillability first.
@@ -280,10 +390,13 @@ async function main() {
         }
         return;
       }
-      let probe;
+      // Fetch the package ONCE, build the payload-bearing tx, and probe with it.
+      // On a fillable probe we reuse that exact tx for the real send — no second
+      // RedStone fetch, no re-populate.
+      let txReq, probe;
       try {
-        const wrapped = wrap(pm, entry.feed);
-        const txReq = await wrapped.populateTransaction.executeRequest(entry.id);
+        const { pkgs } = await fetchPackages(cfg.dataService, entry.feed);
+        txReq = await buildTx(entry, pkgs);
         probe = await staticExecuteCheck(provider, pm.interface, txReq, wallet.address);
       } catch (err) {
         logId(key, "errored", `static probe failed (transient): ${err.message}`);
@@ -291,7 +404,8 @@ async function main() {
       }
       if (probe.ok) {
         entry.phase = "fillable";
-        await execute(entry);
+        entry.t.payload ??= Date.now(); // probe-fillable ⇒ a usable payload is in hand
+        await execute(entry, txReq);
       } else if (entry.phase !== "not-met") {
         logId(key, "not-met", probe.reason);
         entry.phase = "not-met";
@@ -307,9 +421,12 @@ async function main() {
       }
       return;
     }
-    let pkgTs = 0;
+    // ONE fetch: read the package timestamp for the freshness gate AND hold the
+    // package itself. The same package is reused to build the executeRequest
+    // calldata below — no second requestDataPackages round-trip on the submit path.
+    let pkgs, pkgTs;
     try {
-      pkgTs = await payloadTimestampSec(cfg.dataService, entry.feed);
+      ({ pkgs, ts: pkgTs } = await fetchPackages(cfg.dataService, entry.feed));
     } catch (err) {
       logId(key, "errored", `payload fetch failed (transient): ${err.message}`);
       return;
@@ -321,7 +438,17 @@ async function main() {
       }
       return;
     }
-    await execute(entry);
+    entry.t.payload ??= Date.now(); // fresh-enough package obtained
+    // Pre-build the tx now (package in hand) so execute()'s critical path is just
+    // sign + broadcast.
+    let txReq;
+    try {
+      txReq = await buildTx(entry, pkgs);
+    } catch (err) {
+      logId(key, "errored", `tx build failed (transient): ${err.message}`);
+      return;
+    }
+    await execute(entry, txReq);
   }
 
   // ---- startup backfill ---------------------------------------------------

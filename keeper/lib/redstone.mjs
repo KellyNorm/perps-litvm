@@ -42,9 +42,12 @@ export function makeWrap(dataServiceId) {
     });
 }
 
-// Fetch the live data package for `feed`: returns { ts (sec), price1e8 (BigNumber) }.
-// The mark is the package value scaled to the on-chain 1e8 convention.
-export async function fetchMark(dataServiceId, feed) {
+// Fetch the signed data packages for `feed` ONCE: returns { pkgs, ts (sec) }.
+// `pkgs` is the raw DataServiceResponse — reuse it both for the freshness gate
+// (its `ts`) AND to inject calldata via wrapWithPackages, so the submit path needs
+// no second requestDataPackages round-trip. This is the single-fetch primitive the
+// other helpers (fetchMark, payloadTimestampSec) are now built on.
+export async function fetchPackages(dataServiceId, feed) {
   const pkgs = await requestDataPackages({
     dataServiceId,
     dataPackagesIds: [feed],
@@ -52,6 +55,21 @@ export async function fetchMark(dataServiceId, feed) {
     authorizedSigners: PROD_SIGNERS,
   });
   const ts = Math.floor(getDataPackagesTimestamp(pkgs) / 1000);
+  return { pkgs, ts };
+}
+
+// Wrap a contract so ALREADY-FETCHED signed packages are injected into the call's
+// calldata — the reuse counterpart to makeWrap that does NOT hit the network. Same
+// on-chain payload as usingDataService, but built from packages already in hand, so
+// the payload→submit critical path is one fetch instead of two.
+export function wrapWithPackages(contract, pkgs) {
+  return WrapperBuilder.wrap(contract).usingDataPackages(pkgs);
+}
+
+// Fetch the live data package for `feed`: returns { ts (sec), price1e8 (BigNumber) }.
+// The mark is the package value scaled to the on-chain 1e8 convention.
+export async function fetchMark(dataServiceId, feed) {
+  const { pkgs, ts } = await fetchPackages(dataServiceId, feed);
   const value = pkgs[feed][0].dataPackage.dataPoints[0].toObj().value; // human float
   const price1e8 = ethers.BigNumber.from(Math.round(value * 1e8).toString());
   return { ts, price1e8 };
