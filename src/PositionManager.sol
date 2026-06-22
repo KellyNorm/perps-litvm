@@ -1336,6 +1336,64 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
     // --- two-step deferred execution (PR-6b) -----------------------------
 
     /**
+     * @notice Shared effects+interaction tail for every request builder: the
+     *         single point that mutates request state and pulls the escrow. The
+     *         wrappers do ALL validation (and own their per-kind validation
+     *         ORDER); this helper does only the writes and the lone transfer, so
+     *         CEI holds wrapper-side (validate) -> here (effects -> interaction).
+     * @dev    Behaviour-preserving consolidation of the eight builders' identical
+     *         tails (EIP-170 headroom). Invariants folded in here:
+     *         - MUTEX: every non-Open kind holds the {closePending} position-edit
+     *           mutex; Open creates a position and takes none. So set it iff
+     *           `kind != Open` — exactly mirroring {executeRequest}'s teardown.
+     *         - TRIGGER: a plain market request never writes {triggers}; a resting
+     *           order does. `triggerPrice == 0` is the "not a trigger" sentinel
+     *           (see {Trigger}), so write iff `triggerPrice != 0`.
+     *         - ESCROW: opens/increases pull `collateral + EXECUTION_FEE`;
+     *           closes/decreases pull only the fee AND carry `collateral == 0`, so
+     *           `collateral + EXECUTION_FEE` is the one uniform amount for all.
+     *         The caller still emits its builder-specific event AFTER this returns
+     *         (i.e. after the interaction), preserving the prior emit ordering.
+     * @param  key             Position key; only read when `kind != Open` (mutex).
+     * @param  triggerPrice    0 ⇒ plain market request (no {triggers} write).
+     * @return requestId       Id assigned to the queued request.
+     */
+    function _queueRequest(
+        bytes32 key,
+        bytes32 market,
+        bool isLong,
+        RequestKind kind,
+        uint256 collateral,
+        uint256 leverage,
+        uint256 acceptablePrice,
+        uint256 triggerPrice,
+        bool triggerAbove
+    ) internal returns (uint256 requestId) {
+        // Effects.
+        if (kind != RequestKind.Open) closePending[key] = true;
+        requestId = nextRequestId++;
+        requests[requestId] = Request({
+            owner: msg.sender,
+            market: market,
+            isLong: isLong,
+            kind: kind,
+            collateral: collateral,
+            leverage: leverage,
+            acceptablePrice: acceptablePrice,
+            executionFee: EXECUTION_FEE,
+            requestTimestamp: block.timestamp,
+            active: true
+        });
+        if (triggerPrice != 0) {
+            triggers[requestId] = Trigger({triggerPrice: triggerPrice, triggerAbove: triggerAbove});
+        }
+
+        // Interaction LAST (CEI): single, uniform escrow (collateral is 0 for
+        // Close/Decrease, so this pulls just the fee for those kinds).
+        asset.safeTransferFrom(msg.sender, address(this), collateral + EXECUTION_FEE);
+    }
+
+    /**
      * @notice Queue a deferred OPEN. The collateral and the {EXECUTION_FEE} are
      *         escrowed here now; a keeper fills it later at a price relayed
      *         on-chain at execution (front-running protection — the trader does
@@ -1367,23 +1425,19 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
         if (acceptablePrice == 0) revert InvalidAcceptablePrice();
         if (positions[_positionKey(msg.sender, market, isLong)].sizeUsd != 0) revert PositionAlreadyOpen();
 
-        // Effects.
-        requestId = nextRequestId++;
-        requests[requestId] = Request({
-            owner: msg.sender,
-            market: market,
-            isLong: isLong,
-            kind: RequestKind.Open,
-            collateral: collateral,
-            leverage: leverage,
-            acceptablePrice: acceptablePrice,
-            executionFee: EXECUTION_FEE,
-            requestTimestamp: block.timestamp,
-            active: true
-        });
-
-        // Interaction LAST (CEI).
-        asset.safeTransferFrom(msg.sender, address(this), collateral + EXECUTION_FEE);
+        // Effects + escrow (shared tail). Open takes no mutex and writes no
+        // trigger (triggerPrice 0); key is unused for Open.
+        requestId = _queueRequest(
+            _positionKey(msg.sender, market, isLong),
+            market,
+            isLong,
+            RequestKind.Open,
+            collateral,
+            leverage,
+            acceptablePrice,
+            0,
+            false
+        );
 
         emit OpenRequested(requestId, msg.sender, market, isLong, collateral, leverage, acceptablePrice, EXECUTION_FEE);
     }
@@ -1411,24 +1465,10 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
         if (positions[key].sizeUsd == 0) revert NoOpenPosition();
         if (closePending[key]) revert CloseAlreadyPending();
 
-        // Effects.
-        closePending[key] = true;
-        requestId = nextRequestId++;
-        requests[requestId] = Request({
-            owner: msg.sender,
-            market: market,
-            isLong: isLong,
-            kind: RequestKind.Close,
-            collateral: 0,
-            leverage: 0,
-            acceptablePrice: acceptablePrice,
-            executionFee: EXECUTION_FEE,
-            requestTimestamp: block.timestamp,
-            active: true
-        });
-
-        // Interaction LAST (CEI).
-        asset.safeTransferFrom(msg.sender, address(this), EXECUTION_FEE);
+        // Effects + escrow (shared tail). Close takes the mutex (kind != Open),
+        // writes no trigger (triggerPrice 0), and escrows only the fee
+        // (collateral 0).
+        requestId = _queueRequest(key, market, isLong, RequestKind.Close, 0, 0, acceptablePrice, 0, false);
 
         emit CloseRequested(requestId, msg.sender, market, isLong, acceptablePrice, EXECUTION_FEE);
     }
@@ -1473,24 +1513,10 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
         uint256 remainingCollateral = pos.collateral - Math.mulDiv(pos.collateral, closeBps, BPS_DENOMINATOR);
         if (remainingCollateral < MIN_COLLATERAL) revert CollateralTooLow(remainingCollateral, MIN_COLLATERAL);
 
-        // Effects.
-        closePending[key] = true;
-        requestId = nextRequestId++;
-        requests[requestId] = Request({
-            owner: msg.sender,
-            market: market,
-            isLong: isLong,
-            kind: RequestKind.Decrease,
-            collateral: 0,
-            leverage: closeBps, // OVERLOAD: Decrease carries closeBps here (see {Request}).
-            acceptablePrice: acceptablePrice,
-            executionFee: EXECUTION_FEE,
-            requestTimestamp: block.timestamp,
-            active: true
-        });
-
-        // Interaction LAST (CEI).
-        asset.safeTransferFrom(msg.sender, address(this), EXECUTION_FEE);
+        // Effects + escrow (shared tail). Decrease takes the mutex (kind != Open),
+        // writes no trigger (triggerPrice 0), escrows only the fee (collateral 0),
+        // and carries closeBps in the OVERLOADED leverage field (see {Request}).
+        requestId = _queueRequest(key, market, isLong, RequestKind.Decrease, 0, closeBps, acceptablePrice, 0, false);
 
         emit DecreaseRequested(requestId, msg.sender, market, isLong, closeBps, acceptablePrice, EXECUTION_FEE);
     }
@@ -1539,24 +1565,12 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
         if (positions[key].sizeUsd == 0) revert NoOpenPosition();
         if (closePending[key]) revert CloseAlreadyPending();
 
-        // Effects.
-        closePending[key] = true;
-        requestId = nextRequestId++;
-        requests[requestId] = Request({
-            owner: msg.sender,
-            market: market,
-            isLong: isLong,
-            kind: RequestKind.Increase,
-            collateral: addCollateral,
-            leverage: addLeverage, // natural meaning (leverage applied to addCollateral)
-            acceptablePrice: acceptablePrice,
-            executionFee: EXECUTION_FEE,
-            requestTimestamp: block.timestamp,
-            active: true
-        });
-
-        // Interaction LAST (CEI): escrow collateral + fee like an Open.
-        asset.safeTransferFrom(msg.sender, address(this), addCollateral + EXECUTION_FEE);
+        // Effects + escrow (shared tail). Increase takes the mutex (kind != Open),
+        // writes no trigger (triggerPrice 0), and escrows addCollateral + fee like
+        // an Open; addLeverage rides the leverage field in its natural sense.
+        requestId = _queueRequest(
+            key, market, isLong, RequestKind.Increase, addCollateral, addLeverage, acceptablePrice, 0, false
+        );
 
         emit IncreaseRequested(
             requestId, msg.sender, market, isLong, addCollateral, addLeverage, acceptablePrice, EXECUTION_FEE
@@ -1601,25 +1615,11 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
         if (positions[key].sizeUsd == 0) revert NoOpenPosition();
         if (closePending[key]) revert CloseAlreadyPending();
 
-        // Effects.
-        closePending[key] = true;
-        requestId = nextRequestId++;
-        requests[requestId] = Request({
-            owner: msg.sender,
-            market: market,
-            isLong: isLong,
-            kind: RequestKind.Close,
-            collateral: 0,
-            leverage: 0,
-            acceptablePrice: acceptablePrice,
-            executionFee: EXECUTION_FEE,
-            requestTimestamp: block.timestamp,
-            active: true
-        });
-        triggers[requestId] = Trigger({triggerPrice: triggerPrice, triggerAbove: triggerAbove});
-
-        // Interaction LAST (CEI).
-        asset.safeTransferFrom(msg.sender, address(this), EXECUTION_FEE);
+        // Effects + escrow (shared tail). Close takes the mutex (kind != Open),
+        // escrows only the fee (collateral 0), and writes the resting trigger
+        // gate (triggerPrice != 0).
+        requestId =
+            _queueRequest(key, market, isLong, RequestKind.Close, 0, 0, acceptablePrice, triggerPrice, triggerAbove);
 
         emit TriggerCloseRequested(
             requestId, msg.sender, market, isLong, acceptablePrice, triggerPrice, triggerAbove, EXECUTION_FEE
@@ -1670,25 +1670,13 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
         uint256 remainingCollateral = pos.collateral - Math.mulDiv(pos.collateral, closeBps, BPS_DENOMINATOR);
         if (remainingCollateral < MIN_COLLATERAL) revert CollateralTooLow(remainingCollateral, MIN_COLLATERAL);
 
-        // Effects.
-        closePending[key] = true;
-        requestId = nextRequestId++;
-        requests[requestId] = Request({
-            owner: msg.sender,
-            market: market,
-            isLong: isLong,
-            kind: RequestKind.Decrease,
-            collateral: 0,
-            leverage: closeBps, // OVERLOAD: Decrease carries closeBps here (see {Request}).
-            acceptablePrice: acceptablePrice,
-            executionFee: EXECUTION_FEE,
-            requestTimestamp: block.timestamp,
-            active: true
-        });
-        triggers[requestId] = Trigger({triggerPrice: triggerPrice, triggerAbove: triggerAbove});
-
-        // Interaction LAST (CEI).
-        asset.safeTransferFrom(msg.sender, address(this), EXECUTION_FEE);
+        // Effects + escrow (shared tail). Decrease takes the mutex (kind != Open),
+        // escrows only the fee (collateral 0), carries closeBps in the OVERLOADED
+        // leverage field (see {Request}), and writes the resting trigger gate
+        // (triggerPrice != 0).
+        requestId = _queueRequest(
+            key, market, isLong, RequestKind.Decrease, 0, closeBps, acceptablePrice, triggerPrice, triggerAbove
+        );
 
         emit TriggerDecreaseRequested(
             requestId, msg.sender, market, isLong, closeBps, acceptablePrice, triggerPrice, triggerAbove, EXECUTION_FEE
@@ -1752,25 +1740,13 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
         bytes32 key = _positionKey(msg.sender, market, isLong);
         if (positions[key].sizeUsd != 0) revert PositionAlreadyOpen();
 
-        // Effects. No {closePending} mutex: an open creates a position, it does not
-        // edit one (mirror {requestOpen}).
-        requestId = nextRequestId++;
-        requests[requestId] = Request({
-            owner: msg.sender,
-            market: market,
-            isLong: isLong,
-            kind: RequestKind.Open,
-            collateral: collateral,
-            leverage: leverage,
-            acceptablePrice: acceptablePrice,
-            executionFee: EXECUTION_FEE,
-            requestTimestamp: block.timestamp,
-            active: true
-        });
-        triggers[requestId] = Trigger({triggerPrice: triggerPrice, triggerAbove: triggerAbove});
-
-        // Interaction LAST (CEI): escrow collateral + fee like an Open.
-        asset.safeTransferFrom(msg.sender, address(this), collateral + EXECUTION_FEE);
+        // Effects + escrow (shared tail). No {closePending} mutex: an open creates
+        // a position, it does not edit one (kind == Open; key unused for the mutex,
+        // mirror {requestOpen}). Escrows collateral + fee and writes the resting
+        // trigger gate (triggerPrice != 0).
+        requestId = _queueRequest(
+            key, market, isLong, RequestKind.Open, collateral, leverage, acceptablePrice, triggerPrice, triggerAbove
+        );
 
         emit TriggerOpenRequested(
             requestId,
@@ -1829,25 +1805,21 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
         if (positions[key].sizeUsd == 0) revert NoOpenPosition();
         if (closePending[key]) revert CloseAlreadyPending();
 
-        // Effects.
-        closePending[key] = true;
-        requestId = nextRequestId++;
-        requests[requestId] = Request({
-            owner: msg.sender,
-            market: market,
-            isLong: isLong,
-            kind: RequestKind.Increase,
-            collateral: addCollateral,
-            leverage: addLeverage, // natural meaning (leverage applied to addCollateral)
-            acceptablePrice: acceptablePrice,
-            executionFee: EXECUTION_FEE,
-            requestTimestamp: block.timestamp,
-            active: true
-        });
-        triggers[requestId] = Trigger({triggerPrice: triggerPrice, triggerAbove: triggerAbove});
-
-        // Interaction LAST (CEI): escrow collateral + fee like an Open.
-        asset.safeTransferFrom(msg.sender, address(this), addCollateral + EXECUTION_FEE);
+        // Effects + escrow (shared tail). Increase takes the mutex (kind != Open),
+        // escrows addCollateral + fee like an Open, carries addLeverage in the
+        // leverage field in its natural sense, and writes the resting trigger gate
+        // (triggerPrice != 0).
+        requestId = _queueRequest(
+            key,
+            market,
+            isLong,
+            RequestKind.Increase,
+            addCollateral,
+            addLeverage,
+            acceptablePrice,
+            triggerPrice,
+            triggerAbove
+        );
 
         emit TriggerIncreaseRequested(
             requestId,

@@ -475,4 +475,36 @@ contract TwoStepExecutionTest is Test {
         assertEq(asset.balanceOf(address(pm)), openCollateral, "PM holds only open collateral after a cancel");
         assertEq(_sizeUsd(pm, alice, BTC, true), COL * LEV, "alice's filled position is untouched");
     }
+
+    // =====================================================================
+    // Validation-order asymmetry (order-pinning; refactor invariant)
+    //
+    // requestOpen and requestTriggerOpen check the SAME amount validations but
+    // in a DIFFERENT order: requestOpen checks collateral BEFORE acceptablePrice,
+    // requestTriggerOpen checks acceptablePrice BEFORE collateral. With BOTH
+    // inputs bad, each reverts with the FIRST check it reaches. The _queueRequest
+    // refactor leaves all validation in the wrappers, so this asymmetry must hold
+    // byte-for-byte. These pins guard that.
+    // =====================================================================
+
+    // requestOpen: bad collateral AND bad acceptablePrice -> CollateralTooLow
+    // (collateral is checked first; acceptablePrice==0 is never reached).
+    function test_requestOpen_validationOrder_collateralBeforeAcceptablePrice() public {
+        _fund(pm, alice, COL + EXECUTION_FEE);
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(PositionManager.CollateralTooLow.selector, MIN_COLLATERAL - 1, MIN_COLLATERAL)
+        );
+        pm.requestOpen(BTC, true, MIN_COLLATERAL - 1, LEV, 0);
+    }
+
+    // requestTriggerOpen: bad collateral AND bad acceptablePrice ->
+    // InvalidAcceptablePrice (acceptablePrice is checked first; the collateral
+    // check is never reached).
+    function test_requestTriggerOpen_validationOrder_acceptablePriceBeforeCollateral() public {
+        _fund(pm, alice, COL + EXECUTION_FEE);
+        vm.prank(alice);
+        vm.expectRevert(PositionManager.InvalidAcceptablePrice.selector);
+        pm.requestTriggerOpen(BTC, true, MIN_COLLATERAL - 1, LEV, 0, ENTRY * ONE8, true);
+    }
 }
