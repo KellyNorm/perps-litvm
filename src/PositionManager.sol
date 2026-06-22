@@ -465,6 +465,7 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
     error NoOpenPosition();
     error InvalidPrice();
     error ExceedsUtilization();
+    error ExceedsMaxOI();
     error PriceTooStale(uint256 priceTimestampSeconds, uint256 blockTimestamp);
     error PriceFromFuture(uint256 priceTimestampSeconds, uint256 blockTimestamp);
     error NotLiquidatable(uint256 equity, uint256 maintenance);
@@ -2183,6 +2184,20 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
             }
         }
 
+        // Per-market, per-side open-interest cap (exposure cap). Only an OI
+        // INCREASE (open or increase fill) can breach it, so the check is gated
+        // on `isOpen` — closes, decreases, and liquidations (which call here with
+        // `isOpen == false`) always pass. Cap VALUES live in the external
+        // {Governance} param store (zero local storage); a key of 0 (the default
+        // for an unconfigured market+side) DISABLES the cap, so existing markets
+        // trade unchanged until an owner sets one. Reverting here rolls back the
+        // whole execute tx, leaving the request active for cancel — consistent
+        // with the {ExceedsUtilization} solvency gate. See {_maxOiKey}.
+        if (isOpen) {
+            uint256 cap = governance.getParam(_maxOiKey(market, isLong));
+            if (cap != 0 && (isLong ? m.longSizeUsd : m.shortSizeUsd) > cap) revert ExceedsMaxOI();
+        }
+
         m.lastMarkPrice = markPrice;
 
         uint256 newUnrealized = _marketUnrealizedProfit(m);
@@ -2324,5 +2339,18 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
 
     function _requireSupportedMarket(bytes32 market) internal view {
         if (!supportedMarkets[market]) revert MarketNotSupported(market);
+    }
+
+    /**
+     * @notice Governance param-store key for a market+side open-interest cap.
+     * @dev    `keccak256(abi.encode("MAX_OI", market, isLong))`. The owner
+     *         configures a cap with `governance.setParamBounds(key, ...)` then
+     *         `governance.setParam(key, cap)`; this manager READS it at every
+     *         OI-increasing fill (see {_updateMarket}). A value of 0 disables the
+     *         cap for that side. `pure`: the key is a deterministic hash with no
+     *         storage read, so a keeper/frontend can mirror it off-chain.
+     */
+    function _maxOiKey(bytes32 market, bool isLong) internal pure returns (bytes32) {
+        return keccak256(abi.encode("MAX_OI", market, isLong));
     }
 }
