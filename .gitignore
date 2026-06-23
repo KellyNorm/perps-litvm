@@ -11,8 +11,9 @@ out/
 /broadcast/*/31337/
 /broadcast/**/dry-run/
 
-# Docs
-docs/
+# Docs (generated output ignored; hand-written design docs tracked by exception)
+docs/*
+!docs/oracle-discovery.md
 
 # Dotenv file
 .env
