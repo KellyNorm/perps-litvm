@@ -10,23 +10,30 @@
 // No Solidity changes. The keeper calls EXACTLY ONE state-changing function,
 // executeRequest — never cancelRequest, never anything that moves funds.
 //
-// DISCOVERY  Maintain the active request-id set. Backfill by walking the id
-//            counter and reconciling each id against requests(id).active (so a
-//            restart is idempotent — it rebuilds the exact live set from chain
-//            state). Stay live via the *Requested events (add) and
-//            RequestExecuted / RequestCancelled (remove); every event handler
-//            re-reads chain state through the same reconcile(), so listeners can
-//            never desync the set. A per-loop counter catch-up backstops any
-//            missed log.
+// DISCOVERY  Maintain the active request-id set. Stay live on a real WebSocket:
+//            a *Requested log -> reconcile(id) immediately (sub-second, vs up to
+//            a full loop tick on the old .on()-over-HTTP polling). RequestExecuted
+//            / RequestCancelled likewise remove. Every handler re-reads chain
+//            state through the same idempotent reconcile(), so listeners can never
+//            desync the set. catchUpCounter() walks the id counter and reconciles
+//            each id against requests(id).active — it backfills on startup, runs on
+//            a low-frequency 30s timer, and runs on every WS reconnect, so a
+//            dropped/reconnected socket can never lose a request.
 //
 // EXECUTION  by kind (a request is a TRIGGER iff triggers(id).triggerPrice != 0):
-//   - MARKET   once now >= requestTimestamp + MIN_EXECUTION_DELAY and a payload
-//              stamped past that floor exists, send executeRequest. The contract
-//              fills OR auto-cancels on slippage — we record the receipt's
-//              outcome, we don't second-guess it.
+//   - MARKET   on discovery we SCHEDULE the fill to the window-open instant:
+//              fireAt = requestTimestamp + MIN_EXECUTION_DELAY. A per-id setTimeout
+//              (sized off the chain-vs-wall clock skew tracked from newHeads) AND
+//              the newHeads stream both release the fill — newHeads fires it on the
+//              FIRST block whose timestamp crosses the floor (so the on-chain
+//              block.timestamp >= earliest check passes, no TooEarlyToExecute), and
+//              the timer is the backup if heads stall. At fire we fetch ONE fresh
+//              payload and sign+broadcast. The contract fills OR auto-cancels on
+//              slippage — we record the receipt's outcome, we don't second-guess it.
 //   - TRIGGER  each loop, STATIC-probe fillability (provider.call via the
 //              revert-decoder). Send the real executeRequest ONLY on a probe that
 //              would succeed; otherwise it's still resting — try again next loop.
+//              (Triggers stay on the loop this step; the scheduler is market-only.)
 //
 // Usage:  cd keeper && cp .env.example .env && edit .env && node keeper.mjs
 //   (reads keeper/.env via --env-file or a manual source; see README.md)
@@ -39,12 +46,20 @@ import { revertReason, staticExecuteCheck } from "./lib/revert.mjs";
 // ---- config ---------------------------------------------------------------
 const cfg = {
   rpc: process.env.LITVM_RPC_URL,
+  // WebSocket endpoint(s) for the live subscriptions (logs + newHeads). The
+  // infra-partner socket is primary; the public /ws is the fallback. Reconnects
+  // alternate between them so a dead primary falls through to the public one.
+  wsUrls: [
+    process.env.KEEPER_WS_URL || "wss://liteforge.rpc.caldera.xyz/infra-partner-ws",
+    process.env.KEEPER_WS_FALLBACK || "wss://liteforge.rpc.caldera.xyz/ws",
+  ],
   pk: process.env.KEEPER_PRIVATE_KEY,
   pmAddr: process.env.POSITION_MANAGER_ADDRESS,
   musdAddr: process.env.MUSD_ADDRESS,
   dataService: process.env.REDSTONE_DATA_SERVICE || "redstone-primary-prod",
   startBlock: process.env.START_BLOCK ? Number(process.env.START_BLOCK) : undefined,
   loopMs: process.env.KEEPER_LOOP_MS ? Number(process.env.KEEPER_LOOP_MS) : 2500,
+  catchUpMs: process.env.KEEPER_CATCHUP_MS ? Number(process.env.KEEPER_CATCHUP_MS) : 30_000,
 };
 for (const [k, v] of Object.entries({
   LITVM_RPC_URL: cfg.rpc,
@@ -59,6 +74,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const f18 = (v) => ethers.utils.formatUnits(v, 18);
 const f8 = (v) => ethers.utils.formatUnits(v, 8);
 const now = () => Math.floor(Date.now() / 1000);
+
+// Firing-window tuning. FIRE_BUFFER_MS nudges the wall-clock timer a hair past the
+// floor so it doesn't beat the crossing block; REFIRE_MS throttles repeat fire
+// attempts on one id so a post-floor revert can't busy-loop the submit path.
+const FIRE_BUFFER_MS = 150;
+const REFIRE_MS = 1000;
 
 // ---- structured per-id logging --------------------------------------------
 // One tagged line per id, with de-duplication on the steady-state phases
@@ -77,7 +98,8 @@ function logSys(msg) {
 // Pure observation — no behavior change. Each active entry carries an `t` object
 // of wall-clock-ms stamps captured the FIRST time each stage is reached:
 //   seen        — discovered into the active set (reconcile)
-//   windowOpen  — first tick where blockTs >= requestTs + MIN_EXECUTION_DELAY
+//   windowOpen  — the delay window opened (market: the fire instant; trigger: the
+//                 first tick blockTs >= floor)
 //   payload     — a usable RedStone payload (market: pkg ts past the floor;
 //                 trigger: static-probe says fillable) is in hand
 //   submitted   — executeRequest broadcast (tx hash returned)
@@ -96,6 +118,9 @@ function logTiming(entry) {
 }
 
 async function main() {
+  // Reads and sends stay on the proven HTTP provider; only the live subscriptions
+  // (logs + newHeads) move to a WebSocket. Keeping the wallet on HTTP means the
+  // submit hot path is unchanged from STEP 2.
   const provider = new ethers.providers.JsonRpcProvider(cfg.rpc);
   const wallet = new ethers.Wallet(cfg.pk, provider);
   const pm = new ethers.Contract(cfg.pmAddr, PM_ABI, wallet);
@@ -112,22 +137,35 @@ async function main() {
   logSys(`PositionManager:   ${cfg.pmAddr}`);
   logSys(`chainId:           ${net.chainId}   data service: ${cfg.dataService}`);
   logSys(`MIN_EXEC_DELAY:    ${MIN_DELAY}s     EXECUTION_FEE: ${f18(EXEC_FEE)} mUSD`);
+  logSys(`WS endpoints:      ${cfg.wsUrls.join("  |  ")}`);
   logSys(`keeper zkLTC:      ${ethers.utils.formatEther(startZkltc)}`);
   logSys(`keeper mUSD:       ${f18(startMusd)}`);
   logSys("================================================================");
 
   // ---- active request-id set ----------------------------------------------
-  // id(string) -> { id, req, isTrigger, feed, phase } ; `phase` is the last
-  // logged steady-state so we only re-log on change.
+  // id(string) -> { id, req, isTrigger, feed, phase, earliest, fireTimer, firing,
+  // lastFireMs, t } ; `phase` is the last logged steady-state so we only re-log on
+  // change. `fireTimer`/`firing`/`lastFireMs` drive the market scheduler.
   const active = new Map();
   const inFlight = new Set(); // ids with a tx mid-flight — never double-submit
   let feesEarned = ethers.constants.Zero; // cumulative this session
   let fills = 0;
   let scanCursor = 0; // next id not yet walked by the counter catch-up
 
+  // ---- chain clock from newHeads ------------------------------------------
+  // The contract gates fills on block.timestamp, so we track the chain clock from
+  // the newHeads stream and estimate "chain now" between blocks off the wall clock.
+  // Seeded from a getBlock at startup; refreshed on every head.
+  let lastHead = null; // { num, tsSec, wallMs }
+  function estChainNow() {
+    if (!lastHead) return now();
+    return lastHead.tsSec + (Date.now() - lastHead.wallMs) / 1000;
+  }
+
   // Read chain state for one id and (re)concile it into the active set. This is
-  // the single source of truth: events and the counter catch-up both funnel
-  // through here, so the set can never drift from requests(id).active.
+  // the single source of truth: WS events and the counter catch-up both funnel
+  // through here, so the set can never drift from requests(id).active. On first
+  // discovery of a MARKET request it arms the window-open schedule.
   async function reconcile(id) {
     const key = id.toString();
     if (inFlight.has(key)) return; // a fill is settling; let it finish first
@@ -139,6 +177,8 @@ async function main() {
       return;
     }
     if (!req.active) {
+      const e = active.get(key);
+      if (e && e.fireTimer) clearTimeout(e.fireTimer);
       if (active.delete(key)) logId(key, "removed", "no longer active on-chain");
       return;
     }
@@ -149,24 +189,39 @@ async function main() {
     const feed = feedOf(req.market);
     if (!active.has(key)) {
       const kind = ["Open", "Close", "Decrease", "Increase"][req.kind] ?? `kind${req.kind}`;
-      active.set(key, { id, req, isTrigger, feed, phase: null, t: { seen: Date.now() } });
+      const entry = {
+        id,
+        req,
+        isTrigger,
+        feed,
+        phase: null,
+        earliest: req.requestTimestamp.toNumber() + MIN_DELAY,
+        fireTimer: null,
+        firing: false,
+        lastFireMs: 0,
+        t: { seen: Date.now() },
+      };
+      active.set(key, entry);
       logId(
         key,
         "discovered",
         `${isTrigger ? "TRIGGER" : "MARKET"} ${kind} ${req.isLong ? "long" : "short"} ${feed}` +
           ` (owner ${req.owner.slice(0, 10)}…, requestTs ${req.requestTimestamp})`,
       );
+      if (!isTrigger) scheduleMarket(entry); // triggers stay on the loop this step
     } else {
       const e = active.get(key);
       e.req = req;
       e.isTrigger = isTrigger;
       e.feed = feed;
+      e.earliest = req.requestTimestamp.toNumber() + MIN_DELAY;
+      if (!isTrigger && !e.fireTimer && !e.firing && !inFlight.has(key)) scheduleMarket(e);
     }
   }
 
   // Catch the counter up: reconcile every id created since the last walk. This
-  // is the backfill (from 0 on a cold start, or START_BLOCK-independent) AND the
-  // per-loop backstop for any *Requested log the listener might have missed.
+  // is the backfill (from 0 on a cold start) AND the low-frequency backstop for
+  // any *Requested log the WS listener might have missed or dropped on reconnect.
   async function catchUpCounter() {
     let next;
     try {
@@ -179,29 +234,91 @@ async function main() {
     scanCursor = next;
   }
 
-  // ---- live event wiring --------------------------------------------------
-  // Every *Requested event adds; RequestExecuted / RequestCancelled remove. Each
-  // handler just re-reads chain state via reconcile(), so listeners stay
-  // authoritative even under reorgs or duplicate deliveries.
-  const REQUESTED = [
-    "OpenRequested",
-    "CloseRequested",
-    "DecreaseRequested",
-    "IncreaseRequested",
-    "TriggerOpenRequested",
-    "TriggerCloseRequested",
-    "TriggerDecreaseRequested",
-    "TriggerIncreaseRequested",
-  ];
-  for (const ev of REQUESTED) {
-    pm.on(ev, (requestId) => {
-      reconcile(requestId).catch((e) => logSys(`reconcile(${requestId}) failed: ${e.message}`));
-    });
+  // ---- market window-open scheduler ---------------------------------------
+  // On discovery, arm a per-id timer for fireAt = requestTimestamp + MIN_DELAY,
+  // sized off the chain-vs-wall skew. The timer is the BACKUP; the newHeads stream
+  // (onNewHead) is the precise primary — it releases the fill on the first block
+  // that crosses the floor, so the on-chain block.timestamp check passes. Both call
+  // fireMarket(), which is idempotent (the `firing`/inFlight/throttle guards make a
+  // double release harmless).
+  function scheduleMarket(entry) {
+    if (entry.isTrigger) return;
+    const key = entry.id.toString();
+    if (entry.fireTimer) {
+      clearTimeout(entry.fireTimer);
+      entry.fireTimer = null;
+    }
+    const waitMs = Math.max(0, (entry.earliest - estChainNow()) * 1000 + FIRE_BUFFER_MS);
+    if (waitMs <= 0) {
+      fireMarket(entry, "past-floor");
+      return;
+    }
+    if (entry.phase !== "scheduled") {
+      logId(key, "scheduled", `fire in ${(waitMs / 1000).toFixed(2)}s (floor ${entry.earliest})`);
+      entry.phase = "scheduled";
+    }
+    entry.fireTimer = setTimeout(() => fireMarket(entry, "timer"), waitMs);
   }
-  for (const ev of ["RequestExecuted", "RequestCancelled"]) {
-    pm.on(ev, (requestId) => {
-      reconcile(requestId).catch((e) => logSys(`reconcile(${requestId}) failed: ${e.message}`));
-    });
+
+  // Fire one MARKET request: fetch ONE fresh payload and run the STEP-2 hot path
+  // (build -> sign -> broadcast). Guards make it safe to call from the timer, the
+  // newHeads release, and the loop backstop at once. If released a hair early (wall
+  // clock ahead of chain) or the payload isn't yet stamped past the floor, it
+  // re-arms a short bounded retry instead of eating a TooEarlyToExecute revert.
+  async function fireMarket(entry, via) {
+    const key = entry.id.toString();
+    if (!active.has(key) || entry.isTrigger) return;
+    if (entry.firing || inFlight.has(key)) return;
+    if (entry.lastFireMs && Date.now() - entry.lastFireMs < REFIRE_MS) return;
+    if (entry.fireTimer) {
+      clearTimeout(entry.fireTimer);
+      entry.fireTimer = null;
+    }
+    // Floor guard: only proceed once the chain clock has reached the window. A
+    // timer that beat the crossing block re-arms for the residual.
+    if (estChainNow() < entry.earliest) {
+      const waitMs = Math.max(50, (entry.earliest - estChainNow()) * 1000 + FIRE_BUFFER_MS);
+      entry.fireTimer = setTimeout(() => fireMarket(entry, "rearm"), waitMs);
+      return;
+    }
+    entry.firing = true;
+    entry.lastFireMs = Date.now();
+    entry.t.windowOpen ??= Date.now(); // window has opened — we are acting on it
+    try {
+      // ONE fetch: read the package timestamp for the freshness gate AND hold the
+      // package to inject calldata — no second requestDataPackages on the submit path.
+      const { pkgs, ts: pkgTs } = await fetchPackages(cfg.dataService, entry.feed);
+      if (pkgTs < entry.earliest) {
+        // Payload not yet stamped past the floor (clock skew) — brief bounded retry.
+        if (entry.phase !== "waiting-payload") {
+          logId(key, "waiting-payload", `need ${entry.feed} pkg ts >= ${entry.earliest}, have ${pkgTs}`);
+          entry.phase = "waiting-payload";
+        }
+        entry.firing = false;
+        entry.lastFireMs = 0; // self-scheduled retry — exempt from the refire throttle
+        entry.fireTimer = setTimeout(() => fireMarket(entry, "pkg-retry"), 500);
+        return;
+      }
+      entry.t.payload ??= Date.now(); // fresh-enough package obtained
+      const txReq = await buildTx(entry, pkgs);
+      await execute(entry, txReq); // owns inFlight + re-reconciles (drops if filled)
+    } catch (err) {
+      logId(key, "errored", `fire(${via}) failed (transient): ${err.message}`);
+    } finally {
+      entry.firing = false;
+    }
+  }
+
+  // ---- newHeads handler ---------------------------------------------------
+  // Update the chain clock and release any market past its floor on the FIRST
+  // block that crosses it (precise, sub-block-time latency, no TooEarly revert).
+  function onNewHead(num, tsSec) {
+    if (lastHead && num <= lastHead.num) return; // ignore out-of-order/dup
+    lastHead = { num, tsSec, wallMs: Date.now() };
+    for (const entry of active.values()) {
+      if (entry.isTrigger || entry.firing || inFlight.has(entry.id.toString())) continue;
+      if (tsSec >= entry.earliest) fireMarket(entry, "newHead");
+    }
   }
 
   // ---- sequential nonce manager -------------------------------------------
@@ -298,9 +415,10 @@ async function main() {
         //            re-ready so the retry re-estimates. (Neither hit in test fills.)
         const reason = revertReason(pm.interface, err);
         const stale = /Timestamp|Stale|TooOld|TooLongFuture/i.test(reason);
-        const repriceRegas = /out of gas|intrinsic gas|gas required exceeds|underpriced|max fee per gas|fee too low/i.test(
-          reason,
-        );
+        const repriceRegas =
+          /out of gas|intrinsic gas|gas required exceeds|underpriced|max fee per gas|fee too low/i.test(
+            reason,
+          );
         if (!stale && !repriceRegas) throw err;
         logId(key, "submit-retry", `${stale ? "stale pkg" : "reprice/regas"} (${reason})`);
         cachedGasLimit = null; // force a fresh estimate
@@ -374,110 +492,188 @@ async function main() {
     }
   }
 
-  // Decide and act on one active request this tick.
-  async function process(entry, blockTs) {
+  // Decide and act on one resting TRIGGER this tick. (Markets are scheduler-driven
+  // now; this is the unchanged STEP-2 trigger path, still on the loop this step.)
+  async function processTrigger(entry, blockTs) {
     const key = entry.id.toString();
     if (inFlight.has(key)) return;
-    const earliest = entry.req.requestTimestamp.toNumber() + MIN_DELAY;
-    if (blockTs >= earliest) entry.t.windowOpen ??= Date.now(); // delay window has opened
+    if (blockTs >= entry.earliest) entry.t.windowOpen ??= Date.now(); // delay window opened
 
-    if (entry.isTrigger) {
-      // Resting order: never blind-send. Static-probe fillability first.
-      if (blockTs < earliest) {
-        if (entry.phase !== "waiting-delay") {
-          logId(key, "waiting-delay", `trigger min-delay until ${earliest}`);
-          entry.phase = "waiting-delay";
-        }
-        return;
-      }
-      // Fetch the package ONCE, build the payload-bearing tx, and probe with it.
-      // On a fillable probe we reuse that exact tx for the real send — no second
-      // RedStone fetch, no re-populate.
-      let txReq, probe;
-      try {
-        const { pkgs } = await fetchPackages(cfg.dataService, entry.feed);
-        txReq = await buildTx(entry, pkgs);
-        probe = await staticExecuteCheck(provider, pm.interface, txReq, wallet.address);
-      } catch (err) {
-        logId(key, "errored", `static probe failed (transient): ${err.message}`);
-        return;
-      }
-      if (probe.ok) {
-        entry.phase = "fillable";
-        entry.t.payload ??= Date.now(); // probe-fillable ⇒ a usable payload is in hand
-        await execute(entry, txReq);
-      } else if (entry.phase !== "not-met") {
-        logId(key, "not-met", probe.reason);
-        entry.phase = "not-met";
-      }
-      return;
-    }
-
-    // MARKET order: wait out the delay, then require a payload past the floor.
-    if (blockTs < earliest) {
+    // Resting order: never blind-send. Static-probe fillability first.
+    if (blockTs < entry.earliest) {
       if (entry.phase !== "waiting-delay") {
-        logId(key, "waiting-delay", `min-delay until ${earliest} (now ${blockTs})`);
+        logId(key, "waiting-delay", `trigger min-delay until ${entry.earliest}`);
         entry.phase = "waiting-delay";
       }
       return;
     }
-    // ONE fetch: read the package timestamp for the freshness gate AND hold the
-    // package itself. The same package is reused to build the executeRequest
-    // calldata below — no second requestDataPackages round-trip on the submit path.
-    let pkgs, pkgTs;
+    // Fetch the package ONCE, build the payload-bearing tx, and probe with it.
+    // On a fillable probe we reuse that exact tx for the real send — no second
+    // RedStone fetch, no re-populate.
+    let txReq, probe;
     try {
-      ({ pkgs, ts: pkgTs } = await fetchPackages(cfg.dataService, entry.feed));
-    } catch (err) {
-      logId(key, "errored", `payload fetch failed (transient): ${err.message}`);
-      return;
-    }
-    if (pkgTs < earliest) {
-      if (entry.phase !== "waiting-payload") {
-        logId(key, "waiting-payload", `need ${entry.feed} pkg ts >= ${earliest}, have ${pkgTs}`);
-        entry.phase = "waiting-payload";
-      }
-      return;
-    }
-    entry.t.payload ??= Date.now(); // fresh-enough package obtained
-    // Pre-build the tx now (package in hand) so execute()'s critical path is just
-    // sign + broadcast.
-    let txReq;
-    try {
+      const { pkgs } = await fetchPackages(cfg.dataService, entry.feed);
       txReq = await buildTx(entry, pkgs);
+      probe = await staticExecuteCheck(provider, pm.interface, txReq, wallet.address);
     } catch (err) {
-      logId(key, "errored", `tx build failed (transient): ${err.message}`);
+      logId(key, "errored", `static probe failed (transient): ${err.message}`);
       return;
     }
-    await execute(entry, txReq);
+    if (probe.ok) {
+      entry.phase = "fillable";
+      entry.t.payload ??= Date.now(); // probe-fillable ⇒ a usable payload is in hand
+      await execute(entry, txReq);
+    } else if (entry.phase !== "not-met") {
+      logId(key, "not-met", probe.reason);
+      entry.phase = "not-met";
+    }
   }
 
-  // ---- startup backfill ---------------------------------------------------
+  // ---- live WS wiring (logs + newHeads), with reconnect -------------------
+  // Subscriptions live on a WebSocket; reads/sends stay on HTTP. A *Requested log
+  // -> reconcile immediately; RequestExecuted / RequestCancelled likewise remove.
+  // On a socket close we tear down, alternate to the fallback URL, reconnect, and
+  // run catchUpCounter() to backfill any gap. Market timers live in-process, so a
+  // WS outage never loses a scheduled fill — the socket only sharpens the trigger.
+  const REQUESTED = [
+    "OpenRequested",
+    "CloseRequested",
+    "DecreaseRequested",
+    "IncreaseRequested",
+    "TriggerOpenRequested",
+    "TriggerCloseRequested",
+    "TriggerDecreaseRequested",
+    "TriggerIncreaseRequested",
+  ];
+  let wsProvider = null;
+  let pmWs = null;
+  let wsTries = 0;
+  let reconnecting = false;
+
+  function teardownWs() {
+    const w = wsProvider;
+    wsProvider = null;
+    try {
+      if (pmWs) pmWs.removeAllListeners();
+    } catch {}
+    pmWs = null;
+    // Strip the raw socket listeners BEFORE destroy() so its own close event can't
+    // re-enter our close handler and double-schedule a reconnect.
+    try {
+      w?._websocket?.removeAllListeners();
+    } catch {}
+    try {
+      w?.destroy();
+    } catch {}
+  }
+
+  function scheduleReconnect() {
+    if (reconnecting) return;
+    reconnecting = true;
+    const delay = Math.min(1000 * (wsTries + 1), 15_000);
+    setTimeout(async () => {
+      reconnecting = false;
+      wsTries++;
+      logSys(`WS reconnect attempt ${wsTries}…`);
+      setupWs();
+      // Gap backfill: any *Requested logs missed while the socket was down are
+      // recovered by walking the id counter (chain state is authoritative).
+      await catchUpCounter().catch((e) => logSys(`reconnect catch-up failed: ${e.message}`));
+    }, delay);
+  }
+
+  function setupWs() {
+    const url = cfg.wsUrls[wsTries % cfg.wsUrls.length];
+    try {
+      wsProvider = new ethers.providers.WebSocketProvider(url);
+    } catch (e) {
+      logSys(`WS create failed (${url}): ${e.message}`);
+      scheduleReconnect();
+      return;
+    }
+    pmWs = new ethers.Contract(cfg.pmAddr, PM_ABI, wsProvider);
+    for (const ev of REQUESTED) {
+      pmWs.on(ev, (requestId) => {
+        reconcile(requestId).catch((e) => logSys(`reconcile(${requestId}) failed: ${e.message}`));
+      });
+    }
+    for (const ev of ["RequestExecuted", "RequestCancelled"]) {
+      pmWs.on(ev, (requestId) => {
+        reconcile(requestId).catch((e) => logSys(`reconcile(${requestId}) failed: ${e.message}`));
+      });
+    }
+    // newHeads with the full header (timestamp) so we can release fills on the
+    // crossing block without a per-block getBlock RPC.
+    wsProvider._subscribe("keeperHeads", ["newHeads"], (header) => {
+      try {
+        onNewHead(
+          ethers.BigNumber.from(header.number).toNumber(),
+          ethers.BigNumber.from(header.timestamp).toNumber(),
+        );
+      } catch {}
+    });
+    const sock = wsProvider._websocket;
+    sock.on("open", () => {
+      wsTries = 0; // healthy — reset the URL rotation / backoff
+      logSys(`WS connected: ${url}`);
+    });
+    sock.on("close", (code) => {
+      logSys(`WS closed (code ${code}) — tearing down + reconnecting`);
+      teardownWs();
+      scheduleReconnect();
+    });
+    sock.on("error", (err) => {
+      logSys(`WS error: ${err.message || err}`);
+    });
+  }
+
+  // ---- startup ------------------------------------------------------------
   if (cfg.startBlock !== undefined) {
     logSys(`START_BLOCK=${cfg.startBlock} set — live listeners attach from current head;`);
     logSys(`backfill walks the id counter (chain state is authoritative & idempotent).`);
+  }
+  // Seed the chain clock before scheduling anything off it.
+  try {
+    const b = await provider.getBlock("latest");
+    lastHead = { num: b.number, tsSec: b.timestamp, wallMs: Date.now() };
+  } catch (err) {
+    logSys(`initial getBlock failed (will seed from newHeads): ${err.message}`);
   }
   logSys("backfilling active requests from the id counter…");
   await catchUpCounter();
   logSys(`backfill complete — ${active.size} active request(s).`);
 
+  setupWs(); // attach the live WS subscriptions
+  setInterval(() => {
+    catchUpCounter().catch((e) => logSys(`periodic catch-up failed: ${e.message}`));
+  }, cfg.catchUpMs).unref?.(); // low-frequency backstop for any missed log
+
   // ---- main loop ----------------------------------------------------------
+  // Triggers run their per-tick static probe here (unchanged). Markets are
+  // scheduler-driven (timer + newHeads); the loop only acts as a post-floor
+  // backstop for them, so a stalled timer AND a dead socket can't strand a fill.
   let tick = 0;
-  let backoff = 0;
   for (;;) {
     try {
-      await catchUpCounter(); // discover new ids + backstop missed logs
-      const blockTs = (await provider.getBlock("latest")).timestamp;
+      const blockTs = Math.floor(estChainNow());
       // Snapshot to avoid mutating the map mid-iteration (execute() reconciles).
       for (const entry of [...active.values()]) {
-        await process(entry, blockTs);
+        if (entry.isTrigger) {
+          await processTrigger(entry, blockTs);
+        } else if (
+          blockTs >= entry.earliest &&
+          !entry.firing &&
+          !entry.fireTimer &&
+          !inFlight.has(entry.id.toString())
+        ) {
+          await fireMarket(entry, "loop-backstop");
+        }
       }
-      backoff = 0;
     } catch (err) {
-      backoff = Math.min(backoff + 1, 5);
-      logSys(`loop error (backoff x${backoff}): ${err.message}`);
+      logSys(`loop error: ${err.message}`);
     }
 
-    // Heartbeat every ~10 ticks, or whenever idle so the operator sees liveness.
+    // Heartbeat every ~10 ticks so the operator sees liveness.
     if (tick % 10 === 0) {
       try {
         const bal = await provider.getBalance(wallet.address);
@@ -486,12 +682,13 @@ async function main() {
         logSys(
           `heartbeat — active ${active.size}, in-flight ${inFlight.size}, fills ${fills}, ` +
             `fees earned ${f18(feesEarned)} mUSD | keeper zkLTC ${ethers.utils.formatEther(bal)}, ` +
-            `mUSD ${f18(mb)}${mark ? `, BTC ${f8(mark.price1e8)}` : ""}`,
+            `mUSD ${f18(mb)}${mark ? `, BTC ${f8(mark.price1e8)}` : ""}` +
+            `${lastHead ? ` | head #${lastHead.num}` : ""}`,
         );
       } catch {}
     }
     tick++;
-    await sleep(cfg.loopMs * (1 + backoff)); // linear backoff on sustained errors
+    await sleep(cfg.loopMs);
   }
 }
 

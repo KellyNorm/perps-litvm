@@ -23,3 +23,6 @@ node_modules/
 
 # Review-artifact diffs
 *.diff
+
+# Keeper measurement / run logs (telemetry artifacts, not source)
+keeper/logs/

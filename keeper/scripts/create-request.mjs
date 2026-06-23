@@ -2,7 +2,9 @@
 // to fill. This is the smoke's "request" step with the "execute" step removed, so
 // the keeper is demonstrably the party that calls executeRequest.
 //
-// Plays the TRADER with DEPLOYER_PRIVATE_KEY (mints/approves mUSD as needed) and
+// Plays the TRADER with TRADER_PRIVATE_KEY (falls back to DEPLOYER_PRIVATE_KEY)
+// — a DEDICATED trader account, separate from the keeper, so the keeper can run
+// continuously with no shared-nonce race. It mints/approves mUSD as needed and
 // sends a plain request* call — NO RedStone payload, exactly what a trader signs.
 // Prints the assigned requestId, then exits. Run the keeper separately to watch
 // it discover and fill (or rest) this id.
@@ -16,8 +18,8 @@
 //   trigger-open  resting trigger-open long (far above)   -> keeper leaves resting
 //   trigger-close resting trigger-close long (not met)    -> keeper leaves resting
 //
-// Env: LITVM_RPC_URL, DEPLOYER_PRIVATE_KEY, POSITION_MANAGER_ADDRESS,
-//      MUSD_ADDRESS, REDSTONE_DATA_SERVICE.
+// Env: LITVM_RPC_URL, TRADER_PRIVATE_KEY (or DEPLOYER_PRIVATE_KEY),
+//      POSITION_MANAGER_ADDRESS, MUSD_ADDRESS, REDSTONE_DATA_SERVICE.
 
 import { ethers } from "ethers";
 import { PM_ABI, ERC20_ABI } from "../lib/abi.mjs";
@@ -33,12 +35,15 @@ const pct = (P, n) => P.mul(n).div(100);
 
 async function main() {
   const rpc = process.env.LITVM_RPC_URL;
-  const pk = process.env.DEPLOYER_PRIVATE_KEY;
+  // Dedicated trader account, separate from the keeper. Falls back to the deployer
+  // key for backward compat, but the keeper-smoothness measurement REQUIRES a
+  // distinct key so a continuously-running keeper shares no nonce sequence.
+  const pk = process.env.TRADER_PRIVATE_KEY || process.env.DEPLOYER_PRIVATE_KEY;
   const pmAddr = process.env.POSITION_MANAGER_ADDRESS;
   const musdAddr = process.env.MUSD_ADDRESS;
   for (const [k, v] of Object.entries({
     LITVM_RPC_URL: rpc,
-    DEPLOYER_PRIVATE_KEY: pk,
+    "TRADER_PRIVATE_KEY (or DEPLOYER_PRIVATE_KEY)": pk,
     POSITION_MANAGER_ADDRESS: pmAddr,
     MUSD_ADDRESS: musdAddr,
   })) {
@@ -47,6 +52,9 @@ async function main() {
 
   const provider = new ethers.providers.JsonRpcProvider(rpc);
   const trader = new ethers.Wallet(pk, provider);
+  console.log(
+    `trader key source: ${process.env.TRADER_PRIVATE_KEY ? "TRADER_PRIVATE_KEY" : "DEPLOYER_PRIVATE_KEY (fallback)"}`,
+  );
   const pm = new ethers.Contract(pmAddr, PM_ABI, trader);
   const musd = new ethers.Contract(musdAddr, ERC20_ABI, trader);
   const market = ethers.utils.formatBytes32String(FEED);
