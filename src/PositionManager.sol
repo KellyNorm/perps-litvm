@@ -14,6 +14,18 @@ import {
 import {LiquidityPool} from "./LiquidityPool.sol";
 import {Governance} from "./Governance.sol";
 
+/// @dev Minimal Chainlink-AggregatorV3 surface for the SECONDARY oracle the circuit
+///      breaker reads (e.g. DIA's per-asset adapters on LitVM). Only the two getters
+///      the breaker needs; the live read is done via a wrapped staticcall so a
+///      reverting/garbage feed can never propagate (see {PositionManager._readSecondary}).
+interface IAggregatorV3 {
+    function latestRoundData()
+        external
+        view
+        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+    function decimals() external view returns (uint8);
+}
+
 /**
  * @title PositionManager
  * @notice Perpetual position engine for the GMX-style perps DEX. Traders
@@ -456,6 +468,24 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
     ///      completely unaffected.
     uint256 private _minExecutionTimestamp;
 
+    // --- oracle circuit-breaker (secondary divergence bound) -------------
+
+    /// @notice Per-market SECONDARY price feed the circuit breaker reads as an
+    ///         independent divergence bound. NEVER an execution/liquidation price —
+    ///         RedStone stays the sole primary mark. `feed == address(0)` (the
+    ///         default for every market) disables the breaker for that market, so
+    ///         existing markets are unaffected until an owner wires one. `decimals`
+    ///         is read once from the feed at {setSecondaryFeed} and stored, so the
+    ///         hot path never re-reads it; the breaker normalizes the secondary
+    ///         answer to the internal 1e8 scale per-feed (DIA 18-dec, LitOracle
+    ///         8-dec) using it.
+    struct SecondaryFeed {
+        address feed;
+        uint8 decimals;
+    }
+
+    mapping(bytes32 => SecondaryFeed) internal secondaryFeed;
+
     // --- errors ----------------------------------------------------------
 
     error MarketNotSupported(bytes32 market);
@@ -487,6 +517,10 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
 
     // governance pause (PR-9)
     error Paused();
+
+    // oracle circuit-breaker
+    error BreakerTripped(uint256 primary, uint256 secondary, uint256 bandBps);
+    error SecondaryDecimalsTooHigh(uint8 decimals);
 
     // --- events ----------------------------------------------------------
 
@@ -704,6 +738,18 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
     event MarketAdded(bytes32 indexed market);
     event MarketRemoved(bytes32 indexed market);
 
+    // oracle circuit-breaker
+    /// @notice The secondary was unavailable/zero/future-stamped or older than the
+    ///         staleness window — the breaker ABSTAINED and proceeded on the primary.
+    event BreakerAbstained(bytes32 indexed market, uint256 primary);
+    /// @notice A fresh secondary diverged from the primary beyond the band. Emitted
+    ///         on EVERY over-band detection (it persists on the non-halting paths —
+    ///         e.g. observe-only liquidation; on a gated OPEN/INCREASE the tx then
+    ///         reverts {BreakerTripped} and this event is rolled back with it).
+    event Divergence(bytes32 indexed market, uint256 primary, uint256 secondary);
+    /// @notice A market's secondary feed was set (or cleared when `feed` == 0).
+    event SecondaryFeedSet(bytes32 indexed market, address feed, uint8 decimals);
+
     /**
      * @param pool_       The deployed {LiquidityPool} counterparty.
      * @param governance_ External {Governance} the manager reads for the global
@@ -795,6 +841,105 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
     function removeMarket(bytes32 market) external onlyOwner {
         supportedMarkets[market] = false;
         emit MarketRemoved(market);
+    }
+
+    // --- oracle circuit-breaker (additive; dormant until configured) -----
+    //
+    // RedStone stays the SOLE primary execution mark (already signature-, staleness-
+    // (<=MAX_PRICE_AGE) and anti-front-run-validated by {validateTimestamp}). The
+    // breaker layers an INDEPENDENT secondary divergence bound on top: it reads a
+    // per-market secondary feed (e.g. DIA) and, if that secondary is FRESH and
+    // diverges from the primary beyond a governed band, it halts RISK-ADDING fills.
+    // The secondary is NEVER used as a price — only as a sanity bound.
+    //
+    // Thresholds live in the {Governance} param store (same pattern as the exposure
+    // caps), packed into one value per market: low 128 bits = divergence band (bps),
+    // high 128 bits = secondary staleness window (seconds). A band of 0 (the default
+    // for every market) DISABLES the breaker, so existing markets are unaffected.
+
+    /**
+     * @notice Owner-set the per-market SECONDARY divergence feed (Chainlink
+     *         AggregatorV3-shaped). Reads `decimals()` ONCE and stores it so the hot
+     *         path never re-reads it. `feed == address(0)` clears it (breaker off for
+     *         that market). Owner-only — same registry-config scope as {addMarket};
+     *         it grants no control over funds or the primary price.
+     * @dev    Rejects a feed reporting more than 18 decimals so per-feed
+     *         normalization to the internal 1e8 scale can never overflow. The feed
+     *         is only ever read via {_readSecondary}'s wrapped staticcall.
+     */
+    function setSecondaryFeed(bytes32 market, address feed) external onlyOwner {
+        if (feed == address(0)) {
+            delete secondaryFeed[market];
+            emit SecondaryFeedSet(market, address(0), 0);
+            return;
+        }
+        uint8 dec = IAggregatorV3(feed).decimals();
+        if (dec > 18) revert SecondaryDecimalsTooHigh(dec);
+        secondaryFeed[market] = SecondaryFeed({feed: feed, decimals: dec});
+        emit SecondaryFeedSet(market, feed, dec);
+    }
+
+    // Param-store keys (mirror off-chain to configure via Governance):
+    //   thresholds (per market): keccak256(abi.encode("CB_PARAMS", market))
+    //     value packs (stalenessSeconds << 128) | bandBps; bandBps == 0 disables.
+    //   liquidation gate (global): keccak256(abi.encode("CB_GATE_LIQ"))
+    //     value 0 (default) ⇒ liquidation path is OBSERVE-ONLY (never reverts);
+    //     non-zero ⇒ a fresh divergence also halts liquidations (off today).
+
+    /**
+     * @dev The breaker check, called at BOTH oracle-read seams with the already-
+     *      validated primary `primary1e8`. Dormant unless a band AND a feed are set
+     *      (the default for every market ⇒ zero behavior change). ABSTAIN (proceed on
+     *      primary, emit {BreakerAbstained}) when the secondary is unavailable / zero
+     *      / future-stamped / older than the window — a sleepy or broken secondary
+     *      never halts anything. On a FRESH over-band divergence it emits {Divergence}
+     *      and, if gating applies, reverts {BreakerTripped}.
+     *
+     *      The secondary is read via a WRAPPED staticcall: a revert, no-code address,
+     *      short/garbage return, or non-positive answer all surface as abstain (never
+     *      a propagated revert) — this is what guarantees the liquidation path can
+     *      never be blocked by a failed/reverting secondary.
+     *
+     *      Gating by caller: `isLiquidation == false` (OPEN/INCREASE fills) ALWAYS
+     *      gate (revert on trip, rolling back the fill — request stays active, self-
+     *      heals on reconvergence). `isLiquidation == true` gates ONLY if the global
+     *      CB_GATE_LIQ flag is set (default 0 ⇒ observe-only, never reverts).
+     */
+    function _checkBreaker(bytes32 market, uint256 primary1e8, bool isLiquidation) internal {
+        uint256 packed = governance.getParam(keccak256(abi.encode("CB_PARAMS", market)));
+        uint256 bandBps = packed & type(uint128).max;
+        if (bandBps == 0) return; // disabled for this market
+
+        SecondaryFeed memory sf = secondaryFeed[market];
+        if (sf.feed == address(0)) return; // no secondary wired
+
+        // Wrapped read: success+>=160 bytes+positive answer, else abstain.
+        (bool success, bytes memory data) =
+            sf.feed.staticcall(abi.encodeWithSelector(IAggregatorV3.latestRoundData.selector));
+        int256 answer;
+        uint256 updatedAt;
+        if (success && data.length >= 160) {
+            (, answer,, updatedAt,) = abi.decode(data, (uint80, int256, uint256, uint256, uint80));
+        }
+        uint256 maxAge = packed >> 128;
+        if (answer <= 0 || updatedAt > block.timestamp || block.timestamp - updatedAt > maxAge) {
+            emit BreakerAbstained(market, primary1e8);
+            return; // abstain — proceed on the validated primary
+        }
+
+        // Normalize the secondary to the internal 1e8 scale (per-feed; dec <= 18 by
+        // {setSecondaryFeed} so neither branch overflows).
+        uint256 secondary1e8 = uint256(answer);
+        if (sf.decimals > 8) secondary1e8 /= 10 ** (sf.decimals - 8);
+        else if (sf.decimals < 8) secondary1e8 *= 10 ** (8 - sf.decimals);
+
+        uint256 diff = primary1e8 > secondary1e8 ? primary1e8 - secondary1e8 : secondary1e8 - primary1e8;
+        // |primary - secondary| / secondary > band, as a cross-multiply (no division).
+        if (diff * BPS_DENOMINATOR > bandBps * secondary1e8) {
+            emit Divergence(market, primary1e8, secondary1e8);
+            bool gate = isLiquidation ? (governance.getParam(keccak256(abi.encode("CB_GATE_LIQ"))) != 0) : true;
+            if (gate) revert BreakerTripped(primary1e8, secondary1e8, bandBps);
+        }
     }
 
     // --- trading ---------------------------------------------------------
@@ -1240,6 +1385,12 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
 
         uint256 exitPrice = getOracleNumericValueFromTxMsg(market);
         if (exitPrice == 0) revert InvalidPrice();
+
+        // Oracle circuit-breaker — OBSERVE-ONLY on the liquidation path by default.
+        // The secondary read is wrapped (staticcall) and, with the global gate flag
+        // unset, this can at most emit {Divergence}; it can NEVER revert. Solvency is
+        // never blocked by a stale/failed/diverging secondary.
+        _checkBreaker(market, exitPrice, true);
 
         // Uncapped P&L: solvency must see the true deficit, including any loss
         // beyond collateral that the close path would have floored.
@@ -1873,6 +2024,14 @@ contract PositionManager is PrimaryProdDataServiceConsumerBase, ReentrancyGuard,
         uint256 price = getOracleNumericValueFromTxMsg(r.market);
         _minExecutionTimestamp = 0;
         if (price == 0) revert InvalidPrice();
+
+        // Oracle circuit-breaker — gate only the RISK-ADDING fills. A fresh secondary
+        // diverging beyond the band reverts the whole tx (request stays active for
+        // cancel/retry; self-heals when the feeds reconverge). CLOSE/DECREASE are
+        // de-risking and are intentionally never gated, so users can always exit.
+        if (r.kind == RequestKind.Open || r.kind == RequestKind.Increase) {
+            _checkBreaker(r.market, price, false);
+        }
 
         // Effect first (CEI): the request is consumed regardless of the outcome.
         requests[requestId].active = false;
