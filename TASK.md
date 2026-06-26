@@ -20,11 +20,23 @@ Claude Code: read `CLAUDE.md`, then this file. Work **ONLY** on the task marked 
 
 ---
 
-## Status — engine feature-complete (2026-06-19)
-Phase 1 + Phase 2 engine **FEATURE-COMPLETE** — **126 tests passing, 0 failures**, money
-path reviewed PR by PR. Deployed contracts are **STALE** (last deploy post-PR-6c,
-pre-PR-7), so the on-chain addresses do not match `main`. Next step: **ONE batched
-redeploy + a full-surface on-chain smoke**, then the frontend (PR-11).
+## Status — stack redeployed + breaker armed (2026-06-26)
+Phase 1 + Phase 2 engine **FEATURE-COMPLETE** — **306 tests passing, 0 failures**, money
+path reviewed PR by PR. **Stack REDEPLOYED live on chain 4441 (2026-06-26)** so Governance
++ exposure caps + request consolidation + circuit-breaker are on-chain (the prior PM
+`0xd83a…f5d7` predated all four). Full-surface smoke (`scripts/smoke-perps.mjs`) **PASSED**;
+all clients re-pointed. Live addresses + runbook in `docs/oracle-discovery.md` (LIVE
+DEPLOYMENT section) and `docs/stack-redeploy-runbook.md`:
+- Governance `0x90365332B2642DCCd3ebC9a976702bA79824970A`
+- PositionManager `0x9396D36F713302FF39E0bA5b38012656f8E4eACF`
+- LiquidityPool `0x4716a0c9c504F83918002A3086590f1ed192560B`
+- mUSD (reused) `0x4AedaB95d41A31f891EE12d13CD77102705e2dEF`
+
+Breaker armed: BTC 150bps/6600s, ETH 200bps/6300s; `CB_GATE_LIQ`=0 (liquidations
+observe-only); MAX_OI caps **dormant** (capability live, values unsized — see
+`scripts/arm-breaker.sh` `ARM_MAX_OI`). Carry-over: `keeper/.env` keeper key == deployer
+(accepted for testnet; swap before running the keeper continuously). Next step: **the
+frontend (PR-11)**.
 
 ---
 
