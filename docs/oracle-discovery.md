@@ -149,6 +149,28 @@ These are the breaker arming parameters to set via governance at deploy. Sized f
 
 ---
 
+## LIVE DEPLOYMENT — chain 4441 (2026-06-26)
+
+Full stack redeployed so Governance + exposure caps + request consolidation +
+circuit-breaker are live (the prior PM `0xd83a…f5d7` predated all four). Breaker
+armed with the locked values above; `CB_GATE_LIQ = 0` (liquidations observe-only);
+`MAX_OI` caps dormant (capability shipped, values to be sized/armed later). Smoke:
+`scripts/smoke-perps.mjs` full-surface PASS; BTC 7bps / ETH 55bps vs DIA (both fresh,
+within band → no trip). Arming reproducible via `scripts/arm-breaker.sh`; runbook in
+`docs/stack-redeploy-runbook.md`.
+
+| Contract | Address | Notes |
+|---|---|---|
+| **Governance** | `0x90365332B2642DCCd3ebC9a976702bA79824970A` | owner = deployer; pause + param store |
+| **PositionManager** | `0x9396D36F713302FF39E0bA5b38012656f8E4eACF` | breaker armed; secondary feeds wired |
+| **LiquidityPool** | `0x4716a0c9c504F83918002A3086590f1ed192560B` | seeded 100k mUSD; linked one-shot to PM |
+| **mUSD (MockERC20)** | `0x4AedaB95d41A31f891EE12d13CD77102705e2dEF` | REUSED (not redeployed) |
+
+Secondary (DIA) feeds wired on the PM: BTC `0x7d0445782E383223c7B4B660bb96b87213e9b605`,
+ETH `0xc760B46beF9eD3F9A3d2b825164324D6703F0185` (both 18-dec, normalized ÷1e10).
+
+---
+
 ## Sources
 - RedStone Pull / Perpetuals / Push docs: https://docs.redstone.finance/docs/dapps/redstone-pull/ , /redstone-perpetuals/ , /redstone-push/
 - RedStone Bolt (2.4ms, push, MegaETH-only): https://blog.redstone.finance/2025/04/08/introducing-redstone-bolt-the-fastest-blockchain-oracle-to-date/

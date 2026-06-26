@@ -14,6 +14,7 @@ out/
 # Docs (generated output ignored; hand-written design docs tracked by exception)
 docs/*
 !docs/oracle-discovery.md
+!docs/stack-redeploy-runbook.md
 
 # Dotenv file
 .env
