@@ -15,6 +15,7 @@ out/
 docs/*
 !docs/oracle-discovery.md
 !docs/stack-redeploy-runbook.md
+!docs/TESTNET_LAUNCH.md
 
 # Dotenv file
 .env
