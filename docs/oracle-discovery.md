@@ -137,6 +137,18 @@ price" without handing a dead feed a halt switch over the money path.
 
 ---
 
+## LOCKED circuit-breaker arming values (durable copy)
+
+These are the breaker arming parameters to set via governance at deploy. Sized from
+**28h of reconstructed DIA history**; revisit if a fast secondary (Pyth) lands.
+
+| Asset | `CB_DEV_BPS` (divergence trip) | `CB_SEC_MAXAGE` (secondary staleness window) |
+|---|---|---|
+| **BTC** | **150** (1.50%) | **6600s** |
+| **ETH** | **200** (2.00%) | **6300s** |
+
+---
+
 ## Sources
 - RedStone Pull / Perpetuals / Push docs: https://docs.redstone.finance/docs/dapps/redstone-pull/ , /redstone-perpetuals/ , /redstone-push/
 - RedStone Bolt (2.4ms, push, MegaETH-only): https://blog.redstone.finance/2025/04/08/introducing-redstone-bolt-the-fastest-blockchain-oracle-to-date/
