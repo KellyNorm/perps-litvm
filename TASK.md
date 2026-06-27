@@ -34,9 +34,14 @@ DEPLOYMENT section) and `docs/stack-redeploy-runbook.md`:
 
 Breaker armed: BTC 150bps/6600s, ETH 200bps/6300s; `CB_GATE_LIQ`=0 (liquidations
 observe-only); MAX_OI caps **dormant** (capability live, values unsized — see
-`scripts/arm-breaker.sh` `ARM_MAX_OI`). Carry-over: `keeper/.env` keeper key == deployer
-(accepted for testnet; swap before running the keeper continuously). Next step: **the
-frontend (PR-11)**.
+`scripts/arm-breaker.sh` `ARM_MAX_OI`).
+
+**Keeper hosting track CLOSED (2026-06-27):** standalone keeper hosted 24/7 on Railway
+with a **dedicated key** `0xCCd1…5748` (no longer the deployer), proven end-to-end —
+unattended fills, +0.5 mUSD fee earning, and restart auto-recovery. Details +
+launch-gate checklist in `docs/TESTNET_LAUNCH.md`. Next step: **the frontend (PR-11)** —
+public Vercel deploy (custom domain + faucet button) and a public-path smoke run as a
+non-deployer account.
 
 ---
 
