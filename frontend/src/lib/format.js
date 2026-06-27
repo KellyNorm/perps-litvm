@@ -45,8 +45,8 @@ export function fmtPct(frac, digits = 2) {
   return (frac * 100).toFixed(digits) + "%";
 }
 
-// Share price can be far from 1 (e.g. ~1e-6 after seeding); keep enough precision
-// to stay honest instead of rounding to 0.00.
+// Share price hovers near 1.0; show up to 4 dp, with extra precision for any
+// genuinely tiny value so it never silently rounds to 0.00.
 export function fmtShare(n) {
   if (n == null || !isFinite(n)) return "—";
   if (n === 0) return "0";
