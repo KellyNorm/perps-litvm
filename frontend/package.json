@@ -9,6 +9,9 @@
     "build": "vite build",
     "preview": "vite preview"
   },
+  "engines": {
+    "node": "22.x"
+  },
   "dependencies": {
     "@redstone-finance/evm-connector": "^0.9.0",
     "@redstone-finance/sdk": "^0.9.0",
