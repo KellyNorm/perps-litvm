@@ -99,18 +99,33 @@ export function useWallet() {
     }
     setConnecting(true);
     setError(null);
-    setDisconnected(false); // user is opting back in — clear the in-app disconnect flag
+    // ALWAYS clear the in-app disconnect guard first, so a reconnect can never be
+    // blocked by a prior disconnect. Connect is self-contained from here: it sets
+    // account/chainId directly from the request result and does NOT route through the
+    // guarded refresh().
+    setDisconnected(false);
     try {
-      await eth.request({ method: "eth_requestAccounts" });
+      // Surface the account picker so the user can choose a (possibly different) wallet
+      // even when the site is already authorized — eth_requestAccounts alone would just
+      // silently return the existing account. Not every injected wallet implements
+      // wallet_requestPermissions; if it's unsupported, fall through to the plain request.
+      try {
+        await eth.request({ method: "wallet_requestPermissions", params: [{ eth_accounts: {} }] });
+      } catch (permErr) {
+        if (permErr?.code === 4001) throw permErr; // user dismissed the picker → abort cleanly
+        // otherwise (unsupported / -32601) ignore and fall back to eth_requestAccounts
+      }
+      const accs = await eth.request({ method: "eth_requestAccounts" });
+      setAccount(accs && accs.length ? ethers.utils.getAddress(accs[0]) : null);
       const cid = await eth.request({ method: "eth_chainId" });
+      setChainId(parseInt(cid, 16));
       if (parseInt(cid, 16) !== CHAIN_ID) await switchChain();
-      await refresh();
     } catch (e) {
       setError(e?.message || String(e));
     } finally {
       setConnecting(false);
     }
-  }, [eth, refresh, switchChain]);
+  }, [eth, switchChain]);
 
   // Injected wallets have no programmatic "disconnect" — the correct, standard behavior
   // is to clear the app's own connection state and remember that choice so the mount
