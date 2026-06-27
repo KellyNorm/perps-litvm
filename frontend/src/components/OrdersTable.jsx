@@ -117,23 +117,23 @@ export default function OrdersTable({ account, orders, readiness, trade, wrongCh
   } else {
     body = orders.map((o) => (
       <tr key={o.id}>
-        <td>
+        <td data-label="Type">
           <span className={"ordtype " + (o.isStop ? "stop" : "limit")}>{o.typeLabel}</span>
         </td>
-        <td>
+        <td data-label="Market">
           <span className="pair">{o.name}</span>
           <span className={"sidetag " + (o.isLong ? "long" : "short")} style={{ marginLeft: 8 }}>
             {o.isLong ? "Long" : "Short"}
           </span>
         </td>
-        <td className="mono">
+        <td className="mono" data-label="Trigger">
           {o.triggerAbove ? "≥ " : "≤ "}
           {fmtUsdPx(o.triggerPrice)}
         </td>
-        <td className="mono">{sizeCell(o)}</td>
-        <td className="mono">{fmtUsd2(o.locked)} mUSD</td>
-        <td style={{ textAlign: "right" }}>{statusCell(o)}</td>
-        <td style={{ textAlign: "right" }}>{cancelCell(o)}</td>
+        <td className="mono" data-label="Size">{sizeCell(o)}</td>
+        <td className="mono" data-label="Locked">{fmtUsd2(o.locked)} mUSD</td>
+        <td style={{ textAlign: "right" }} data-label="Keeper">{statusCell(o)}</td>
+        <td style={{ textAlign: "right" }} data-label="Manage">{cancelCell(o)}</td>
       </tr>
     ));
   }

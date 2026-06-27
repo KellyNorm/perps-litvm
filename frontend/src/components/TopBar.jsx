@@ -14,6 +14,7 @@ function FlameMark() {
 
 export default function TopBar({ account, wrongChain, connecting, hasWallet, onConnect, onDisconnect, onSwitch, onFaucet, onHome }) {
   const [gas, setGas] = useState(null);
+  const [menuOpen, setMenuOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -32,6 +33,14 @@ export default function TopBar({ account, wrongChain, connecting, hasWallet, onC
       clearInterval(id);
     };
   }, []);
+
+  // Esc closes the mobile/tablet menu (touch + keyboard accessible).
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onKey = (e) => e.key === "Escape" && setMenuOpen(false);
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [menuOpen]);
 
   return (
     <div className="topbar">
@@ -56,17 +65,30 @@ export default function TopBar({ account, wrongChain, connecting, hasWallet, onC
           <div className="sub">Perps · LitVM</div>
         </span>
       </div>
-      <span className="net-badge">
-        <span className={"dot" + (wrongChain ? " warn" : "")}></span> LiteForge{" "}
-        <span className="chain mono">· {CHAIN_ID}</span>
-      </span>
+
       <div className="spacer"></div>
-      <span className="gas">
-        zkLTC gas <b>{gas == null ? "—" : (gas < 0.001 ? gas.toExponential(1) : gas.toFixed(3)) + " gwei"}</b>
-      </span>
-      <button className="btn faucet" onClick={onFaucet}>
-        Get test tokens
-      </button>
+
+      {/* Secondary / nav items — inline on desktop, collapse into the hamburger ≤1024px.
+          The core trade form is NOT here; it lives in OrderTicket. */}
+      <nav id="topbar-menu" className={"topbar-menu" + (menuOpen ? " open" : "")}>
+        <span className="net-badge">
+          <span className={"dot" + (wrongChain ? " warn" : "")}></span> LiteForge{" "}
+          <span className="chain mono">· {CHAIN_ID}</span>
+        </span>
+        <span className="gas">
+          zkLTC gas <b>{gas == null ? "—" : (gas < 0.001 ? gas.toExponential(1) : gas.toFixed(3)) + " gwei"}</b>
+        </span>
+        <button
+          className="btn faucet"
+          onClick={() => {
+            onFaucet();
+            setMenuOpen(false);
+          }}
+        >
+          Get test tokens
+        </button>
+      </nav>
+
       {wrongChain ? (
         <button className="btn warnchain" onClick={onSwitch}>
           Switch to 4441
@@ -81,6 +103,20 @@ export default function TopBar({ account, wrongChain, connecting, hasWallet, onC
           {connecting ? "Connecting…" : hasWallet ? "Connect wallet" : "Install wallet"}
         </button>
       )}
+
+      <button
+        className="hamburger"
+        aria-label={menuOpen ? "Close menu" : "Open menu"}
+        aria-expanded={menuOpen}
+        aria-controls="topbar-menu"
+        onClick={() => setMenuOpen((v) => !v)}
+      >
+        <span className="bar"></span>
+        <span className="bar"></span>
+        <span className="bar"></span>
+      </button>
+
+      {menuOpen && <div className="menu-overlay" aria-hidden="true" onClick={() => setMenuOpen(false)}></div>}
     </div>
   );
 }

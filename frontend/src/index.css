@@ -1767,3 +1767,243 @@ tbody tr.danger {
 .orders-note b {
   color: var(--steel);
 }
+
+/* ============================================================
+   Responsive — desktop >1024 / tablet 640–1024 / mobile <640
+   Desktop-first overrides; Dark Velocity tokens throughout.
+   ============================================================ */
+
+/* new topbar elements — desktop defaults (inline, no hamburger) */
+.topbar-menu {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.hamburger {
+  display: none;
+}
+.menu-overlay {
+  display: none;
+}
+
+/* ---- tablet & down (<=1024): single column, trade form on top, hamburger ---- */
+@media (max-width: 1024px) {
+  .grid {
+    display: flex;
+    flex-direction: column;
+  }
+  /* MarketStrip → OrderTicket → Chart → tabs (OrderTicket is .panel) */
+  .panel {
+    order: -1;
+    position: static;
+    top: auto;
+  }
+  .col-main {
+    order: 0;
+  }
+
+  /* collapse secondary/nav items into the hamburger */
+  .hamburger {
+    display: inline-flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 4px;
+    width: 44px;
+    height: 44px;
+    padding: 0 11px;
+    background: var(--raised);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    cursor: pointer;
+  }
+  .hamburger .bar {
+    display: block;
+    width: 100%;
+    height: 2px;
+    background: var(--text);
+    border-radius: 2px;
+  }
+  .topbar-menu {
+    position: absolute;
+    top: 58px;
+    right: 8px;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    min-width: 230px;
+    padding: 14px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+    z-index: 60;
+    display: none;
+  }
+  .topbar-menu.open {
+    display: flex;
+  }
+  .topbar-menu .net-badge,
+  .topbar-menu .gas {
+    justify-content: center;
+  }
+  .topbar-menu .btn.faucet {
+    width: 100%;
+    min-height: 44px;
+  }
+  .menu-overlay {
+    display: block;
+    position: fixed;
+    inset: 58px 0 0 0;
+    background: transparent;
+    z-index: 50;
+  }
+
+  /* market strip: single-row horizontal scroll, not a tall wrap */
+  .marketstrip {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+  }
+
+  /* tablet: tables stay tabular but scroll inside their container, never the page */
+  .lower {
+    overflow-x: auto;
+  }
+}
+
+/* ---- mobile (<640): card tables, tap targets, no horizontal overflow ---- */
+@media (max-width: 639px) {
+  html,
+  body {
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+  .topbar {
+    gap: 10px;
+    padding: 0 12px;
+  }
+  .brand .sub {
+    display: none;
+  }
+
+  /* Positions / Orders tables → stacked cards (same fields, reflowed) */
+  .lower table,
+  .lower thead,
+  .lower tbody,
+  .lower tr,
+  .lower td {
+    display: block;
+    width: 100%;
+  }
+  /* keep the header row in the a11y tree but visually hidden */
+  .lower thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+  .lower tbody tr {
+    width: auto; /* override the block width:100% so side margins don't overflow */
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    padding: 10px 12px;
+    margin: 10px;
+  }
+  .lower tbody tr:hover {
+    background: var(--card);
+  }
+  .lower tbody tr.danger {
+    background: linear-gradient(90deg, rgba(255, 77, 109, 0.12), transparent 70%);
+  }
+  .lower td {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 0;
+    border: none;
+    border-bottom: 1px solid var(--line-soft);
+    font-size: 13px;
+    text-align: right;
+    min-height: 34px;
+  }
+  .lower td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 500;
+    text-align: left;
+    white-space: nowrap;
+  }
+  /* first cell = card title (Market / Type): emphasized, no label */
+  .lower td:first-child {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 10px;
+    margin-bottom: 2px;
+    text-align: left;
+  }
+  .lower td:first-child::before {
+    display: none;
+  }
+  /* action cell: full-width tappable buttons */
+  .lower td[data-label="Manage"] {
+    border-bottom: none;
+    padding-top: 10px;
+  }
+  .lower td[data-label="Manage"]::before {
+    display: none;
+  }
+  .lower .row-acts {
+    width: 100%;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: stretch;
+  }
+  .lower .rowbtn {
+    flex: 1 1 auto;
+    min-width: 76px;
+    min-height: 44px;
+    font-size: 13px;
+  }
+  /* empty state stays centered (not a card row) */
+  .lower td.empty {
+    display: block;
+    text-align: center;
+    border: none;
+    min-height: 0;
+  }
+  .lower td.empty::before {
+    display: none;
+  }
+
+  /* tap targets >= 44px + readable base font */
+  .tabs button,
+  .toggle button,
+  .otabs button,
+  .btn {
+    min-height: 44px;
+  }
+  body {
+    font-size: 14px;
+  }
+
+  /* vault: keep 2-up but tighten padding for phone widths */
+  .vault .cell {
+    padding: 14px;
+  }
+
+  /* keep the top bar from crowding at ~375px */
+  .topbar {
+    gap: 8px;
+  }
+  .brand .name {
+    font-size: 16px;
+    letter-spacing: 0.1em;
+  }
+}

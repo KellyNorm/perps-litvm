@@ -153,18 +153,18 @@ export default function PositionsTable({ account, positions, marks, live, orders
       const netFunding = -p.fundingOwed; // + ⇒ position is owed (receives), − ⇒ owes
       return (
         <tr key={p.key} className={h < 0.25 ? "danger" : undefined}>
-          <td>
+          <td data-label="Market">
             <span className="pair">{p.name}</span>
             <span className={"sidetag " + (p.isLong ? "long" : "short")} style={{ marginLeft: 8 }}>
               {p.isLong ? "Long" : "Short"}
             </span>
             <span className="lev">{lev.toFixed(lev % 1 ? 1 : 0)}×</span>
           </td>
-          <td className="mono">{fmtUsd(p.sizeUsd)}</td>
-          <td className="mono">{fmtUsdPx(p.entryPrice)}</td>
-          <td className="mono">{dp.ok ? fmtUsdPx(mark) : <span className="loading-dim">…</span>}</td>
-          <td className="mono neg">{fmtUsdPx(liq)}</td>
-          <td>
+          <td className="mono" data-label="Size">{fmtUsd(p.sizeUsd)}</td>
+          <td className="mono" data-label="Entry">{fmtUsdPx(p.entryPrice)}</td>
+          <td className="mono" data-label="Live">{dp.ok ? fmtUsdPx(mark) : <span className="loading-dim">…</span>}</td>
+          <td className="mono neg" data-label="Liq. price">{fmtUsdPx(liq)}</td>
+          <td data-label="Health">
             <span className="health">
               <span className="health-track">
                 <span className="health-fill" style={{ width: hpc + "%", background: hc }}></span>
@@ -174,9 +174,9 @@ export default function PositionsTable({ account, positions, marks, live, orders
               </span>
             </span>
           </td>
-          <td className={"mono " + (netFunding >= 0 ? "pos" : "neg")}>{fmtSigned(netFunding)}</td>
-          <td className={"mono " + (pnl >= 0 ? "pos" : "neg")}>{fmtSigned(pnl)}</td>
-          <td style={{ textAlign: "right" }}>{actionCell(p)}</td>
+          <td className={"mono " + (netFunding >= 0 ? "pos" : "neg")} data-label="Net funding">{fmtSigned(netFunding)}</td>
+          <td className={"mono " + (pnl >= 0 ? "pos" : "neg")} data-label="uPnL">{fmtSigned(pnl)}</td>
+          <td style={{ textAlign: "right" }} data-label="Manage">{actionCell(p)}</td>
         </tr>
       );
     });
