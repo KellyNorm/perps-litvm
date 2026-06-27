@@ -22,7 +22,7 @@ function FlameMark() {
   );
 }
 
-export default function TopBar({ account, wrongChain, connecting, hasWallet, onConnect, onSwitch, onFaucet }) {
+export default function TopBar({ account, wrongChain, connecting, hasWallet, onConnect, onDisconnect, onSwitch, onFaucet }) {
   const [gas, setGas] = useState(null);
 
   useEffect(() => {
@@ -70,8 +70,9 @@ export default function TopBar({ account, wrongChain, connecting, hasWallet, onC
           Switch to 4441
         </button>
       ) : account ? (
-        <button className="btn" title={account}>
+        <button className="btn wallet-pill" onClick={onDisconnect} title={`${account} — click to disconnect`}>
           <span className="mono">{shortAddr(account)}</span>
+          <span className="disconnect-x" aria-hidden="true"> ✕</span>
         </button>
       ) : (
         <button className="btn connect" onClick={onConnect} disabled={connecting}>

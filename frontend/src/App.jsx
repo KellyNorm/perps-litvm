@@ -114,6 +114,7 @@ export default function App() {
         connecting={wallet.connecting}
         hasWallet={wallet.hasWallet}
         onConnect={wallet.connect}
+        onDisconnect={wallet.disconnect}
         onSwitch={wallet.switchChain}
         onFaucet={() => setModalOpen(true)}
       />
