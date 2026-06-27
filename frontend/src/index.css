@@ -219,6 +219,26 @@ button {
   border-color: rgba(255, 138, 76, 0.5);
   background: rgba(255, 138, 76, 0.1);
 }
+/* connected-wallet pill — click to disconnect; the ✕ lights up on hover */
+.btn.wallet-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.btn.wallet-pill .disconnect-x {
+  font-size: 11px;
+  font-weight: 700;
+  opacity: 0.45;
+  transition: opacity 0.15s, color 0.15s;
+}
+.btn.wallet-pill:hover {
+  border-color: rgba(229, 64, 42, 0.55);
+  background: rgba(229, 64, 42, 0.08);
+}
+.btn.wallet-pill:hover .disconnect-x {
+  opacity: 1;
+  color: #e5402a;
+}
 
 /* market strip */
 .marketstrip {

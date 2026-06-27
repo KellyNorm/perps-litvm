@@ -72,7 +72,7 @@ export default function TopBar({ account, wrongChain, connecting, hasWallet, onC
       ) : account ? (
         <button className="btn wallet-pill" onClick={onDisconnect} title={`${account} — click to disconnect`}>
           <span className="mono">{shortAddr(account)}</span>
-          <span className="disconnect-x" aria-hidden="true"> ✕</span>
+          <span className="disconnect-x" aria-hidden="true">✕</span>
         </button>
       ) : (
         <button className="btn connect" onClick={onConnect} disabled={connecting}>
