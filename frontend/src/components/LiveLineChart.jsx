@@ -90,13 +90,13 @@ export default function LiveLineChart({ symbol, series, mark, live, startedAt, l
         <svg className="chart-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
           <defs>
             <linearGradient id="markfill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stopColor="rgba(255,138,76,0.28)" />
-              <stop offset="1" stopColor="rgba(255,138,76,0)" />
+              <stop offset="0" stopColor="rgba(41,169,255,0.28)" />
+              <stop offset="1" stopColor="rgba(41,169,255,0)" />
             </linearGradient>
           </defs>
           {[0, 1, 2, 3, 4].map((g) => {
             const gy = PAD + (g * (H - PAD * 2)) / 4;
-            return <line key={g} x1="0" y1={gy} x2={W} y2={gy} stroke="#141A23" strokeWidth="1" />;
+            return <line key={g} x1="0" y1={gy} x2={W} y2={gy} stroke="var(--line-soft)" strokeWidth="1" />;
           })}
           <path d={view.area} fill="url(#markfill)" />
           <path d={view.line} fill="none" stroke="var(--molten)" strokeWidth="1.6" />

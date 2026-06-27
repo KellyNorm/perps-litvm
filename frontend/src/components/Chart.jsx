@@ -6,27 +6,33 @@ import LiveLineChart from "./LiveLineChart.jsx";
 
 const CHART_H = 300;
 
-// Palette pulled from the molten/dark theme (index.css :root). lightweight-charts is
-// imperative, so we feed it the literal hex rather than CSS vars.
-const C = {
-  up: "#34c98c", // --pos
-  down: "#ef5b52", // --neg
-  grid: "#141a23", // --line-soft
-  text: "#6e7888", // --muted
-  border: "#1b232f", // --line
-  mark: "#ff8a4c", // --molten
-  liq: "#ef5b52", // --neg
-  trig: "#4c82d8", // --ltc
-};
+// Palette pulled live from the Dark Velocity theme (index.css :root) so the chart stays
+// in sync with the single source of truth. lightweight-charts is imperative, so we
+// resolve the CSS custom properties to concrete colors at render time.
+function chartColors() {
+  const s = getComputedStyle(document.documentElement);
+  const v = (n, fb) => s.getPropertyValue(n).trim() || fb;
+  return {
+    up: v("--pos", "#00d98b"),
+    down: v("--neg", "#ff4d6d"),
+    grid: v("--line-soft", "rgba(108,140,255,0.1)"),
+    text: v("--muted", "#8b95ad"),
+    border: v("--line", "rgba(108,140,255,0.18)"),
+    mark: v("--accent-blue", "#29a9ff"), // RedStone mark · execution line
+    liq: v("--amber", "#ffb547"), // liquidation overlay = amber
+    trig: v("--accent-violet", "#a24dff"),
+  };
+}
 
 // Candlestick body — owns the imperative lightweight-charts instance. Candles are
-// INDICATIVE exchange history; the RedStone mark (orange line) is what trades execute
+// INDICATIVE exchange history; the RedStone mark (blue line) is what trades execute
 // against. liq/trigger overlays are drawn as labelled price lines.
 function CandleChart({ candles, markPrice, liqLines, trigLines }) {
   const elRef = useRef(null);
   const chartRef = useRef(null);
   const seriesRef = useRef(null);
   const linesRef = useRef([]);
+  const C = chartColors();
   // Latest candle set, read by the autoscale provider so the Y-range tracks price
   // action only (kept in a ref because the series is created once, before data lands).
   const candlesRef = useRef(null);

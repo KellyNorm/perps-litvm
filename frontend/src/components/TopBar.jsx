@@ -12,7 +12,7 @@ function FlameMark() {
   );
 }
 
-export default function TopBar({ account, wrongChain, connecting, hasWallet, onConnect, onDisconnect, onSwitch, onFaucet }) {
+export default function TopBar({ account, wrongChain, connecting, hasWallet, onConnect, onDisconnect, onSwitch, onFaucet, onHome }) {
   const [gas, setGas] = useState(null);
 
   useEffect(() => {
@@ -35,7 +35,19 @@ export default function TopBar({ account, wrongChain, connecting, hasWallet, onC
 
   return (
     <div className="topbar">
-      <div className="brand">
+      <div
+        className="brand"
+        onClick={onHome}
+        role="button"
+        tabIndex={0}
+        aria-label="Go to dashboard"
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onHome?.();
+          }
+        }}
+      >
         <FlameMark />
         <span>
           <div className="name">

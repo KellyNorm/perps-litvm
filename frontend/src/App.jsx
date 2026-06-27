@@ -117,6 +117,15 @@ export default function App() {
         onDisconnect={wallet.disconnect}
         onSwitch={wallet.switchChain}
         onFaucet={() => setModalOpen(true)}
+        onHome={() => {
+          // Client-side reset to the default dashboard view — pure React state, so the
+          // wallet connection and all app state are preserved (no reload/navigation).
+          setTab("pos");
+          if (supportedSymbols.length) setSelected(supportedSymbols[0]);
+          setModalOpen(false);
+          setTpslFor(null);
+          window.scrollTo({ top: 0, behavior: "smooth" });
+        }}
       />
 
       {!configured && (
