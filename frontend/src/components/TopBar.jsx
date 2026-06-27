@@ -7,17 +7,7 @@ import { shortAddr } from "../lib/format.js";
 function FlameMark() {
   return (
     <span className="mark" aria-hidden="true">
-      <svg viewBox="0 0 32 32" width="30" height="30" fill="none">
-        <defs>
-          <linearGradient id="tfg" x1="0" y1="0" x2="32" y2="32">
-            <stop offset="0" stopColor="#FFE7CF" />
-            <stop offset=".55" stopColor="#FF8A4C" />
-            <stop offset="1" stopColor="#E5402A" />
-          </linearGradient>
-        </defs>
-        <path d="M16 2 L28 9 V23 L16 30 L4 23 V9 Z" stroke="#27313F" strokeWidth="1.4" fill="#0E131B" />
-        <path d="M16 8 L11 17 H15 L13 24 L21 14 H16 L19 8 Z" fill="url(#tfg)" />
-      </svg>
+      <img src="/logo.png" alt="" className="brand-logo" width="34" height="34" />
     </span>
   );
 }

@@ -101,22 +101,38 @@ button {
   gap: 11px;
 }
 .mark {
-  width: 30px;
-  height: 30px;
+  width: auto;
+  height: 32px;
   flex: none;
   display: grid;
   place-items: center;
   animation: markflick 2.6s ease-in-out infinite;
 }
+.brand-logo {
+  height: 32px;
+  width: auto;
+  display: block;
+  object-fit: contain;
+}
+.modal-title {
+  display: flex;
+  align-items: center;
+}
+.modal-logo {
+  height: 30px;
+  width: auto;
+  object-fit: contain;
+  margin-right: 10px;
+}
 @keyframes markflick {
   0%,
   100% {
-    filter: drop-shadow(0 0 3px rgba(255, 107, 61, 0.45));
+    filter: drop-shadow(0 0 3px rgba(96, 165, 250, 0.4));
     transform: scale(1);
   }
   50% {
-    filter: drop-shadow(0 0 8px rgba(255, 138, 76, 0.9));
-    transform: scale(1.045);
+    filter: drop-shadow(0 0 9px rgba(120, 130, 255, 0.85));
+    transform: scale(1.04);
   }
 }
 .brand .name {

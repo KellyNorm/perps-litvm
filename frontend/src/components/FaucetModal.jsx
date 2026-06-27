@@ -88,7 +88,10 @@ export default function FaucetModal({
     <div className="overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="faucetTitle">
         <div className="modal-head">
-          <h3 id="faucetTitle">Get test tokens</h3>
+          <div className="modal-title">
+            <img src="/logo.png" alt="" className="modal-logo" aria-hidden="true" />
+            <h3 id="faucetTitle">Get test tokens</h3>
+          </div>
           <button className="x" ref={closeRef} aria-label="Close" onClick={onClose}>
             ✕
           </button>
