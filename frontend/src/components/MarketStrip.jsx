@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { fmtUsdPx, fmtCompact, fmtPct } from "../lib/format.js";
 import { borrowDayFrac, fundingDayFrac } from "../lib/engine.js";
 
@@ -18,6 +18,7 @@ function displayMark(symbol, marks, live) {
 
 export default function MarketStrip({ supported, selected, onSelect, marks, live, liveSource, states }) {
   const [open, setOpen] = useState(false);
+  const [ddPos, setDdPos] = useState(null); // {top,left,width} for the fixed dropdown
   const selRef = useRef(null);
   const meta = supported.find((m) => m.symbol === selected) || supported[0];
   const mark = marks[selected]; // RedStone mark · execution
@@ -31,6 +32,27 @@ export default function MarketStrip({ supported, selected, onSelect, marks, live
     document.addEventListener("click", onDoc);
     return () => document.removeEventListener("click", onDoc);
   }, []);
+
+  // The dropdown is position:fixed (so it escapes the market strip's overflow clip).
+  // Anchor it under the trigger and clamp it fully on-screen — works at 320px → desktop.
+  // useLayoutEffect positions it before paint (no flash); kept synced on scroll/resize.
+  useLayoutEffect(() => {
+    if (!open) return;
+    function place() {
+      const r = selRef.current?.getBoundingClientRect();
+      if (!r) return;
+      const width = Math.min(360, window.innerWidth - 16);
+      const left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8));
+      setDdPos({ top: Math.round(r.bottom), left: Math.round(left), width });
+    }
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true); // capture scroll in any ancestor
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open]);
 
   if (!meta) return null;
 
@@ -74,7 +96,10 @@ export default function MarketStrip({ supported, selected, onSelect, marks, live
         </span>
         <span className="mkt-chevron">▾</span>
         {open && (
-          <div className="dropdown">
+          <div
+            className="dropdown"
+            style={ddPos ? { top: ddPos.top, left: ddPos.left, width: ddPos.width } : { visibility: "hidden" }}
+          >
             <div className="dd-search">Markets · RedStone feeds</div>
             {supported.map((m) => {
               const mk = displayMark(m.symbol, marks, live);
