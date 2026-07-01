@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TachyonFi — High-Speed Perpetuals</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#080B14; --bg2:#0E1324; --card:#131A2E; --line:rgba(148,170,255,.10);
+  --text:#F4F8FF; --muted:#93A0C0; --dim:#5C6A8C;
+  --blue:#29A9FF; --indigo:#6A7BFF; --violet:#A24DFF; --magenta:#D44CFF;
+  --green:#00D98B; --red:#FF4D6D;
+  --grad:linear-gradient(135deg,#29A9FF,#6A7BFF 45%,#A24DFF 70%,#D44CFF 100%);
+  --grad-soft:linear-gradient(135deg,rgba(41,169,255,.18),rgba(210,76,255,.18));
+  --disp:'Space Grotesk',sans-serif; --body:'Inter',sans-serif; --mono:'JetBrains Mono',monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  background:var(--bg); color:var(--text); font-family:var(--body);
+  line-height:1.5; -webkit-font-smoothing:antialiased; overflow-x:hidden;
+}
+a{color:inherit;text-decoration:none}
+::selection{background:rgba(162,77,255,.35)}
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+.mono{font-family:var(--mono)}
+.grad-text{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+
+/* ---------- NAV ---------- */
+nav{
+  position:fixed;top:0;left:0;right:0;z-index:100;
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 24px;max-width:1180px;margin:0 auto;
+  transition:padding .3s ease;
+}
+.nav-shell{
+  position:fixed;top:0;left:0;right:0;z-index:99;height:68px;
+  background:rgba(8,11,20,0);backdrop-filter:blur(0);
+  border-bottom:1px solid transparent;transition:all .3s ease;
+}
+.nav-shell.scrolled{
+  background:rgba(8,11,20,.72);backdrop-filter:blur(18px) saturate(140%);
+  border-bottom:1px solid var(--line);
+}
+.brand{display:flex;align-items:center;gap:11px;font-family:var(--disp);font-weight:700;font-size:20px;letter-spacing:-.01em}
+.brand svg{width:34px;height:24px;display:block}
+.nav-links{display:flex;gap:30px;align-items:center}
+.nav-links a{font-size:14px;color:var(--muted);transition:color .2s;font-weight:500}
+.nav-links a:hover{color:var(--text)}
+.nav-right{display:flex;align-items:center;gap:16px}
+.badge{
+  display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:500;
+  padding:6px 12px;border-radius:100px;color:#BFE6FF;
+  background:rgba(41,169,255,.08);border:1px solid rgba(41,169,255,.22);
+  font-family:var(--mono);letter-spacing:.02em;white-space:nowrap;
+}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(0,217,139,.6);animation:pulse 2s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(0,217,139,.55)}70%{box-shadow:0 0 0 7px rgba(0,217,139,0)}100%{box-shadow:0 0 0 0 rgba(0,217,139,0)}}
+.btn{
+  position:relative;display:inline-flex;align-items:center;gap:8px;
+  font-family:var(--disp);font-weight:600;font-size:14px;letter-spacing:.01em;
+  padding:11px 20px;border-radius:11px;color:#04070E;cursor:pointer;border:0;
+  background:var(--grad);background-size:180% 180%;overflow:hidden;
+  box-shadow:0 6px 24px -8px rgba(106,123,255,.65);
+  transition:transform .2s ease, box-shadow .2s ease;
+}
+.btn:hover{transform:translateY(-1px);box-shadow:0 10px 30px -8px rgba(162,77,255,.7);animation:shimmer 2.2s linear infinite}
+@keyframes shimmer{0%{background-position:0% 50%}100%{background-position:180% 50%}}
+.btn svg{width:15px;height:15px}
+.btn-ghost{
+  background:transparent;color:var(--text);border:1px solid var(--line);box-shadow:none;
+}
+.btn-ghost:hover{background:rgba(148,170,255,.05);border-color:rgba(148,170,255,.25);animation:none}
+.nav-toggle{display:none}
+
+/* ---------- HERO ---------- */
+.hero{position:relative;min-height:100vh;display:flex;align-items:center;padding-top:68px;overflow:hidden}
+#field{position:absolute;inset:0;width:100%;height:100%;z-index:0}
+.hero-glow{
+  position:absolute;top:-10%;left:50%;transform:translateX(-50%);
+  width:900px;height:700px;z-index:0;pointer-events:none;
+  background:radial-gradient(ellipse at center,rgba(106,123,255,.18),rgba(210,76,255,.06) 40%,transparent 70%);
+  filter:blur(30px);animation:breathe 7s ease-in-out infinite;
+}
+.hero-inner{position:relative;z-index:2;width:100%;padding:60px 0}
+.hero-mark{width:200px;height:139px;margin-bottom:34px;transform-origin:center;filter:drop-shadow(0 0 40px rgba(41,169,255,.4));animation:markIgnite 1.2s cubic-bezier(.16,.84,.24,1) both}
+@keyframes markIgnite{0%{opacity:0;transform:scale(.5) rotate(-12deg);filter:blur(14px) drop-shadow(0 0 0 rgba(41,169,255,0))}55%{opacity:1;transform:scale(1.06) rotate(2deg);filter:blur(0) drop-shadow(0 0 80px rgba(41,169,255,.85))}100%{opacity:1;transform:none;filter:drop-shadow(0 0 40px rgba(41,169,255,.4))}}
+@keyframes riseIn{from{opacity:0;transform:translateY(34px);filter:blur(9px)}to{opacity:1;transform:none;filter:blur(0)}}
+@keyframes sweepText{0%{background-position:0% center}100%{background-position:200% center}}
+@keyframes breathe{0%,100%{opacity:.85;transform:translateX(-50%) scale(1)}50%{opacity:1;transform:translateX(-50%) scale(1.07)}}
+@keyframes ringBurst{0%{opacity:.7;transform:translate(-50%,-50%) scale(.2)}70%{opacity:0}100%{opacity:0;transform:translate(-50%,-50%) scale(1.8)}}
+.hl-1{animation:riseIn .8s ease both .55s}
+.hl-2{animation:riseIn .95s cubic-bezier(.2,.8,.2,1) both .68s}
+.hl-3{animation:riseIn .8s ease both .88s}
+.hl-4{animation:riseIn .8s ease both 1.05s}
+.hl-5{animation:riseIn .8s ease both 1.2s}
+.hero-title .grad-text{background-size:220% auto;animation:sweepText 5s linear infinite}
+.burst{position:absolute;top:32%;left:50%;width:520px;height:520px;z-index:1;pointer-events:none;border-radius:50%;
+  background:radial-gradient(circle,rgba(191,230,255,.5),rgba(106,123,255,.15) 40%,transparent 62%);
+  transform:translate(-50%,-50%) scale(.2);animation:ringBurst 1.4s ease-out .15s both}
+.eyebrow{margin-bottom:22px;display:inline-flex}
+h1.hero-title{
+  font-family:var(--disp);font-weight:700;letter-spacing:-.03em;line-height:.98;
+  font-size:clamp(46px,8vw,92px);max-width:12ch;
+}
+.hero-sub{margin-top:24px;font-size:clamp(16px,2.2vw,20px);color:var(--muted);max-width:52ch;line-height:1.6}
+.hero-cta{margin-top:38px;display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+.hero-cta .btn{padding:14px 26px;font-size:15px}
+.hero-note{margin-top:22px;font-size:13px;color:var(--dim);display:flex;align-items:center;gap:8px;font-family:var(--mono)}
+
+/* reveal */
+.rv{opacity:0;transform:translateY(26px);transition:opacity .8s cubic-bezier(.2,.7,.2,1),transform .8s cubic-bezier(.2,.7,.2,1)}
+.rv.in{opacity:1;transform:none}
+.d1{transition-delay:.06s}.d2{transition-delay:.14s}.d3{transition-delay:.22s}.d4{transition-delay:.30s}.d5{transition-delay:.38s}
+
+/* ---------- STATS STRIP ---------- */
+.stats{position:relative;z-index:3;margin-top:-30px}
+.stats-inner{
+  display:grid;grid-template-columns:repeat(3,1fr);
+  background:linear-gradient(180deg,rgba(19,26,46,.9),rgba(14,19,36,.9));
+  border:1px solid var(--line);border-radius:18px;backdrop-filter:blur(14px);
+  overflow:hidden;box-shadow:0 30px 80px -40px rgba(0,0,0,.8);
+}
+.stat{padding:28px 30px;position:relative}
+.stat + .stat{border-left:1px solid var(--line)}
+.stat-label{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.14em;font-family:var(--mono);margin-bottom:10px}
+.stat-val{font-family:var(--mono);font-weight:700;font-size:clamp(26px,4vw,38px);letter-spacing:-.02em}
+.stat-sub{font-size:12px;color:var(--muted);margin-top:6px;font-family:var(--mono)}
+
+/* ---------- SECTION ---------- */
+section.block{padding:120px 0}
+.sec-eyebrow{font-family:var(--mono);font-size:13px;letter-spacing:.18em;text-transform:uppercase;color:var(--blue);margin-bottom:16px}
+.sec-title{font-family:var(--disp);font-weight:700;font-size:clamp(30px,4.5vw,48px);letter-spacing:-.02em;line-height:1.05;max-width:16ch}
+.sec-lead{margin-top:18px;color:var(--muted);font-size:17px;max-width:56ch}
+.sec-head{margin-bottom:56px}
+
+/* features */
+.feat-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:20px}
+.feat{
+  position:relative;padding:32px;border-radius:18px;overflow:hidden;
+  background:var(--card);border:1px solid var(--line);transition:transform .3s ease,border-color .3s ease;
+}
+.feat::before{
+  content:"";position:absolute;inset:0;border-radius:18px;padding:1px;opacity:0;transition:opacity .3s ease;
+  background:var(--grad);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+}
+.feat::after{
+  content:"";position:absolute;top:-40%;right:-20%;width:60%;height:120%;opacity:0;transition:opacity .35s ease;
+  background:radial-gradient(circle,rgba(106,123,255,.22),transparent 65%);filter:blur(20px);
+}
+.feat:hover{transform:translateY(-4px)}
+.feat:hover::before,.feat:hover::after{opacity:1}
+.feat-ico{width:48px;height:48px;border-radius:12px;display:grid;place-items:center;margin-bottom:20px;background:var(--grad-soft);border:1px solid var(--line)}
+.feat-ico svg{width:24px;height:24px;stroke:var(--blue);fill:none;stroke-width:1.6}
+.feat h3{font-family:var(--disp);font-weight:600;font-size:20px;margin-bottom:10px;letter-spacing:-.01em}
+.feat p{color:var(--muted);font-size:15px;line-height:1.6}
+
+/* how it works */
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;counter-reset:s}
+.step{position:relative;padding:34px 28px;border-radius:18px;background:var(--bg2);border:1px solid var(--line)}
+.step-num{font-family:var(--mono);font-weight:700;font-size:14px;color:var(--dim);letter-spacing:.1em}
+.step-line{height:2px;background:var(--grad);width:44px;border-radius:2px;margin:16px 0 20px}
+.step h4{font-family:var(--disp);font-weight:600;font-size:19px;margin-bottom:8px}
+.step p{color:var(--muted);font-size:14px;line-height:1.6}
+
+/* predictions */
+.pred{position:relative;overflow:hidden;border-radius:26px;border:1px solid rgba(210,76,255,.22);
+  background:radial-gradient(120% 140% at 85% 20%,rgba(210,76,255,.14),transparent 55%),linear-gradient(180deg,#120E22,#0C0A18);
+  padding:56px;display:grid;grid-template-columns:1.3fr 1fr;gap:40px;align-items:center;
+}
+.pred-badge{background:rgba(210,76,255,.1);border-color:rgba(210,76,255,.3);color:#F0BFFF}
+.pred h2{font-family:var(--disp);font-weight:700;font-size:clamp(28px,4vw,44px);letter-spacing:-.02em;margin:20px 0 16px;line-height:1.05}
+.pred p{color:#C7BEDD;font-size:16px;line-height:1.65;max-width:46ch}
+.pred-chips{margin-top:26px;display:flex;gap:10px;flex-wrap:wrap}
+.chip{font-family:var(--mono);font-size:12.5px;padding:8px 13px;border-radius:9px;background:rgba(255,255,255,.03);border:1px solid rgba(210,76,255,.18);color:#D9CCEC}
+.pred-art{position:relative;display:grid;place-items:center;min-height:280px}
+.mascot{width:230px;filter:drop-shadow(0 24px 50px rgba(41,169,255,.35));animation:float 6s ease-in-out infinite}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-14px)}}
+.pred-card{
+  position:absolute;font-family:var(--mono);background:rgba(19,26,46,.85);border:1px solid var(--line);
+  border-radius:12px;padding:12px 14px;backdrop-filter:blur(8px);box-shadow:0 12px 30px -14px #000;
+}
+.pc-top{top:8%;left:-4%;font-size:12px}
+.pc-bot{bottom:6%;right:-6%;font-size:12px}
+.pc-q{color:var(--muted);font-size:11px;margin-bottom:6px}
+.pc-row{display:flex;gap:8px;align-items:center}
+.pill-up{color:var(--green);border:1px solid rgba(0,217,139,.3);border-radius:6px;padding:3px 8px;font-size:11px}
+.pill-dn{color:var(--red);border:1px solid rgba(255,77,109,.3);border-radius:6px;padding:3px 8px;font-size:11px}
+
+/* faq */
+.faq{max-width:820px;margin:0 auto}
+.q{border-bottom:1px solid var(--line)}
+.q-head{width:100%;text-align:left;background:none;border:0;color:var(--text);cursor:pointer;
+  padding:22px 0;display:flex;justify-content:space-between;align-items:center;gap:20px;
+  font-family:var(--disp);font-weight:500;font-size:17px}
+.q-head:hover{color:#fff}
+.q-ico{flex:0 0 auto;width:22px;height:22px;position:relative;transition:transform .3s ease}
+.q-ico::before,.q-ico::after{content:"";position:absolute;background:var(--blue);border-radius:2px;transition:opacity .3s}
+.q-ico::before{top:10px;left:2px;width:18px;height:2px}
+.q-ico::after{top:2px;left:10px;width:2px;height:18px}
+.q.open .q-ico{transform:rotate(135deg)}
+.q-body{max-height:0;overflow:hidden;transition:max-height .35s ease}
+.q-body p{color:var(--muted);font-size:15px;line-height:1.7;padding-bottom:22px;max-width:70ch}
+
+/* footer */
+footer{border-top:1px solid var(--line);padding:56px 0 40px;background:linear-gradient(180deg,transparent,rgba(14,19,36,.5))}
+.foot-top{display:flex;justify-content:space-between;align-items:flex-start;gap:40px;flex-wrap:wrap;margin-bottom:40px}
+.foot-brand{display:flex;align-items:center;gap:11px;font-family:var(--disp);font-weight:700;font-size:19px}
+.foot-brand svg{width:32px;height:22px}
+.foot-links{display:flex;gap:64px;flex-wrap:wrap}
+.foot-col{min-width:210px;flex:1}
+.foot-col h5{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);margin-bottom:12px}
+.frow{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:11px 0;font-size:14px;color:var(--muted);border-bottom:1px solid rgba(148,170,255,.06)}
+.frow:last-child{border-bottom:0}
+a.frow{transition:color .2s}
+a.frow:hover{color:var(--text)}
+.tag{font-family:var(--mono);font-size:11px;letter-spacing:.02em;padding:3px 10px;border-radius:100px;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.tag-live{color:var(--green);background:rgba(0,217,139,.08);border:1px solid rgba(0,217,139,.28)}
+.tag-live i{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 7px var(--green)}
+.tag-soon{color:var(--dim);background:rgba(148,170,255,.05);border:1px solid var(--line)}
+.tag-go{color:#BFE6FF;background:rgba(41,169,255,.08);border:1px solid rgba(41,169,255,.24)}
+.foot-bottom{display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap;
+  padding-top:26px;border-top:1px solid var(--line)}
+.disclaimer{font-family:var(--mono);font-size:12.5px;color:var(--dim);display:inline-flex;align-items:center;gap:9px}
+.warn-dot{width:6px;height:6px;border-radius:50%;background:var(--magenta)}
+.copy{font-size:12.5px;color:var(--dim);font-family:var(--mono)}
+
+/* ---------- ENDLESS RUNNER ---------- */
+.runner{position:relative;height:190px;overflow:hidden;border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg,#090D18,#0C1120)}
+.runner-layer{position:absolute;left:0;bottom:36px;width:100%;height:120px;pointer-events:none}
+.candles{position:absolute;left:0;bottom:0;height:120px;width:2560px;opacity:.85;animation:scrollX 26s linear infinite}
+.coins-track{position:absolute;left:0;top:0;height:100%;display:flex;align-items:center;animation:scrollX 11s linear infinite;pointer-events:none}
+.coin-group{display:flex;align-items:center;flex:0 0 auto}
+.coin{flex:0 0 auto;width:34px;height:34px;margin:0 96px;border-radius:50%;display:grid;place-items:center;
+  font-family:var(--mono);font-size:16px;font-weight:700;color:#BFE6FF;
+  background:rgba(41,169,255,.08);border:1px solid rgba(41,169,255,.28);box-shadow:0 0 16px rgba(41,169,255,.28)}
+.coin.up{color:var(--green);background:rgba(0,217,139,.08);border-color:rgba(0,217,139,.3);box-shadow:0 0 16px rgba(0,217,139,.28)}
+.coin.vi{color:#E7C4FF;background:rgba(162,77,255,.1);border-color:rgba(162,77,255,.32);box-shadow:0 0 16px rgba(162,77,255,.28)}
+.coin:nth-child(2n){transform:translateY(-34px)}
+.coin:nth-child(3n){transform:translateY(28px)}
+.coin:nth-child(5n){transform:translateY(-10px)}
+.runner-ground{position:absolute;left:0;bottom:34px;width:100%;height:2px;
+  background:repeating-linear-gradient(90deg,rgba(148,170,255,.45) 0 14px,transparent 14px 32px);
+  animation:groundScroll .45s linear infinite}
+.runner-ground::after{content:"";position:absolute;left:0;top:2px;width:100%;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(41,169,255,.5),rgba(210,76,255,.5),transparent)}
+@keyframes scrollX{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+@keyframes groundScroll{from{background-position:0 0}to{background-position:-32px 0}}
+.runner-mascot{position:absolute;left:15%;bottom:36px;width:96px;height:106px;z-index:3}
+.run-svg{width:100%;height:100%;transform-origin:bottom center;
+  animation:hop .62s cubic-bezier(.3,0,.4,1) infinite;filter:drop-shadow(0 8px 14px rgba(41,169,255,.4))}
+@keyframes hop{
+  0%{transform:translateY(0) scaleY(.9) rotate(-4deg)}
+  30%{transform:translateY(-32px) scaleY(1.06) rotate(3deg)}
+  55%{transform:translateY(0) scaleY(.9) rotate(-4deg)}
+  72%{transform:translateY(-13px) scaleY(1.02) rotate(1deg)}
+  100%{transform:translateY(0) scaleY(.9) rotate(-4deg)}}
+.run-shadow{position:absolute;left:50%;bottom:-8px;width:74px;height:13px;transform:translateX(-50%);border-radius:50%;
+  background:radial-gradient(ellipse,rgba(0,0,0,.55),transparent 70%);animation:shadowPulse .62s cubic-bezier(.3,0,.4,1) infinite}
+@keyframes shadowPulse{0%,55%,100%{transform:translateX(-50%) scaleX(1);opacity:.5}30%,72%{transform:translateX(-50%) scaleX(.5);opacity:.2}}
+.speedlines{position:absolute;right:96%;top:16%;width:130px;height:64%;
+  background:repeating-linear-gradient(90deg,transparent 0 9px,rgba(41,169,255,.28) 9px 11px);
+  -webkit-mask:linear-gradient(90deg,transparent,#000 80%);mask:linear-gradient(90deg,transparent,#000 80%);
+  animation:speed .5s linear infinite}
+@keyframes speed{0%{opacity:.45}50%{opacity:.85}100%{opacity:.45}}
+.runner-cap{position:absolute;top:14px;left:24px;font-size:12px;color:var(--dim);letter-spacing:.05em;z-index:4}
+
+/* responsive */
+@media(max-width:1024px){
+  .wrap{padding:0 22px}
+  section.block{padding:100px 0}
+}
+@media(max-width:900px){
+  nav{padding:12px 20px}
+  .nav-links{display:none}
+  .feat-grid{grid-template-columns:1fr}
+  .steps{grid-template-columns:1fr}
+  .pred{grid-template-columns:1fr;padding:38px 26px;text-align:center}
+  .pred p{margin-inline:auto}.pred-chips{justify-content:center}
+  .pred-art{min-height:270px;margin-top:20px}
+  .stats-inner{grid-template-columns:1fr}
+  .stat + .stat{border-left:0;border-top:1px solid var(--line)}
+  .foot-links{gap:44px}
+}
+@media(max-width:640px){
+  .wrap{padding:0 18px}
+  section.block{padding:78px 0}
+  .hero-inner{padding:44px 0}
+  .hero-mark{width:150px;height:104px;margin-bottom:26px}
+  .hero-cta{flex-direction:column;align-items:stretch}
+  .hero-cta .btn,.hero-cta .btn-ghost{justify-content:center;width:100%}
+  .hero-note{font-size:12px}
+  .stats{margin-top:-16px}
+  .stat{padding:22px 20px}
+  .sec-head{margin-bottom:40px}
+  .feat{padding:26px}
+  .pred{padding:30px 20px;border-radius:20px}
+  .pred-art{display:flex;flex-direction:column;gap:12px;min-height:0;margin-top:24px}
+  .mascot{width:160px}
+  .pred-card{position:static;width:auto}
+  .runner{height:150px}
+  .runner-mascot{width:78px;height:86px;left:11%}
+  .coin{margin:0 66px}
+  .foot-top{gap:28px}
+  .foot-col{min-width:0;flex:1 1 100%}
+  .foot-bottom{flex-direction:column;align-items:flex-start;gap:12px}
+}
+@media(max-width:400px){
+  .brand{font-size:17px}.brand svg{width:28px;height:20px}
+  nav{padding:10px 16px}
+  nav .btn{padding:9px 14px;font-size:13px}
+  h1.hero-title{font-size:38px}
+  .badge{font-size:11px;padding:5px 10px}
+  .sec-title{font-size:27px}
+  .runner{height:132px}
+  .runner-mascot{width:66px;height:74px}
+  .coin{width:28px;height:28px;font-size:13px;margin:0 52px}
+  .runner-cap{font-size:11px;left:16px}
+}
+@media(prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+  .rv{opacity:1;transform:none}
+  .burst{display:none}
+}
+</style>
+</head>
+<body>
+
+<!-- SHARED SVG DEFS -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="tg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#29A9FF"/><stop offset=".45" stop-color="#6A7BFF"/>
+      <stop offset=".7" stop-color="#A24DFF"/><stop offset="1" stop-color="#D44CFF"/>
+    </linearGradient>
+    <radialGradient id="core" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#FFFFFF"/><stop offset=".5" stop-color="#BFE6FF"/><stop offset="1" stop-color="#29A9FF"/>
+    </radialGradient>
+  </defs>
+</svg>
+
+<!-- logo mark template (inline via JS clone would over-engineer; define a JS-free reusable macro through symbol) -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="mark" viewBox="0 0 150 104">
+    <!-- speed trails -->
+    <g stroke="url(#tg)" stroke-linecap="round" opacity=".55">
+      <line class="trail t1" x1="92" y1="44" x2="150" y2="42" stroke-width="2"/>
+      <line class="trail t2" x1="96" y1="54" x2="146" y2="53" stroke-width="1.5"/>
+      <line class="trail t3" x1="90" y1="62" x2="140" y2="62" stroke-width="1.5"/>
+    </g>
+    <!-- upper shard -->
+    <polygon points="60,44 108,10 92,40 80,44" fill="url(#tg)"/>
+    <polygon points="70,44 128,20 100,42 84,45" fill="url(#tg)" opacity=".8"/>
+    <!-- lower shard -->
+    <polygon points="60,50 96,78 78,54 68,50" fill="url(#tg)"/>
+    <polygon points="70,52 118,74 96,54 80,52" fill="url(#tg)" opacity=".7"/>
+    <!-- left chevron -->
+    <polygon points="18,52 46,40 40,50 60,47 42,58 48,66" fill="url(#tg)"/>
+    <!-- glowing core -->
+    <circle cx="62" cy="47" r="12" fill="url(#core)"/>
+    <circle class="pulse" cx="62" cy="47" r="12" fill="none" stroke="#BFE6FF" stroke-width="1.5" opacity=".7"/>
+  </symbol>
+</svg>
+<style>
+  @keyframes trailmove{0%{opacity:.2;transform:translateX(-6px)}50%{opacity:.75}100%{opacity:.2;transform:translateX(0)}}
+  .t1{animation:trailmove 1.8s ease-in-out infinite}
+  .t2{animation:trailmove 1.8s ease-in-out .3s infinite}
+  .t3{animation:trailmove 1.8s ease-in-out .6s infinite}
+  @keyframes corepulse{0%,100%{r:12;opacity:.7}50%{r:15;opacity:0}}
+  .pulse{animation:corepulse 2.4s ease-out infinite}
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="blob" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5EC8FF"/><stop offset="1" stop-color="#2B8FEB"/></linearGradient>
+    <radialGradient id="eye" cx="50%" cy="50%" r="60%"><stop offset="0" stop-color="#8FFCE8"/><stop offset="1" stop-color="#00D98B"/></radialGradient>
+  </defs>
+  <symbol id="mascot" viewBox="0 0 220 240">
+      <path d="M110 20 C70 20 60 46 66 66 C40 78 30 118 40 158 C50 200 78 224 110 224 C142 224 170 200 180 158 C190 118 180 78 154 66 C160 46 150 20 110 20 Z" fill="url(#blob)" stroke="#0A1428" stroke-width="4"/>
+      <path d="M74 60 C82 42 100 34 110 34 C120 34 138 42 146 60" fill="none" stroke="#BFF0FF" stroke-width="3" opacity=".6"/>
+      <ellipse cx="86" cy="128" rx="20" ry="26" fill="#0A1A2E"/>
+      <ellipse cx="140" cy="122" rx="20" ry="26" fill="#0A1A2E"/>
+      <g fill="url(#eye)" filter="drop-shadow(0 0 6px #00D98B)">
+        <path d="M86 112 l6 12 -7 2 8 14 -4 2 -8-14 7-2 -6-12z"/>
+        <circle cx="86" cy="132" r="4"/>
+        <path d="M140 106 l6 12 -7 2 8 14 -4 2 -8-14 7-2 -6-12z"/>
+        <circle cx="140" cy="126" r="4"/>
+      </g>
+      <path d="M104 156 q6 6 14 0" fill="none" stroke="#0A1428" stroke-width="3.5" stroke-linecap="round"/>
+  </symbol>
+</svg>
+<div class="nav-shell" id="navShell"></div>
+<nav>
+  <a class="brand" href="#top"><svg><use href="#mark"/></svg><span>Tachyon<span class="grad-text">Fi</span></span></a>
+  <div class="nav-links">
+    <a href="#features">Features</a>
+    <a href="#how">How it works</a>
+    <a href="#faq">FAQ</a>
+  </div>
+  <div class="nav-right">
+    <a class="btn" href="https://app.tachyonfi.xyz" target="_blank" rel="noopener">Trade Now
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+    </a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<header class="hero" id="top">
+  <canvas id="field"></canvas>
+  <div class="hero-glow"></div>
+  <div class="burst"></div>
+  <div class="wrap hero-inner">
+    <svg class="hero-mark"><use href="#mark"/></svg>
+    <div class="eyebrow hl-1"><span class="badge"><span class="dot"></span>Live on LitVM Testnet</span></div>
+    <h1 class="hero-title hl-2">High-Speed <span class="grad-text">Perpetuals</span></h1>
+    <p class="hero-sub hl-3">A decentralized perps exchange on LitVM. Trade leveraged BTC and ETH — with LTC and more cryptocurrencies on the way — against one shared mUSD pool. Deep, unified liquidity, filled around the clock by an automated keeper at fresh oracle prices.</p>
+    <div class="hero-cta hl-4">
+      <a class="btn" href="https://app.tachyonfi.xyz" target="_blank" rel="noopener">Trade Now
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </a>
+      <a class="btn btn-ghost" href="https://x.com/_tachyonfi" target="_blank" rel="noopener">Follow on X</a>
+    </div>
+    <p class="hero-note hl-5"><span class="warn-dot"></span>Testnet · Unaudited · test mUSD only — nothing here has real value.</p>
+  </div>
+</header>
+
+<!-- STATS -->
+<div class="wrap stats">
+  <div class="stats-inner rv">
+    <div class="stat"><div class="stat-label">Pool TVL</div><div class="stat-val" data-count="1284500" data-prefix="$" data-money="1">$0</div><div class="stat-sub">test mUSD · single vault</div></div>
+    <div class="stat"><div class="stat-label">Live Markets</div><div class="stat-val" data-count="2">0</div><div class="stat-sub">BTC · ETH — more soon</div></div>
+    <div class="stat"><div class="stat-label">Open Interest</div><div class="stat-val" data-count="842300" data-prefix="$" data-money="1">$0</div><div class="stat-sub">long + short, all markets</div></div>
+  </div>
+</div>
+
+<!-- FEATURES -->
+<section class="block wrap" id="features">
+  <div class="sec-head rv">
+    <div class="sec-eyebrow">Built for velocity</div>
+    <h2 class="sec-title">Trading infrastructure that runs itself</h2>
+    <p class="sec-lead">One pool, an autonomous keeper, and an on-chain safety layer — engineered so positions fill fast and the vault stays protected.</p>
+  </div>
+  <div class="feat-grid">
+    <div class="feat rv d1">
+      <div class="feat-ico"><svg viewBox="0 0 24 24"><path d="M3 7c0-1.7 4-3 9-3s9 1.3 9 3-4 3-9 3-9-1.3-9-3Z"/><path d="M3 7v10c0 1.7 4 3 9 3s9-1.3 9-3V7"/><path d="M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/></svg></div>
+      <h3>One pool, every market</h3>
+      <p>A single mUSD vault backs BTC and ETH alike, so liquidity stays deep and unified — and LPs earn from all trading activity, not one isolated market.</p>
+    </div>
+    <div class="feat rv d2">
+      <div class="feat-ico"><svg viewBox="0 0 24 24"><path d="M12 3v4"/><path d="M12 17v4"/><path d="M5 12H3"/><path d="M21 12h-2"/><circle cx="12" cy="12" r="4"/><path d="M12 8a4 4 0 0 1 4 4"/></svg></div>
+      <h3>Self-running execution</h3>
+      <p>A two-step request-and-execute flow with front-running protection. An automated keeper fills orders 24/7 at fresh oracle prices — no manual steps, around the clock.</p>
+    </div>
+    <div class="feat rv d3">
+      <div class="feat-ico"><svg viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 5 3.4 7.7 8 9 4.6-1.3 8-4 8-9V6l-8-3Z"/><path d="M9 12l2 2 4-4"/></svg></div>
+      <h3>On-chain circuit-breaker</h3>
+      <p>Prices are cross-checked against a secondary feed. If they diverge abnormally, new risk halts automatically — guarding the pool against oracle manipulation and bad debt during fast moves.</p>
+    </div>
+    <div class="feat rv d4">
+      <div class="feat-ico"><svg viewBox="0 0 24 24"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8Z"/></svg></div>
+      <h3>Fast &amp; low-cost on LitVM</h3>
+      <p>Built native to the Litecoin-aligned EVM chain: sub-cent gas and quick execution, so trading feels immediate — true to the tachyon name.</p>
+    </div>
+  </div>
+</section>
+
+<!-- HOW IT WORKS -->
+<section class="block wrap" id="how">
+  <div class="sec-head rv">
+    <div class="sec-eyebrow">From zero to open position</div>
+    <h2 class="sec-title">Three steps, no real funds</h2>
+  </div>
+  <div class="steps">
+    <div class="step rv d1"><div class="step-num">01</div><div class="step-line"></div><h4>Connect your wallet</h4><p>Open the app and connect. It prompts you to switch to the LitVM network automatically.</p></div>
+    <div class="step rv d2"><div class="step-num">02</div><div class="step-line"></div><h4>Claim test mUSD</h4><p>Grab free test mUSD from the built-in faucet. It's testnet collateral — nothing has real value.</p></div>
+    <div class="step rv d3"><div class="step-num">03</div><div class="step-line"></div><h4>Open a position</h4><p>Go long or short on BTC or ETH with leverage. The keeper fills your order at the fresh oracle price.</p></div>
+  </div>
+</section>
+
+<!-- ENDLESS RUNNER (lead-in to Predictions) -->
+<div class="runner" aria-hidden="true">
+  <div class="runner-layer">
+    <svg class="candles" viewBox="0 0 2560 120" preserveAspectRatio="none" aria-hidden="true">
+      <rect x="39.1" y="18" width="1.8" height="32" fill="rgba(0,217,139,.20)"/>
+      <rect x="35.0" y="26" width="10" height="16" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="105.1" y="24" width="1.8" height="85" fill="rgba(255,77,109,.20)"/>
+      <rect x="101.0" y="45" width="10" height="53" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="171.1" y="10" width="1.8" height="82" fill="rgba(255,77,109,.20)"/>
+      <rect x="167.0" y="30" width="10" height="48" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="237.1" y="30" width="1.8" height="79" fill="rgba(0,217,139,.20)"/>
+      <rect x="233.0" y="49" width="10" height="43" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="303.1" y="16" width="1.8" height="76" fill="rgba(0,217,139,.20)"/>
+      <rect x="299.0" y="34" width="10" height="38" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="369.1" y="36" width="1.8" height="59" fill="rgba(0,217,139,.20)"/>
+      <rect x="365.0" y="53" width="10" height="33" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="435.1" y="22" width="1.8" height="56" fill="rgba(255,77,109,.20)"/>
+      <rect x="431.0" y="38" width="10" height="28" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="501.1" y="42" width="1.8" height="53" fill="rgba(255,77,109,.20)"/>
+      <rect x="497.0" y="57" width="10" height="23" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="567.1" y="28" width="1.8" height="50" fill="rgba(0,217,139,.20)"/>
+      <rect x="563.0" y="42" width="10" height="18" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="633.1" y="14" width="1.8" height="89" fill="rgba(0,217,139,.20)"/>
+      <rect x="629.0" y="27" width="10" height="55" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="699.1" y="34" width="1.8" height="72" fill="rgba(0,217,139,.20)"/>
+      <rect x="695.0" y="46" width="10" height="50" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="765.1" y="20" width="1.8" height="69" fill="rgba(255,77,109,.20)"/>
+      <rect x="761.0" y="31" width="10" height="45" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="831.1" y="40" width="1.8" height="66" fill="rgba(255,77,109,.20)"/>
+      <rect x="827.0" y="50" width="10" height="40" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="897.1" y="26" width="1.8" height="63" fill="rgba(0,217,139,.20)"/>
+      <rect x="893.0" y="35" width="10" height="35" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="963.1" y="46" width="1.8" height="46" fill="rgba(0,217,139,.20)"/>
+      <rect x="959.0" y="54" width="10" height="30" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="1029.1" y="18" width="1.8" height="57" fill="rgba(0,217,139,.20)"/>
+      <rect x="1025.0" y="39" width="10" height="25" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="1095.1" y="38" width="1.8" height="54" fill="rgba(255,77,109,.20)"/>
+      <rect x="1091.0" y="58" width="10" height="20" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="1161.1" y="24" width="1.8" height="93" fill="rgba(255,77,109,.20)"/>
+      <rect x="1157.0" y="43" width="10" height="57" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="1227.1" y="10" width="1.8" height="90" fill="rgba(0,217,139,.20)"/>
+      <rect x="1223.0" y="28" width="10" height="52" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="1319.1" y="18" width="1.8" height="32" fill="rgba(0,217,139,.20)"/>
+      <rect x="1315.0" y="26" width="10" height="16" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="1385.1" y="24" width="1.8" height="85" fill="rgba(255,77,109,.20)"/>
+      <rect x="1381.0" y="45" width="10" height="53" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="1451.1" y="10" width="1.8" height="82" fill="rgba(255,77,109,.20)"/>
+      <rect x="1447.0" y="30" width="10" height="48" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="1517.1" y="30" width="1.8" height="79" fill="rgba(0,217,139,.20)"/>
+      <rect x="1513.0" y="49" width="10" height="43" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="1583.1" y="16" width="1.8" height="76" fill="rgba(0,217,139,.20)"/>
+      <rect x="1579.0" y="34" width="10" height="38" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="1649.1" y="36" width="1.8" height="59" fill="rgba(0,217,139,.20)"/>
+      <rect x="1645.0" y="53" width="10" height="33" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="1715.1" y="22" width="1.8" height="56" fill="rgba(255,77,109,.20)"/>
+      <rect x="1711.0" y="38" width="10" height="28" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="1781.1" y="42" width="1.8" height="53" fill="rgba(255,77,109,.20)"/>
+      <rect x="1777.0" y="57" width="10" height="23" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="1847.1" y="28" width="1.8" height="50" fill="rgba(0,217,139,.20)"/>
+      <rect x="1843.0" y="42" width="10" height="18" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="1913.1" y="14" width="1.8" height="89" fill="rgba(0,217,139,.20)"/>
+      <rect x="1909.0" y="27" width="10" height="55" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="1979.1" y="34" width="1.8" height="72" fill="rgba(0,217,139,.20)"/>
+      <rect x="1975.0" y="46" width="10" height="50" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="2045.1" y="20" width="1.8" height="69" fill="rgba(255,77,109,.20)"/>
+      <rect x="2041.0" y="31" width="10" height="45" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="2111.1" y="40" width="1.8" height="66" fill="rgba(255,77,109,.20)"/>
+      <rect x="2107.0" y="50" width="10" height="40" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="2177.1" y="26" width="1.8" height="63" fill="rgba(0,217,139,.20)"/>
+      <rect x="2173.0" y="35" width="10" height="35" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="2243.1" y="46" width="1.8" height="46" fill="rgba(0,217,139,.20)"/>
+      <rect x="2239.0" y="54" width="10" height="30" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="2309.1" y="18" width="1.8" height="57" fill="rgba(0,217,139,.20)"/>
+      <rect x="2305.0" y="39" width="10" height="25" rx="1.5" fill="rgba(0,217,139,.16)"/>
+      <rect x="2375.1" y="38" width="1.8" height="54" fill="rgba(255,77,109,.20)"/>
+      <rect x="2371.0" y="58" width="10" height="20" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="2441.1" y="24" width="1.8" height="93" fill="rgba(255,77,109,.20)"/>
+      <rect x="2437.0" y="43" width="10" height="57" rx="1.5" fill="rgba(255,77,109,.16)"/>
+      <rect x="2507.1" y="10" width="1.8" height="90" fill="rgba(0,217,139,.20)"/>
+      <rect x="2503.0" y="28" width="10" height="52" rx="1.5" fill="rgba(0,217,139,.16)"/>
+    </svg>
+  </div>
+  <div class="coins-track">
+    <div class="coin-group"><span class="coin ">₿</span><span class="coin vi">Ξ</span><span class="coin up">Ł</span><span class="coin ">$</span><span class="coin vi">Ξ</span><span class="coin up">₿</span><span class="coin ">Ł</span><span class="coin vi">$</span></div>
+    <div class="coin-group"><span class="coin ">₿</span><span class="coin vi">Ξ</span><span class="coin up">Ł</span><span class="coin ">$</span><span class="coin vi">Ξ</span><span class="coin up">₿</span><span class="coin ">Ł</span><span class="coin vi">$</span></div>
+  </div>
+  <div class="runner-ground"></div>
+  <div class="runner-mascot">
+    <div class="speedlines"></div>
+    <svg class="run-svg" viewBox="0 0 220 240" aria-hidden="true"><use href="#mascot"/></svg>
+    <div class="run-shadow"></div>
+  </div>
+  <span class="runner-cap mono">// there's always another move</span>
+</div>
+
+<!-- PREDICTIONS -->
+<section class="block wrap" id="predictions">
+  <div class="pred rv">
+    <div class="pred-copy">
+      <span class="badge pred-badge">Coming Soon</span>
+      <h2>Prediction markets,<br>the fast &amp; simple way in</h2>
+      <p>No leverage, no liquidations — just pick a side. "Will BTC be up or down?" Stake, and watch it play out over short, snappy windows. Auto-generated around the clock, beginner-friendly, and housed in the same app as perps.</p>
+      <div class="pred-chips">
+        <span class="chip">Minutes-to-an-hour windows</span>
+        <span class="chip">Up / down, that's it</span>
+        <span class="chip">No leverage</span>
+        <span class="chip">Same app as Perps</span>
+      </div>
+    </div>
+    <div class="pred-art">
+      <!-- mascot (swap in the real PNG on your build) -->
+      <svg class="mascot" viewBox="0 0 220 240" aria-hidden="true"><use href="#mascot"/></svg>
+      <div class="pred-card pc-top">
+        <div class="pc-q">BTC · next 15 min</div>
+        <div class="pc-row"><span class="pill-up">UP ▲</span><span style="color:var(--dim)">vs</span><span class="pill-dn">DOWN ▼</span></div>
+      </div>
+      <div class="pred-card pc-bot">
+        <div class="pc-q">ETH · next 5 min</div>
+        <div class="pc-row"><span class="pill-up">62%</span><span style="color:var(--dim)">/</span><span class="pill-dn">38%</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FAQ -->
+<section class="block wrap" id="faq">
+  <div class="sec-head rv" style="text-align:center">
+    <div class="sec-eyebrow" style="text-align:center">Good to know</div>
+    <h2 class="sec-title" style="margin-inline:auto;text-align:center">Questions, answered straight</h2>
+  </div>
+  <div class="faq rv">
+    <div class="q"><button class="q-head">What is TachyonFi?<span class="q-ico"></span></button><div class="q-body"><p>A decentralized perpetual futures exchange on LitVM — take leveraged long or short positions on BTC and ETH against a single shared liquidity pool.</p></div></div>
+    <div class="q"><button class="q-head">Is this real money?<span class="q-ico"></span></button><div class="q-body"><p>No. TachyonFi runs on LitVM testnet. You trade with test mUSD claimed from the faucet — nothing here has real value.</p></div></div>
+    <div class="q"><button class="q-head">How do I start?<span class="q-ico"></span></button><div class="q-body"><p>Connect your wallet, switch to LitVM (the app prompts you), claim test mUSD from the faucet, then open a position.</p></div></div>
+    <div class="q"><button class="q-head">What can I trade?<span class="q-ico"></span></button><div class="q-body"><p>BTC and ETH perpetuals — long or short, with leverage. More markets are coming, with LTC next.</p></div></div>
+    <div class="q"><button class="q-head">What's coming next?<span class="q-ico"></span></button><div class="q-body"><p>Prediction markets — fast, simple crypto up/down price markets, right inside the same app — plus more assets.</p></div></div>
+    <div class="q"><button class="q-head">How are trades executed?<span class="q-ico"></span></button><div class="q-body"><p>A two-step request/execute flow. An automated keeper fills your order at fresh oracle prices, with front-running protection, 24/7.</p></div></div>
+    <div class="q"><button class="q-head">How are prices set?<span class="q-ico"></span></button><div class="q-body"><p>A RedStone oracle feeds prices, backed by an on-chain circuit-breaker that halts new risk if prices diverge abnormally.</p></div></div>
+    <div class="q"><button class="q-head">Is it audited?<span class="q-ico"></span></button><div class="q-body"><p>Not yet. This is an early testnet release for testing and feedback — it is not production-ready.</p></div></div>
+    <div class="q"><button class="q-head">Where are the docs?<span class="q-ico"></span></button><div class="q-body"><p>Coming soon.</p></div></div>
+    <div class="q"><button class="q-head">Feedback or bugs?<span class="q-ico"></span></button><div class="q-body"><p>Reach out on X at @_tachyonfi.</p></div></div>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <div class="wrap">
+    <div class="foot-top">
+      <div>
+        <div class="foot-brand"><svg><use href="#mark"/></svg><span>Tachyon<span class="grad-text">Fi</span></span></div>
+        <p style="color:var(--muted);font-size:14px;margin-top:14px;max-width:34ch">High-speed perpetual futures on LitVM. Deep, unified liquidity — filled around the clock.</p>
+      </div>
+      <div class="foot-links">
+        <div class="foot-col">
+          <h5>Product</h5>
+          <a class="frow" href="https://app.tachyonfi.xyz" target="_blank" rel="noopener"><span>Trade Now</span><span class="tag tag-go">Open ↗</span></a>
+          <div class="frow"><span>Perps</span><span class="tag tag-live"><i></i>Live</span></div>
+          <div class="frow"><span>Predictions</span><span class="tag tag-soon">Soon</span></div>
+        </div>
+        <div class="foot-col">
+          <h5>Resources</h5>
+          <a class="frow" href="https://x.com/_tachyonfi" target="_blank" rel="noopener"><span>X · @_tachyonfi</span><span class="tag tag-go">Follow ↗</span></a>
+          <div class="frow"><span>Docs</span><span class="tag tag-soon">Soon</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span class="disclaimer"><span class="warn-dot"></span>Testnet · Unaudited — for testing and feedback only. Not financial advice.</span>
+      <span class="copy">© 2026 TachyonFi</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+const reduce = window.matchMedia('(prefers-reduced-motion:reduce)').matches;
+
+/* nav shell */
+const shell=document.getElementById('navShell');
+addEventListener('scroll',()=>shell.classList.toggle('scrolled',scrollY>20));
+
+/* reveals */
+const io=new IntersectionObserver((es)=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}}),{threshold:.12});
+document.querySelectorAll('.rv:not(.in)').forEach(el=>io.observe(el));
+
+/* count up */
+function countUp(el){
+  const target=+el.dataset.count, money=el.dataset.money, pre=el.dataset.prefix||'';
+  const dur=1500, t0=performance.now();
+  function fmt(n){return money?Math.round(n).toLocaleString('en-US'):Math.round(n).toString()}
+  function tick(t){
+    const p=Math.min((t-t0)/dur,1), e=1-Math.pow(1-p,3);
+    el.textContent=pre+fmt(target*e); if(p<1)requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+}
+const sio=new IntersectionObserver((es)=>es.forEach(e=>{if(e.isIntersecting){countUp(e.target);sio.unobserve(e.target)}}),{threshold:.5});
+if(!reduce)document.querySelectorAll('[data-count]').forEach(el=>sio.observe(el));
+else document.querySelectorAll('[data-count]').forEach(el=>{el.textContent=(el.dataset.prefix||'')+(+el.dataset.count).toLocaleString('en-US')});
+
+/* faq accordion */
+document.querySelectorAll('.q-head').forEach(b=>b.addEventListener('click',()=>{
+  const q=b.parentElement, body=q.querySelector('.q-body'), open=q.classList.contains('open');
+  document.querySelectorAll('.q.open').forEach(o=>{o.classList.remove('open');o.querySelector('.q-body').style.maxHeight=null});
+  if(!open){q.classList.add('open');body.style.maxHeight=body.scrollHeight+'px'}
+}));
+
+/* hero velocity field */
+const cv=document.getElementById('field'), ctx=cv.getContext('2d');
+let W,H,parts=[];
+const cols=['41,169,255','106,123,255','162,77,255','212,76,255'];
+function size(){W=cv.width=innerWidth*devicePixelRatio;H=cv.height=cv.offsetHeight*devicePixelRatio;ctx.scale(1,1)}
+function seed(){parts=[];const n=Math.min(150,Math.floor(innerWidth/10));for(let i=0;i<n;i++)parts.push(mk())}
+function mk(){const hyper=Math.random()<.18;const s=Math.random()*2.6+.7;return{x:Math.random()*W,y:Math.random()*H,v:s*devicePixelRatio*(hyper?3.6:2),len:((hyper?Math.random()*150+100:Math.random()*60+20))*devicePixelRatio,c:cols[Math.floor(Math.random()*cols.length)],a:(hyper?Math.random()*.35+.4:Math.random()*.45+.14),r:(hyper?Math.random()*1.6+.9:Math.random()*1.2+.3),hyper}}
+function frame(){
+  ctx.clearRect(0,0,W,H);
+  for(const p of parts){
+    ctx.strokeStyle=`rgba(${p.c},${p.a})`; ctx.lineWidth=p.r; ctx.beginPath();
+    ctx.moveTo(p.x,p.y); ctx.lineTo(p.x-p.len,p.y); ctx.stroke();
+    ctx.fillStyle=`rgba(255,255,255,${p.a*.9})`; ctx.beginPath(); ctx.arc(p.x,p.y,p.r*.9,0,7); ctx.fill();
+    p.x+=p.v; if(p.x-p.len>W){p.x=-p.len;p.y=Math.random()*H;p.a=Math.random()*.5+.15}
+  }
+  requestAnimationFrame(frame);
+}
+function initField(){if(reduce){return}size();seed();frame()}
+addEventListener('resize',()=>{if(!reduce){size();seed()}});
+initField();
+</script>
+</body>
+</html>
