@@ -1,0 +1,24 @@
+/* Real logo PNG that replaces the reference's inline SVG mark stand-in.
+   The reference's SVG-specific rules (.brand svg, and .hero-mark's fixed
+   width/height) assume a ~1.44:1 SVG; the real mark is a wide ~2.33:1 image
+   (tightly cropped to public/logo-mark.png), so it is sized by HEIGHT with
+   width:auto to avoid distortion. Sizing / cropping / positioning only —
+   no colors, copy, fonts, layout, spacing, or animations are touched.
+   The glow/drop-shadow and ignite animation stay on global.css's .hero-mark. */
+
+/* Nav mark: height matched to the "TachyonFi" wordmark; centered by .brand's flex. */
+.brand img{height:26px;width:auto;display:block;object-fit:contain}
+
+/* Hero mark: sized by height, width auto (overrides global's fixed 200x139 box).
+   display:block makes it the top of the content column (left-aligned with the
+   badge/H1/subhead) instead of sitting inline beside the badge; margin-bottom
+   tightens the gap so it sits directly above the badge. Size/glow unchanged. */
+.hero-mark{width:auto;height:120px;object-fit:contain;display:block;margin-bottom:20px}
+
+@media(max-width:640px){
+  /* overrides global's mobile fixed 150x104 box */
+  .hero-mark{width:auto;height:100px}
+}
+@media(max-width:400px){
+  .brand img{height:22px;width:auto}
+}
