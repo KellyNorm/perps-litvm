@@ -40,3 +40,9 @@ export function musdWrite(signer) {
 export function pmWrite(signer) {
   return new ethers.Contract(ADDRESSES.positionManager, PositionManager, signer);
 }
+
+// Signer-bound LiquidityPool for the LP deposit/withdraw/redeem writes. The connected
+// wallet signs deposit (after approving the pool as the mUSD spender) and withdraw/redeem.
+export function poolWrite(signer) {
+  return new ethers.Contract(ADDRESSES.pool, LiquidityPool, signer);
+}

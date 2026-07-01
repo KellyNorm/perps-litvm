@@ -798,6 +798,162 @@ tbody tr.danger {
   border-radius: 4px;
 }
 
+/* --- LP vault: position + P&L + provide-liquidity panel --------------------- */
+.vault-wrap {
+  display: flex;
+  flex-direction: column;
+}
+
+/* 2) Your liquidity + P&L */
+.lp-position {
+  padding: 16px 18px;
+  border-top: 1px solid var(--line-soft);
+  background: var(--panel);
+}
+.lp-position.empty {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.lp-position.empty .btn.connect {
+  flex: none;
+}
+.lp-position-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 13px;
+}
+.lp-shares {
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 700;
+}
+.lp-shares small {
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 500;
+}
+.lp-badge {
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent-blue);
+  border: 1px solid var(--line);
+  background: rgba(41, 169, 255, 0.08);
+  border-radius: 20px;
+  padding: 4px 10px;
+  font-weight: 700;
+}
+.lp-badge.provide {
+  color: var(--pos);
+  border-color: rgba(0, 217, 139, 0.3);
+  background: var(--pos-dim);
+}
+.lp-pnl-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: var(--line-soft);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+.lp-stat {
+  background: var(--bg);
+  padding: 12px 14px;
+}
+.lp-stat .k {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.lp-stat .v {
+  font-family: var(--mono);
+  font-size: 16px;
+  font-weight: 700;
+}
+.lp-stat .v small {
+  font-size: 11px;
+  font-weight: 500;
+  margin-left: 3px;
+}
+.lp-stat .v.pos {
+  color: var(--pos);
+}
+.lp-stat .v.neg {
+  color: var(--neg);
+}
+.lp-note {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.5;
+  margin-top: 11px;
+}
+.lp-note.cap {
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--bg);
+  padding: 9px 12px;
+  margin: 12px 0 0;
+}
+
+/* 3) Provide-liquidity panel — visually distinct from the trade ticket */
+.lp-panel {
+  padding: 18px;
+  border-top: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(0, 217, 139, 0.04), transparent 90px), var(--panel);
+}
+.lp-panel-head {
+  margin-bottom: 14px;
+}
+.lp-panel-title {
+  font-family: var(--disp);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  margin-top: 9px;
+}
+.lp-otabs {
+  margin-bottom: 16px;
+}
+.open-btn.lp-btn.deposit {
+  background: linear-gradient(180deg, #1fe6a0, #00b878);
+}
+.open-btn.lp-btn.withdraw {
+  background: linear-gradient(180deg, #6fc2ff, var(--molten-deep));
+  color: var(--bg);
+}
+.lp-explainer {
+  text-align: left;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.6;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 12px;
+}
+.lp-explainer b {
+  color: var(--steel, var(--text));
+}
+@media (max-width: 560px) {
+  .lp-pnl-grid {
+    grid-template-columns: 1fr;
+  }
+  .lp-position.empty {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
 /* right ticket panel */
 .panel {
   background: var(--panel);

@@ -34,7 +34,7 @@ export default function App() {
   // current price, and position PnL so they tick smoothly. RedStone `marks` stay the
   // labeled "mark · execution" reference (what trades actually settle against).
   const { live, source: liveSource } = useLiveFeed(supportedSymbols);
-  const { data: vault, yourDeposit } = useVault(account);
+  const { data: vault, yourDeposit, refresh: refreshVault } = useVault(account);
   const { positions, refresh: refreshPositions } = usePositions(account, supported);
   const balances = useBalances(account);
   const rpcDegraded = useRpcHealth();
@@ -63,6 +63,12 @@ export default function App() {
     balances.refresh();
     orders.refresh();
   }, [refreshPositions, balances, orders]);
+
+  // LP deposit/withdraw settled: refresh the vault stats + the wallet's mUSD balance.
+  const onLpDone = useCallback(() => {
+    refreshVault();
+    balances.refresh();
+  }, [refreshVault, balances]);
 
   const trade = useTrade({
     account,
@@ -187,7 +193,19 @@ export default function App() {
                 ) : tab === "orders" ? (
                   <OrdersTable account={account} orders={orders.orders} readiness={orders.readiness} trade={trade} wrongChain={wrongChain} />
                 ) : (
-                  <VaultPanel vault={vault} yourDeposit={yourDeposit} account={account} />
+                  <VaultPanel
+                    vault={vault}
+                    yourDeposit={yourDeposit}
+                    account={account}
+                    wrongChain={wrongChain}
+                    getSigner={wallet.getSigner}
+                    musdBalance={balances.musd}
+                    onConnect={wallet.connect}
+                    onSwitch={wallet.switchChain}
+                    onFaucet={() => setModalOpen(true)}
+                    toast={showToast}
+                    onDone={onLpDone}
+                  />
                 )}
               </div>
             </div>
