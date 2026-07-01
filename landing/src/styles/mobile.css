@@ -1,0 +1,34 @@
+/* Mobile-only overrides — approved, documented design deviation.
+   Imported AFTER global.css so these win by source order at equal specificity.
+   Scope: hero section only, at max-width:640px. Desktop/tablet (>640px) are
+   pixel-identical to before. Only alignment/centering changes here — no sizes,
+   colors, fonts, or animations are altered, and no other section is touched. */
+@media (max-width: 640px) {
+  /* Center every hero text element: badge, H1, subhead, CTA row, disclaimer. */
+  .hero-inner {
+    text-align: center;
+  }
+
+  /* Logo mark: center horizontally above the badge (it's an inline img with a
+     fixed width, so block + auto inline margins centers the mark itself). */
+  .hero-mark {
+    display: block;
+    margin-inline: auto;
+  }
+
+  /* H1 is a max-width:12ch block; center the block, not just its wrapped lines. */
+  h1.hero-title {
+    margin-inline: auto;
+  }
+
+  /* Subhead: comfortable readable measure, centered (don't stretch edge-to-edge). */
+  .hero-sub {
+    max-width: 40ch;
+    margin-inline: auto;
+  }
+
+  /* Disclaimer line is a flex row (dot + text) — center its contents. */
+  .hero-note {
+    justify-content: center;
+  }
+}
