@@ -1,6 +1,8 @@
 import Nav from './components/Nav'
 import Hero from './components/Hero'
 import Stats from './components/Stats'
+import Features from './components/Features'
+import How from './components/How'
 
 export default function App() {
   return (
@@ -8,6 +10,8 @@ export default function App() {
       <Nav />
       <Hero />
       <Stats />
+      <Features />
+      <How />
     </>
   )
 }
