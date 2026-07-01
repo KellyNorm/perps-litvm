@@ -9,6 +9,11 @@
 /* Nav mark: height matched to the "TachyonFi" wordmark; centered by .brand's flex. */
 .brand img{height:26px;width:auto;display:block;object-fit:contain}
 
+/* Footer mark: replaces the reference's .foot-brand svg (32x22 stand-in). Sized
+   by HEIGHT with width:auto for the wide PNG, matching the nav-mark approach and
+   the reference's ~22px mark height. Sizing only. */
+.foot-brand img{height:22px;width:auto;display:block;object-fit:contain}
+
 /* Hero mark: sized by height, width auto (overrides global's fixed 200x139 box).
    display:block makes it the top of the content column (left-aligned with the
    badge/H1/subhead) instead of sitting inline beside the badge; margin-bottom
