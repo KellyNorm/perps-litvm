@@ -237,6 +237,7 @@ abstract contract OracleResolvedMarket is ReentrancyGuard {
         if (_voidBeforeSettle(marketId)) {
             m.phase = Phase.Void;
             emit MarketResolved(marketId, m.phase, m.outcome, m.settlePrice);
+            _afterResolve(marketId);
             return;
         }
 
@@ -270,6 +271,7 @@ abstract contract OracleResolvedMarket is ReentrancyGuard {
         }
 
         emit MarketResolved(marketId, m.phase, m.outcome, m.settlePrice);
+        _afterResolve(marketId);
     }
 
     // ------------------------------------------------------------- views
@@ -322,5 +324,15 @@ abstract contract OracleResolvedMarket is ReentrancyGuard {
     function _voidBeforeSettle(uint256 marketId) internal view virtual returns (bool) {
         marketId; // silence unused-parameter warning in the base no-op
         return false;
+    }
+
+    /**
+     * @notice Hook: a market has just reached a terminal phase (Settled or Void).
+     * @dev The auto-factory overrides this to prune its bounded active-set so
+     *      replenish never scans dead markets. Base is a no-op, so the resolution
+     *      and money layers are unaffected.
+     */
+    function _afterResolve(uint256 marketId) internal virtual {
+        marketId; // silence unused-parameter warning in the base no-op
     }
 }

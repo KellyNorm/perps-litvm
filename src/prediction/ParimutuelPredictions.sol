@@ -121,10 +121,36 @@ contract ParimutuelPredictions is OracleResolvedMarket, Ownable, Pausable {
         uint256 offsetBps,
         bool offsetUp
     ) external onlyOwner whenNotPaused returns (uint256 marketId) {
+        return _openMarket(assetId, feed, betWindow, settleWindow, offsetBps, offsetUp);
+    }
+
+    /**
+     * @notice Shared market-open path: capture strike (resolution layer), freeze
+     *         the fee, then fire {_onMarketCreated}. Reused by the owner entry
+     *         above and by the auto-factory layer, so every market — however it is
+     *         created — snapshots its fee identically and is tracked identically.
+     */
+    function _openMarket(
+        uint16 assetId,
+        IAggregatorV3 feed,
+        uint64 betWindow,
+        uint64 settleWindow,
+        uint256 offsetBps,
+        bool offsetUp
+    ) internal returns (uint256 marketId) {
         marketId = _createMarket(assetId, feed, betWindow, settleWindow, offsetBps, offsetUp);
         uint16 fee = uint16(feeBps); // feeBps <= FEE_CAP (300) so the cast is exact
         _pools[marketId].feeBps = fee;
         emit MarketOpened(marketId, fee);
+        _onMarketCreated(marketId);
+    }
+
+    /**
+     * @notice Hook: a market has just been opened. The auto-factory overrides this
+     *         to register the market in its active-set. Base is a no-op.
+     */
+    function _onMarketCreated(uint256 marketId) internal virtual {
+        marketId; // silence unused-parameter warning in the base no-op
     }
 
     // ------------------------------------------------------------------- bet
