@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IAggregatorV3} from "./IAggregatorV3.sol";
 import {SafeAggregatorReader} from "./SafeAggregatorReader.sol";
 import {PredictionTwap} from "./PredictionTwap.sol";
@@ -27,7 +28,7 @@ import {PredictionTwap} from "./PredictionTwap.sol";
  *         and `tExpiry = tLock + settleWindow` with both windows > 0 — so no sample
  *         that determines the result can ever be taken before betting closes.
  */
-abstract contract OracleResolvedMarket {
+abstract contract OracleResolvedMarket is ReentrancyGuard {
     using SafeAggregatorReader for IAggregatorV3;
 
     // ----------------------------------------------------------------- types
@@ -224,10 +225,20 @@ abstract contract OracleResolvedMarket {
      *      A real outcome is fixed ONLY from a valid TWAP built of healthy samples;
      *      every ambiguous path lands on VOID (design §14.5).
      */
-    function settle(uint256 marketId) external {
+    function settle(uint256 marketId) external nonReentrant {
         Market storage m = _market(marketId);
         if (m.phase == Phase.Settled || m.phase == Phase.Void) revert AlreadyResolved();
         if (uint64(block.timestamp) < m.tExpiry) revert BeforeExpiry();
+
+        // Pool-driven VOID (design §5.6/§5.7): a one-sided or empty book has no
+        // real counterparty to win against, so it voids WITHOUT an oracle read —
+        // cheaper and unmanipulable. The money layer overrides {_voidBeforeSettle};
+        // the base default never short-circuits.
+        if (_voidBeforeSettle(marketId)) {
+            m.phase = Phase.Void;
+            emit MarketResolved(marketId, m.phase, m.outcome, m.settlePrice);
+            return;
+        }
 
         (bool valid, int256 twap) = PredictionTwap.compute(
             _observations[marketId],
@@ -300,5 +311,16 @@ abstract contract OracleResolvedMarket {
     function _market(uint256 marketId) internal view returns (Market storage) {
         if (marketId >= _markets.length) revert NoSuchMarket();
         return _markets[marketId];
+    }
+
+    /**
+     * @notice Hook: force a VOID before any TWAP work is done (design §5.6/§5.7).
+     * @dev The money layer overrides this to void a one-sided or zero-participant
+     *      book (no real counterparty). The base — which knows nothing about pools
+     *      — never short-circuits, so the pure resolution layer is unaffected.
+     */
+    function _voidBeforeSettle(uint256 marketId) internal view virtual returns (bool) {
+        marketId; // silence unused-parameter warning in the base no-op
+        return false;
     }
 }
