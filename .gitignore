@@ -16,6 +16,7 @@ docs/*
 !docs/oracle-discovery.md
 !docs/stack-redeploy-runbook.md
 !docs/TESTNET_LAUNCH.md
+!docs/prediction-market-design.md
 
 # Dotenv file
 .env
