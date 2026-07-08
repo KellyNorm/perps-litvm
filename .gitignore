@@ -17,6 +17,8 @@ docs/*
 !docs/stack-redeploy-runbook.md
 !docs/TESTNET_LAUNCH.md
 !docs/prediction-market-design.md
+!docs/dia-cadence-diagnostic.md
+!docs/dia_poll.csv
 
 # Dotenv file
 .env
