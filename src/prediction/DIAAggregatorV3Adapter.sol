@@ -13,7 +13,7 @@ import {IDIAOracle} from "./IDIAOracle.sol";
  *         factory's per-asset feed (addAsset / setAssetFeed) at it.
  *
  * @dev    Mapping (design §2, "DIA-swap path"):
- *           - DIA `value` (uint256, 18-dec) -> `answer` (int256, decimals()==18)
+ *           - DIA `value` (uint128, 18-dec) -> `answer` (int256, decimals()==18)
  *           - DIA `timestamp`               -> `updatedAt` AND `startedAt` (staleness anchor)
  *           - `roundId` / `answeredInRound` -> fixed {ROUND} so the completeness guard
  *             (`answeredInRound < roundId`) always holds; DIA has no round concept,
@@ -70,8 +70,9 @@ contract DIAAggregatorV3Adapter is IAggregatorV3 {
      *        - `value == 0`            -> `answer == 0`   (reader rejects: answer <= 0)
      *        - stale / future `ts`     -> `updatedAt`     (reader rejects: staleness/future)
      *      A DIA `value` that would not fit a positive int256 is clamped to 0 (an
-     *      unusable, reader-rejected reading) rather than wrapping to a negative — no
-     *      realistic 18-dec USD price approaches this bound, so it is a pure guardrail.
+     *      unusable, reader-rejected reading) rather than wrapping to a negative. DIA
+     *      packs `value` as uint128, whose max (~3.4e38) sits far below int256's, so the
+     *      clamp can no longer fire in practice — it stays as pure defense-in-depth.
      *      A reverting DIA feed reverts here, which the reader's staticcall catches.
      */
     function latestRoundData()

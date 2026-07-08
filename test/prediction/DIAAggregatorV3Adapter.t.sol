@@ -104,6 +104,34 @@ contract DIAAggregatorV3AdapterTest is Test {
         assertEq(price, int256(60_000e18), "raw 18-dec answer preserved");
     }
 
+    /// DECIMALS REGRESSION GUARD. The live LitVM DIA feed was read empirically and
+    /// returns `getValue("BTC/USD") == 62865495019032875630592` (~$62,865 x 1e18),
+    /// proving 18 decimals despite DIA's docs claiming 8. This pins the adapter to
+    /// that reality: a realistic BTC price passes through as the EXACT same integer,
+    /// not off by any power of ten. If anyone ever reintroduces an 8-dec assumption
+    /// (a /1e10 rescale) or a spurious x1e10, `answer` would drift and this fails.
+    function test_LatestRoundData_RealisticBtcPrice_NoScalingError() public {
+        // $62,865 encoded at 18 decimals — the magnitude class the live feed returns.
+        int256 expected = 62_865e18; // 62_865_000_000_000_000_000_000
+        dia.setValue(KEY, uint256(expected), NOW);
+
+        (, int256 answer,,,) = adapter.latestRoundData();
+
+        // Exact, not merely approximate.
+        assertEq(answer, expected, "18-dec BTC price must map through unscaled");
+
+        // And provably not off by any power of ten in either direction: the 8-dec
+        // misread (1e10 too small) and a 1e10-too-large misread must both be excluded.
+        assertTrue(answer != expected / 1e10, "must NOT collapse to an 8-dec value");
+        assertTrue(answer != expected * 1e10, "must NOT inflate by 1e10");
+
+        // Same guarantee through the exact path the market uses (reader over adapter).
+        dia.setValue(KEY, uint256(expected), NOW);
+        (bool ok, int256 price) = _read();
+        assertTrue(ok, "realistic BTC point must read ok");
+        assertEq(price, expected, "reader preserves the exact 18-dec answer");
+    }
+
     /// Staleness anchor is exact: age == MAX_STALENESS passes, one second older fails.
     function test_StalenessBoundary_IsExact() public {
         dia.setValue(KEY, 60_000e18, NOW - MAX_STALENESS); // exactly at the edge

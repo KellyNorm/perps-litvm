@@ -40,11 +40,13 @@ contract MockDIAOracle is IDIAOracle {
 
     // --- IDIAOracle ---
 
-    function getValue(string memory key) external view returns (uint256 value, uint256 timestamp) {
+    function getValue(string memory key) external view returns (uint128 value, uint128 timestamp) {
         if (reverting) revert("MockDIAOracle: feed down");
         Point storage p = _points[keccak256(bytes(key))];
         // An unknown key returns (0, 0) — mirrors DIA's behavior for an asset that
         // has never been published (e.g. TRX/HYPE/ZCASH before finalization).
-        return (p.value, p.timestamp);
+        // Values are stored as uint256 for test ergonomics but returned as uint128
+        // to match the real feed's ABI; every price/timestamp a test injects fits.
+        return (uint128(p.value), uint128(p.timestamp));
     }
 }
