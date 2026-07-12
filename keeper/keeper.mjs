@@ -38,10 +38,11 @@
 // Usage:  cd keeper && cp .env.example .env && edit .env && node keeper.mjs
 //   (reads keeper/.env via --env-file or a manual source; see README.md)
 
+import { pathToFileURL } from "url";
 import { ethers } from "ethers";
 import { PM_ABI, ERC20_ABI } from "./lib/abi.mjs";
 import { fetchPackages, wrapWithPackages, feedOf, fetchMark } from "./lib/redstone.mjs";
-import { revertReason, staticExecuteCheck } from "./lib/revert.mjs";
+import { revertReason, staticExecuteCheck, extractErrorData } from "./lib/revert.mjs";
 
 // ---- config ---------------------------------------------------------------
 const cfg = {
@@ -60,6 +61,17 @@ const cfg = {
   startBlock: process.env.START_BLOCK ? Number(process.env.START_BLOCK) : undefined,
   loopMs: process.env.KEEPER_LOOP_MS ? Number(process.env.KEEPER_LOOP_MS) : 2500,
   catchUpMs: process.env.KEEPER_CATCHUP_MS ? Number(process.env.KEEPER_CATCHUP_MS) : 30_000,
+};
+
+// ---- transient-RPC retry tuning -------------------------------------------
+// The LitVM RPC (Nitro gateway) intermittently returns 504 / gateway-timeouts and
+// other infra 5xx while upstream is degraded. Those are TRANSIENT: the keeper
+// retries them with capped exponential backoff (2s, 4s, 8s, 16s, cap 30s) instead
+// of dying. All three are env-tunable for ops.
+const RETRY = {
+  attempts: process.env.KEEPER_RPC_RETRIES ? Number(process.env.KEEPER_RPC_RETRIES) : 6,
+  baseMs: process.env.KEEPER_RPC_RETRY_BASE_MS ? Number(process.env.KEEPER_RPC_RETRY_BASE_MS) : 2000,
+  capMs: process.env.KEEPER_RPC_RETRY_CAP_MS ? Number(process.env.KEEPER_RPC_RETRY_CAP_MS) : 30_000,
 };
 for (const [k, v] of Object.entries({
   LITVM_RPC_URL: cfg.rpc,
@@ -94,6 +106,70 @@ function logSys(msg) {
   console.log(`[${ts()}] ${msg}`);
 }
 
+// ---- transient-RPC classification + retry (RPC-call layer only) ------------
+// Distinguish INFRA errors (retryable) from GENUINE contract reverts (fatal to the
+// call, handled exactly as before). This is the whole safety story: a real revert
+// (TriggerNotMet, SlippageNotMet, RequestNotActive, …) carries decodable revert
+// data, so we detect it FIRST and never retry/mask it. Only infra hiccups
+// (HTTP 5xx — esp. 504 — SERVER_ERROR, TIMEOUT, NETWORK_ERROR, and a CALL_EXCEPTION
+// that is really a server error with no revert data) are treated as transient.
+const TRANSIENT_MSG =
+  /\b50[0-9]\b|gateway ?time-?out|bad gateway|service unavailable|temporarily unavailable|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|EAI_AGAIN|socket hang up|timeout|network ?error/i;
+
+export function isTransient(err) {
+  if (!err) return false;
+  // 1. Real contract revert? A decodable revert payload => NOT transient. This guard
+  //    is what stops an infra retry from ever masking a genuine failure.
+  try {
+    const data = extractErrorData(err);
+    if (typeof data === "string" && data.length >= 10) return false;
+  } catch {}
+  // 2. ethers v5 transient error codes.
+  const code = err.code;
+  if (code === "SERVER_ERROR" || code === "TIMEOUT" || code === "NETWORK_ERROR") return true;
+  // 3. HTTP 5xx surfaced on the error (esp. 504 from the gateway). ethers hangs the
+  //    status off a few shapes; a CALL_EXCEPTION that is really a server error (5xx,
+  //    no revert data — step 1 already let it through) is transient per spec.
+  const status =
+    err.status ?? err.statusCode ?? err.error?.status ?? err.serverError?.status ?? err.response?.status;
+  if (typeof status === "number" && status >= 500 && status < 600) return true;
+  // 4. Message / body text fallback (proxies that only put "504 Gateway Time-out" in
+  //    the body). Reached only when there is NO revert data, so matching "timeout"
+  //    here can't swallow a real revert.
+  const hay = `${err.message || ""} ${err.reason || ""} ${err.body || ""} ${
+    err.error?.message || ""
+  } ${err.error?.body || ""}`;
+  if (TRANSIENT_MSG.test(hay)) return true;
+  return false;
+}
+
+// Run `fn` (a single RPC call), retrying ONLY transient errors with capped
+// exponential backoff. A non-transient error (a real revert, a bad-config error)
+// throws IMMEDIATELY — the retry layer shields infra hiccups and nothing else. On
+// exhaustion it rethrows the last error so the caller's existing try/catch can
+// log-and-continue; the process is never brought down by a transient RPC error.
+export async function withRetry(fn, opts = {}) {
+  const attempts = opts.attempts ?? RETRY.attempts;
+  const baseMs = opts.baseMs ?? RETRY.baseMs;
+  const capMs = opts.capMs ?? RETRY.capMs;
+  const label = opts.label || "rpc";
+  let delay = baseMs;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isTransient(err) || attempt >= attempts) throw err;
+      logSys(
+        `${label}: transient RPC error (attempt ${attempt}/${attempts}) — ` +
+          `${err.code || ""} ${err.message || err}`.trim() +
+          ` — retrying in ${(delay / 1000).toFixed(0)}s`,
+      );
+      await sleep(delay);
+      delay = Math.min(delay * 2, capMs);
+    }
+  }
+}
+
 // ---- lifecycle stage timing (baseline telemetry, STEP 1 task B) ------------
 // Pure observation — no behavior change. Each active entry carries an `t` object
 // of wall-clock-ms stamps captured the FIRST time each stage is reached:
@@ -126,11 +202,13 @@ async function main() {
   const pm = new ethers.Contract(cfg.pmAddr, PM_ABI, wallet);
   const musd = new ethers.Contract(cfg.musdAddr, ERC20_ABI, provider);
 
-  const net = await provider.getNetwork();
-  const MIN_DELAY = (await pm.MIN_EXECUTION_DELAY()).toNumber();
-  const EXEC_FEE = await pm.EXECUTION_FEE();
-  const startZkltc = await provider.getBalance(wallet.address);
-  const startMusd = await musd.balanceOf(wallet.address);
+  const net = await withRetry(() => provider.getNetwork(), { label: "getNetwork" });
+  const MIN_DELAY = (
+    await withRetry(() => pm.MIN_EXECUTION_DELAY(), { label: "MIN_EXECUTION_DELAY" })
+  ).toNumber();
+  const EXEC_FEE = await withRetry(() => pm.EXECUTION_FEE(), { label: "EXECUTION_FEE" });
+  const startZkltc = await withRetry(() => provider.getBalance(wallet.address), { label: "getBalance" });
+  const startMusd = await withRetry(() => musd.balanceOf(wallet.address), { label: "balanceOf" });
 
   logSys("=== keeper starting ============================================");
   logSys(`keeper account:    ${wallet.address}  (dedicated — earns the fill fee)`);
@@ -171,7 +249,7 @@ async function main() {
     if (inFlight.has(key)) return; // a fill is settling; let it finish first
     let req;
     try {
-      req = await pm.requests(id);
+      req = await withRetry(() => pm.requests(id), { label: `requests(${key})` });
     } catch (err) {
       logId(key, "errored", `requests() read failed: ${err.message}`);
       return;
@@ -184,7 +262,7 @@ async function main() {
     }
     let isTrigger = false;
     try {
-      isTrigger = !(await pm.triggers(id)).triggerPrice.isZero();
+      isTrigger = !(await withRetry(() => pm.triggers(id), { label: `triggers(${key})` })).triggerPrice.isZero();
     } catch {}
     const feed = feedOf(req.market);
     if (!active.has(key)) {
@@ -225,7 +303,7 @@ async function main() {
   async function catchUpCounter() {
     let next;
     try {
-      next = (await pm.nextRequestId()).toNumber();
+      next = (await withRetry(() => pm.nextRequestId(), { label: "nextRequestId" })).toNumber();
     } catch (err) {
       logSys(`nextRequestId() read failed (transient): ${err.message}`);
       return;
@@ -325,9 +403,13 @@ async function main() {
   // One keeper account, one tx in flight at a time (we await each send). An
   // explicit nonce makes the ordering deterministic; we resync from chain after
   // any send error so a dropped/replaced tx can't wedge the pipeline.
-  let nonce = await provider.getTransactionCount(wallet.address, "latest");
+  let nonce = await withRetry(() => provider.getTransactionCount(wallet.address, "latest"), {
+    label: "getTransactionCount",
+  });
   async function resyncNonce() {
-    nonce = await provider.getTransactionCount(wallet.address, "latest");
+    nonce = await withRetry(() => provider.getTransactionCount(wallet.address, "latest"), {
+      label: "resyncNonce",
+    });
   }
 
   // ---- cached gas limit + fee data (keep the submit hot path RPC-free) -----
@@ -348,7 +430,10 @@ async function main() {
   let cachedGasLimit = null;
   async function ensureGasLimit(txReq) {
     if (cachedGasLimit) return cachedGasLimit;
-    const est = await wallet.estimateGas(txReq);
+    // estimateGas of a guaranteed-fillable tx can't revert, so any throw here is
+    // infra; a would-revert estimate carries revert data and isTransient=false, so
+    // it still surfaces immediately (unchanged behavior).
+    const est = await withRetry(() => wallet.estimateGas(txReq), { label: "estimateGas" });
     cachedGasLimit = est.mul(2);
     if (cachedGasLimit.lt(GAS_FLOOR)) cachedGasLimit = GAS_FLOOR;
     logSys(`gas limit cached @ ${cachedGasLimit} (estimate ${est} ×2, floor ${GAS_FLOOR})`);
@@ -357,7 +442,7 @@ async function main() {
   let feeOverride = null;
   async function refreshFee() {
     try {
-      const fd = await provider.getFeeData();
+      const fd = await withRetry(() => provider.getFeeData(), { label: "getFeeData" });
       if (fd.maxFeePerGas && fd.maxPriorityFeePerGas) {
         feeOverride = {
           maxFeePerGas: fd.maxFeePerGas.mul(2),
@@ -634,7 +719,7 @@ async function main() {
   }
   // Seed the chain clock before scheduling anything off it.
   try {
-    const b = await provider.getBlock("latest");
+    const b = await withRetry(() => provider.getBlock("latest"), { label: "getBlock(latest)" });
     lastHead = { num: b.number, tsSec: b.timestamp, wallMs: Date.now() };
   } catch (err) {
     logSys(`initial getBlock failed (will seed from newHeads): ${err.message}`);
@@ -676,8 +761,8 @@ async function main() {
     // Heartbeat every ~10 ticks so the operator sees liveness.
     if (tick % 10 === 0) {
       try {
-        const bal = await provider.getBalance(wallet.address);
-        const mb = await musd.balanceOf(wallet.address);
+        const bal = await withRetry(() => provider.getBalance(wallet.address), { label: "hb getBalance" });
+        const mb = await withRetry(() => musd.balanceOf(wallet.address), { label: "hb balanceOf" });
         const mark = await fetchMark(cfg.dataService, "BTC").catch(() => null);
         logSys(
           `heartbeat — active ${active.size}, in-flight ${inFlight.size}, fills ${fills}, ` +
@@ -692,7 +777,37 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+// ---- entrypoint / supervisor ----------------------------------------------
+// main() runs forever (the loop + timers self-heal via the in-call withRetry above).
+// A TRANSIENT error can still escape main() only in the narrow startup window
+// BEFORE the resilient loop is reached AND after the per-call retry budget is spent
+// (a prolonged outage). We must NOT crash-loop the process there: log it, back off,
+// and re-run main(). The reads that can throw through to here (getNetwork /
+// MIN_EXECUTION_DELAY / EXECUTION_FEE / balances / nonce) all run before any WS or
+// interval is created, so a restart is clean — no leaked sockets/timers. Only a
+// genuine fatal (missing env, a real bug/revert) exits non-zero.
+async function supervise() {
+  let backoffMs = RETRY.baseMs;
+  for (;;) {
+    try {
+      await main();
+      return; // main() only returns on intentional shutdown
+    } catch (err) {
+      if (!isTransient(err)) {
+        console.error(err);
+        process.exit(1);
+      }
+      logSys(
+        `startup hit a transient RPC error — ${err.code || ""} ${err.message || err}`.trim() +
+          ` — RPC likely degraded; restarting in ${(backoffMs / 1000).toFixed(0)}s (will keep waiting)`,
+      );
+      await sleep(backoffMs);
+      backoffMs = Math.min(backoffMs * 2, RETRY.capMs);
+    }
+  }
+}
+
+// Launch only when executed directly, so a test can import isTransient / withRetry
+// without starting the keeper.
+const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) supervise();
