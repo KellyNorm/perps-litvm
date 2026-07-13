@@ -124,6 +124,20 @@ const MARKET_QUARANTINE_ATTEMPTS = 18;
 // NoOpenPosition, InvalidPrice) that could clear later — those retry indefinitely.
 const PERMANENT_REVERT =
   /MarketNotSupported|CollateralTooLow|LeverageOutOfRange|InvalidAcceptablePrice|InvalidCloseBps|InvalidTriggerPrice|SecondaryDecimalsTooHigh/;
+// Trigger hot lane / re-screen cadence. A resting trigger that is NEAR its level (about
+// to cross) or MET-but-gated is kept RESIDENT and re-probed on a short per-id cadence —
+// instead of self-evicting to the minutes-long oldest-first rotation — so it fills within
+// seconds of becoming executable. The lane is bounded (RPC load + memory); far-from-money
+// triggers ride the slow sweep as before.
+const TRIGGER_HOT_PROBE_MS = 1_500; // near-money re-probe cadence (actively watching a cross)
+const TRIGGER_BACKOFF_BASE_MS = 2_000; // met-but-gated (temporary revert) backoff base
+const TRIGGER_BACKOFF_CAP_MS = 30_000; // …capped so a util-drop / fresh-price recovery is caught fast
+const TRIGGER_NEAR_BAND_BPS = 50; // within 0.50% of the trigger price ⇒ hold hot
+const MAX_HOT_TRIGGERS = 24; // priority-lane bound; overflow rides the slow sweep
+// Temporary trigger reverts: condition is MET but a gate blocks — RETAIN + backoff, never
+// drop. (TriggerNotMet is handled separately as the genuine "still waiting to cross" case.)
+const TEMPORARY_TRIGGER_REVERT =
+  /ExceedsUtilization|ExceedsMaxOI|PriceTooStale|PriceFromFuture|PriceBeforeRequest|BreakerTripped|Paused|TooEarlyToExecute/;
 
 // ---- structured per-id logging --------------------------------------------
 // One tagged line per id, with de-duplication on the steady-state phases
@@ -320,6 +334,7 @@ async function main() {
   const active = new Map();
   const inFlight = new Set(); // ids with a tx mid-flight — never double-submit
   const quarantined = new Set(); // ids parked after persistent PERMANENT-type probe reverts (NOT cancelled)
+  const hotTriggers = new Set(); // ids kept resident for short-cadence re-screening (near-money / met-but-gated)
   let feesEarned = ethers.constants.Zero; // cumulative this session
   let fills = 0;
   // Bounded-sweep state. `sweepCursor` rolls OLDEST-FIRST over [0, nextRequestId)
@@ -362,6 +377,7 @@ async function main() {
     if (!req.active) {
       const e = active.get(key);
       if (e && e.fireTimer) clearTimeout(e.fireTimer);
+      hotTriggers.delete(key);
       if (active.delete(key)) logId(key, "removed", "no longer active on-chain");
       return "inactive";
     }
@@ -794,50 +810,132 @@ async function main() {
     }
   }
 
-  // Screen and (if fillable) act on one resting TRIGGER this tick, then RELEASE it
-  // from the bounded working set. Releasing after each screen is what keeps the set
-  // small and rotating: an un-executable order (much of the spam backlog) is skipped
-  // cheaply — no tx, no gas — and freed so batch capacity moves on to the next
-  // oldest ids; it is re-admitted and re-screened by a later sweep rotation, so it
-  // is skipped, never dropped. A fillable order goes through execute() unchanged;
-  // execute() owns inFlight and re-reconciles, so we do NOT release those here.
+  // Release a trigger from the working set back to the oldest-first sweep (skipped, not
+  // dropped): re-offered on a later rotation. Also clears any hot residency.
+  function releaseTrigger(entry) {
+    const key = entry.id.toString();
+    entry.nextProbeAt = 0;
+    entry.backoffMs = 0;
+    hotTriggers.delete(key);
+    active.delete(key);
+  }
+
+  // Keep a trigger RESIDENT in the hot lane for short-cadence re-screening instead of
+  // evicting it to the minutes-long rotation. `blocked` ⇒ condition met but a temporary
+  // gate blocks ⇒ exponential backoff. Else (near-money, about to cross) ⇒ a short fixed
+  // cadence to catch the crossing. Bounded by MAX_HOT_TRIGGERS: if the lane is full, fall
+  // back to the slow sweep (logged once). Entry stays in `active`; the main loop re-screens
+  // it each tick, gated by nextProbeAt, so residency is cheap between probes.
+  function retainTrigger(entry, reason, blocked) {
+    const key = entry.id.toString();
+    if (!hotTriggers.has(key)) {
+      if (hotTriggers.size >= MAX_HOT_TRIGGERS) {
+        if (entry.phase !== "hot-full") {
+          logId(key, "deferred", `hot lane full (${MAX_HOT_TRIGGERS}) — riding slow sweep (${reason})`);
+          entry.phase = "hot-full";
+        }
+        releaseTrigger(entry);
+        return;
+      }
+      hotTriggers.add(key);
+    }
+    if (blocked) {
+      entry.backoffMs = entry.backoffMs
+        ? Math.min(entry.backoffMs * 2, TRIGGER_BACKOFF_CAP_MS)
+        : TRIGGER_BACKOFF_BASE_MS;
+      entry.nextProbeAt = Date.now() + entry.backoffMs;
+    } else {
+      entry.backoffMs = 0;
+      entry.nextProbeAt = Date.now() + TRIGGER_HOT_PROBE_MS;
+    }
+    const phase = `hot:${reason.split("(")[0]}`;
+    if (entry.phase !== phase) {
+      logId(
+        key,
+        "hot",
+        `${blocked ? "met-but-gated" : "near"} (${reason}) — re-screen in ${((entry.nextProbeAt - Date.now()) / 1000).toFixed(1)}s`,
+      );
+      entry.phase = phase;
+    }
+  }
+
+  // Distance of a TriggerNotMet from its level, in bps, parsed from the decoded reason
+  // "TriggerNotMet(price, triggerPrice, triggerAbove)". Infinity if unparseable ⇒ far ⇒
+  // slow sweep. Prices are 1e8; the ratio is unit-free so the scale cancels.
+  function triggerNotMetBps(reason) {
+    const m = reason.match(/TriggerNotMet\((\d+),\s*(\d+)/);
+    if (!m) return Infinity;
+    const price = Number(m[1]),
+      trig = Number(m[2]);
+    if (!trig) return Infinity;
+    return (Math.abs(price - trig) / trig) * 10_000;
+  }
+
+  // Screen one resting TRIGGER this tick with the gas-free static probe. Reason-aware:
+  //   ok ⇒ fill (money path unchanged); RequestNotActive ⇒ drop; TriggerNotMet near ⇒
+  //   hold hot to catch the cross; TriggerNotMet far ⇒ release to the sweep; temporary
+  //   gate (met-but-gated) ⇒ hold hot + backoff, never drop; probe threw ⇒ hold hot +
+  //   backoff. A hot/backoff trigger only re-fetches+probes after its nextProbeAt cooldown.
   // Returns a status the cycle summary tallies:
-  //   "inflight" | "pre-delay" | "error" | "not-met" | "fillable".
+  //   "inflight" | "pre-delay" | "cooling" | "error" | "not-met" | "near" | "blocked" |
+  //   "removed" | "fillable".
   async function processTrigger(entry, blockTs) {
     const key = entry.id.toString();
     if (inFlight.has(key)) return "inflight";
     if (blockTs >= entry.earliest) entry.t.windowOpen ??= Date.now(); // delay window opened
 
-    // Not executable yet (still inside min-delay): cheap-skip WITHOUT even a
-    // RedStone fetch, and release. The sweep re-checks it after the delay.
+    // Inside min-delay: cheap-skip WITHOUT a RedStone fetch; release to the sweep.
     if (blockTs < entry.earliest) {
-      active.delete(key);
+      releaseTrigger(entry);
       return "pre-delay";
     }
-    // Cheap executability screen: fetch the package ONCE, build the payload-bearing
-    // tx, and STATIC-probe it (gas-free provider.call via the revert-decoder). We
-    // never blind-send an executeRequest that would revert — only a probe that would
-    // succeed proceeds to the money path. On a fillable probe we reuse that exact tx
-    // for the real send — no second RedStone fetch, no re-populate.
+    // Per-id probe cadence: a resident (hot/backoff) trigger stays cheap between probes.
+    if (entry.nextProbeAt && Date.now() < entry.nextProbeAt) return "cooling";
+
+    // Cheap executability screen: fetch the package ONCE, build the payload-bearing tx,
+    // and STATIC-probe it (gas-free provider.call). We never blind-send an executeRequest
+    // that would revert — only a probe that would succeed proceeds to the money path, and
+    // it reuses that exact tx (no second RedStone fetch).
     let txReq, probe;
     try {
       const { pkgs } = await fetchPackages(cfg.dataService, entry.feed);
       txReq = await buildTx(entry, pkgs);
       probe = await staticExecuteCheck(provider, pm.interface, txReq, wallet.address);
     } catch (err) {
-      logId(key, "errored", `static probe failed (transient): ${err.message}`);
-      active.delete(key); // release; re-swept next rotation (skipped, not dropped)
+      // Transient RedStone/RPC hiccup: retain with backoff (never drop on infra noise).
+      retainTrigger(entry, `probe transient: ${err.message}`, true);
       return "error";
     }
     if (probe.ok) {
       entry.phase = "fillable";
+      entry.backoffMs = 0;
+      entry.nextProbeAt = 0;
+      hotTriggers.delete(key);
       entry.t.payload ??= Date.now(); // probe-fillable ⇒ a usable payload is in hand
       await execute(entry, txReq); // MONEY PATH — unchanged (owns inFlight + reconcile)
       return "fillable";
     }
-    // Un-executable (trigger condition not met): cheap-skip + release. No per-id log
-    // here — the flood would drown the output; the per-cycle summary counts it.
-    active.delete(key);
+    const reason = probe.reason || "";
+    if (/RequestNotActive/.test(reason)) {
+      hotTriggers.delete(key);
+      reconcile(entry.id).catch((e) => logSys(`reconcile(${key}) failed: ${e.message}`));
+      return "removed";
+    }
+    if (/TriggerNotMet/.test(reason)) {
+      if (triggerNotMetBps(reason) <= TRIGGER_NEAR_BAND_BPS) {
+        retainTrigger(entry, reason, false); // near — hold hot to catch the cross
+        return "near";
+      }
+      releaseTrigger(entry); // far — ride the oldest-first sweep (keeps the set bounded)
+      return "not-met";
+    }
+    if (TEMPORARY_TRIGGER_REVERT.test(reason)) {
+      retainTrigger(entry, reason, true); // met-but-gated — hold hot with backoff
+      return "blocked";
+    }
+    // Permanent/unknown revert: not a priority-lane case. Release to the slow sweep
+    // (re-offered later, never dropped) so it can't starve the hot lane.
+    releaseTrigger(entry);
     return "not-met";
   }
 
@@ -986,7 +1084,7 @@ async function main() {
           if (r === "fillable") {
             screened++;
             fired++;
-          } else if (r === "not-met") {
+          } else if (r === "not-met" || r === "near" || r === "blocked") {
             screened++;
             notMet++;
           } else if (r === "pre-delay") {
@@ -1009,7 +1107,7 @@ async function main() {
       logSys(
         `cycle #${tick} — batch ${sweep.examined}, working-set ${active.size}/${cfg.maxActive}, ` +
           `backlog≈${lastSweepBacklog} (id-counter ${sweep.next}, swept→${sweepCursor}) | ` +
-          `screened ${screened}, skipped[not-met ${notMet}, pre-delay ${preDelay}, err ${probeErr}], fired ${fired}`,
+          `screened ${screened}, hot ${hotTriggers.size}, skipped[not-met ${notMet}, pre-delay ${preDelay}, err ${probeErr}], fired ${fired}`,
       );
     } catch (err) {
       logSys(`loop error: ${err.message}`);
