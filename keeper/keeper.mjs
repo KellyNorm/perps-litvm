@@ -15,10 +15,13 @@
 //            a full loop tick on the old .on()-over-HTTP polling). RequestExecuted
 //            / RequestCancelled likewise remove. Every handler re-reads chain
 //            state through the same idempotent reconcile(), so listeners can never
-//            desync the set. catchUpCounter() walks the id counter and reconciles
-//            each id against requests(id).active — it backfills on startup, runs on
-//            a low-frequency 30s timer, and runs on every WS reconnect, so a
-//            dropped/reconnected socket can never lose a request.
+//            desync the set. sweepBatch() walks the id counter in BOUNDED,
+//            OLDEST-FIRST batches (at most KEEPER_BATCH_SIZE ids/cycle, cursor wraps)
+//            and reconciles each id against requests(id).active — it warms up on
+//            startup, runs every loop tick as continuous discovery, and runs on
+//            every WS reconnect, so a dropped/reconnected socket can never lose a
+//            request AND the whole backlog is never loaded into memory at once (the
+//            OOM guard against the testnet's trigger-spam flood).
 //
 // EXECUTION  by kind (a request is a TRIGGER iff triggers(id).triggerPrice != 0):
 //   - MARKET   on discovery we SCHEDULE the fill to the window-open instant:
@@ -61,6 +64,18 @@ const cfg = {
   startBlock: process.env.START_BLOCK ? Number(process.env.START_BLOCK) : undefined,
   loopMs: process.env.KEEPER_LOOP_MS ? Number(process.env.KEEPER_LOOP_MS) : 2500,
   catchUpMs: process.env.KEEPER_CATCHUP_MS ? Number(process.env.KEEPER_CATCHUP_MS) : 30_000,
+  // ---- bounded-batch discovery (OOM guard) --------------------------------
+  // The testnet gets flooded with thousands of resting trigger orders (bot spam).
+  // The keeper must NEVER load/hold the whole backlog in memory. Instead it sweeps
+  // the on-chain id space OLDEST-FIRST in bounded batches: at most `batchSize`
+  // requests are examined/held/screened per cycle, and the live working set is
+  // hard-capped at `maxActive`. Both are env-tunable; defaults sit in the 50–100
+  // band so the in-memory set stays small and roughly constant regardless of how
+  // many total requests are pending on-chain.
+  batchSize: process.env.KEEPER_BATCH_SIZE ? Number(process.env.KEEPER_BATCH_SIZE) : 75,
+  maxActive: process.env.KEEPER_MAX_ACTIVE
+    ? Number(process.env.KEEPER_MAX_ACTIVE)
+    : (process.env.KEEPER_BATCH_SIZE ? Number(process.env.KEEPER_BATCH_SIZE) : 75) * 2,
 };
 
 // ---- transient-RPC retry tuning -------------------------------------------
@@ -170,6 +185,39 @@ export async function withRetry(fn, opts = {}) {
   }
 }
 
+// ---- bounded-batch sweep primitives (pure, unit-testable) ------------------
+// These encode the whole OOM guarantee and are exported so the simulation test
+// can drive the REAL bounding logic (not a reimplementation):
+//
+//   planSweep  — given the rolling cursor, the id counter (nextRequestId), and the
+//                batch size, return the OLDEST-FIRST list of ids to examine THIS
+//                cycle and the next cursor. The list is bounded (<= min(batch,next))
+//                and the cursor wraps at the end, so successive cycles walk the
+//                entire id space FIFO and every id is eventually revisited — no
+//                request is ever loaded-all-at-once and none is permanently starved.
+//   admits     — the working-set admission rule. Markets are ALWAYS admitted
+//                (transient + latency-sensitive, so a spam flood can't starve a real
+//                market fill); new TRIGGER entries are admitted only while the live
+//                set is under `maxActive`, which hard-bounds memory. A deferred
+//                trigger is not dropped — the next sweep rotation re-offers it.
+export function planSweep(cursor, next, batch) {
+  const ids = [];
+  if (!Number.isFinite(next) || next <= 0) return { ids, nextCursor: 0 };
+  let c = cursor >= next || cursor < 0 ? 0 : cursor;
+  const count = Math.min(batch, next);
+  for (let i = 0; i < count; i++) {
+    ids.push(c);
+    c++;
+    if (c >= next) c = 0; // wrap to the oldest id — keeps the sweep FIFO + rotating
+  }
+  return { ids, nextCursor: c };
+}
+
+export function admits(activeSize, isTrigger, maxActive) {
+  if (!isTrigger) return true; // markets always admitted (few, transient, time-critical)
+  return activeSize < maxActive; // triggers capped — this is the memory bound
+}
+
 // ---- lifecycle stage timing (baseline telemetry, STEP 1 task B) ------------
 // Pure observation — no behavior change. Each active entry carries an `t` object
 // of wall-clock-ms stamps captured the FIRST time each stage is reached:
@@ -216,6 +264,7 @@ async function main() {
   logSys(`chainId:           ${net.chainId}   data service: ${cfg.dataService}`);
   logSys(`MIN_EXEC_DELAY:    ${MIN_DELAY}s     EXECUTION_FEE: ${f18(EXEC_FEE)} mUSD`);
   logSys(`WS endpoints:      ${cfg.wsUrls.join("  |  ")}`);
+  logSys(`bounded batch:     ${cfg.batchSize}/cycle   max working set: ${cfg.maxActive}   loop: ${cfg.loopMs}ms`);
   logSys(`keeper zkLTC:      ${ethers.utils.formatEther(startZkltc)}`);
   logSys(`keeper mUSD:       ${f18(startMusd)}`);
   logSys("================================================================");
@@ -228,7 +277,14 @@ async function main() {
   const inFlight = new Set(); // ids with a tx mid-flight — never double-submit
   let feesEarned = ethers.constants.Zero; // cumulative this session
   let fills = 0;
-  let scanCursor = 0; // next id not yet walked by the counter catch-up
+  // Bounded-sweep state. `sweepCursor` rolls OLDEST-FIRST over [0, nextRequestId)
+  // and wraps, so the backlog is streamed in bounded batches — never loaded whole.
+  // `sweepActiveCount` tallies the active requests seen during the in-progress
+  // rotation; on each full wrap it snapshots into `lastSweepBacklog` to give a
+  // real (memory-free) backlog-depth read for the cycle logs.
+  let sweepCursor = 0;
+  let sweepActiveCount = 0;
+  let lastSweepBacklog = 0;
 
   // ---- chain clock from newHeads ------------------------------------------
   // The contract gates fills on block.timestamp, so we track the chain clock from
@@ -244,21 +300,24 @@ async function main() {
   // the single source of truth: WS events and the counter catch-up both funnel
   // through here, so the set can never drift from requests(id).active. On first
   // discovery of a MARKET request it arms the window-open schedule.
+  // Returns a small status string so the bounded sweep can tally backlog depth
+  // without holding anything: "inflight" | "error" | "inactive" | "deferred" |
+  // "added" | "updated" (the last three mean the id is active on-chain).
   async function reconcile(id) {
     const key = id.toString();
-    if (inFlight.has(key)) return; // a fill is settling; let it finish first
+    if (inFlight.has(key)) return "inflight"; // a fill is settling; let it finish first
     let req;
     try {
       req = await withRetry(() => pm.requests(id), { label: `requests(${key})` });
     } catch (err) {
       logId(key, "errored", `requests() read failed: ${err.message}`);
-      return;
+      return "error";
     }
     if (!req.active) {
       const e = active.get(key);
       if (e && e.fireTimer) clearTimeout(e.fireTimer);
       if (active.delete(key)) logId(key, "removed", "no longer active on-chain");
-      return;
+      return "inactive";
     }
     let isTrigger = false;
     try {
@@ -266,6 +325,10 @@ async function main() {
     } catch {}
     const feed = feedOf(req.market);
     if (!active.has(key)) {
+      // Memory bound: markets are always admitted; a new TRIGGER is admitted only
+      // while the live set is under the cap. A deferred trigger is NOT dropped —
+      // the oldest-first sweep re-offers it on a later rotation.
+      if (!admits(active.size, isTrigger, cfg.maxActive)) return "deferred";
       const kind = ["Open", "Close", "Decrease", "Increase"][req.kind] ?? `kind${req.kind}`;
       const entry = {
         id,
@@ -280,13 +343,20 @@ async function main() {
         t: { seen: Date.now() },
       };
       active.set(key, entry);
-      logId(
-        key,
-        "discovered",
-        `${isTrigger ? "TRIGGER" : "MARKET"} ${kind} ${req.isLong ? "long" : "short"} ${feed}` +
-          ` (owner ${req.owner.slice(0, 10)}…, requestTs ${req.requestTimestamp})`,
-      );
-      if (!isTrigger) scheduleMarket(entry); // triggers stay on the loop this step
+      // Per-id "discovered" logging is kept for MARKETs (few, worth a line each) but
+      // suppressed for TRIGGERs: under the spam flood they are admitted/released on
+      // every sweep rotation, so a per-id line would drown the log — the per-cycle
+      // summary (screened/skipped/fired counts) covers them instead.
+      if (!isTrigger) {
+        logId(
+          key,
+          "discovered",
+          `MARKET ${kind} ${req.isLong ? "long" : "short"} ${feed}` +
+            ` (owner ${req.owner.slice(0, 10)}…, requestTs ${req.requestTimestamp})`,
+        );
+        scheduleMarket(entry);
+      }
+      return "added";
     } else {
       const e = active.get(key);
       e.req = req;
@@ -294,22 +364,37 @@ async function main() {
       e.feed = feed;
       e.earliest = req.requestTimestamp.toNumber() + MIN_DELAY;
       if (!isTrigger && !e.fireTimer && !e.firing && !inFlight.has(key)) scheduleMarket(e);
+      return "updated";
     }
   }
 
-  // Catch the counter up: reconcile every id created since the last walk. This
-  // is the backfill (from 0 on a cold start) AND the low-frequency backstop for
-  // any *Requested log the WS listener might have missed or dropped on reconnect.
-  async function catchUpCounter() {
+  // Bounded, oldest-first sweep — the single loader. Examines at most
+  // cfg.batchSize ids per call (never the whole backlog), rolling the cursor over
+  // [0, nextRequestId) and wrapping, so successive calls stream the entire id space
+  // FIFO. This is the cold-start backfill, the per-tick discovery, and the
+  // reconnect backstop for any missed *Requested log — all with a small, constant
+  // working set. Returns { examined, next } for the cycle logs.
+  async function sweepBatch() {
     let next;
     try {
       next = (await withRetry(() => pm.nextRequestId(), { label: "nextRequestId" })).toNumber();
     } catch (err) {
       logSys(`nextRequestId() read failed (transient): ${err.message}`);
-      return;
+      return { examined: 0, next: 0 };
     }
-    for (let id = scanCursor; id < next; id++) await reconcile(id);
-    scanCursor = next;
+    const { ids, nextCursor } = planSweep(sweepCursor, next, cfg.batchSize);
+    for (const id of ids) {
+      const status = await reconcile(id);
+      if (status === "added" || status === "updated" || status === "deferred") sweepActiveCount++;
+    }
+    sweepCursor = nextCursor;
+    // A wrap back to the oldest id completes one rotation: snapshot the active-seen
+    // tally as the current backlog depth, then reset for the next rotation.
+    if (nextCursor === 0 && ids.length > 0) {
+      lastSweepBacklog = sweepActiveCount;
+      sweepActiveCount = 0;
+    }
+    return { examined: ids.length, next };
   }
 
   // ---- market window-open scheduler ---------------------------------------
@@ -577,24 +662,31 @@ async function main() {
     }
   }
 
-  // Decide and act on one resting TRIGGER this tick. (Markets are scheduler-driven
-  // now; this is the unchanged STEP-2 trigger path, still on the loop this step.)
+  // Screen and (if fillable) act on one resting TRIGGER this tick, then RELEASE it
+  // from the bounded working set. Releasing after each screen is what keeps the set
+  // small and rotating: an un-executable order (much of the spam backlog) is skipped
+  // cheaply — no tx, no gas — and freed so batch capacity moves on to the next
+  // oldest ids; it is re-admitted and re-screened by a later sweep rotation, so it
+  // is skipped, never dropped. A fillable order goes through execute() unchanged;
+  // execute() owns inFlight and re-reconciles, so we do NOT release those here.
+  // Returns a status the cycle summary tallies:
+  //   "inflight" | "pre-delay" | "error" | "not-met" | "fillable".
   async function processTrigger(entry, blockTs) {
     const key = entry.id.toString();
-    if (inFlight.has(key)) return;
+    if (inFlight.has(key)) return "inflight";
     if (blockTs >= entry.earliest) entry.t.windowOpen ??= Date.now(); // delay window opened
 
-    // Resting order: never blind-send. Static-probe fillability first.
+    // Not executable yet (still inside min-delay): cheap-skip WITHOUT even a
+    // RedStone fetch, and release. The sweep re-checks it after the delay.
     if (blockTs < entry.earliest) {
-      if (entry.phase !== "waiting-delay") {
-        logId(key, "waiting-delay", `trigger min-delay until ${entry.earliest}`);
-        entry.phase = "waiting-delay";
-      }
-      return;
+      active.delete(key);
+      return "pre-delay";
     }
-    // Fetch the package ONCE, build the payload-bearing tx, and probe with it.
-    // On a fillable probe we reuse that exact tx for the real send — no second
-    // RedStone fetch, no re-populate.
+    // Cheap executability screen: fetch the package ONCE, build the payload-bearing
+    // tx, and STATIC-probe it (gas-free provider.call via the revert-decoder). We
+    // never blind-send an executeRequest that would revert — only a probe that would
+    // succeed proceeds to the money path. On a fillable probe we reuse that exact tx
+    // for the real send — no second RedStone fetch, no re-populate.
     let txReq, probe;
     try {
       const { pkgs } = await fetchPackages(cfg.dataService, entry.feed);
@@ -602,23 +694,26 @@ async function main() {
       probe = await staticExecuteCheck(provider, pm.interface, txReq, wallet.address);
     } catch (err) {
       logId(key, "errored", `static probe failed (transient): ${err.message}`);
-      return;
+      active.delete(key); // release; re-swept next rotation (skipped, not dropped)
+      return "error";
     }
     if (probe.ok) {
       entry.phase = "fillable";
       entry.t.payload ??= Date.now(); // probe-fillable ⇒ a usable payload is in hand
-      await execute(entry, txReq);
-    } else if (entry.phase !== "not-met") {
-      logId(key, "not-met", probe.reason);
-      entry.phase = "not-met";
+      await execute(entry, txReq); // MONEY PATH — unchanged (owns inFlight + reconcile)
+      return "fillable";
     }
+    // Un-executable (trigger condition not met): cheap-skip + release. No per-id log
+    // here — the flood would drown the output; the per-cycle summary counts it.
+    active.delete(key);
+    return "not-met";
   }
 
   // ---- live WS wiring (logs + newHeads), with reconnect -------------------
   // Subscriptions live on a WebSocket; reads/sends stay on HTTP. A *Requested log
   // -> reconcile immediately; RequestExecuted / RequestCancelled likewise remove.
   // On a socket close we tear down, alternate to the fallback URL, reconnect, and
-  // run catchUpCounter() to backfill any gap. Market timers live in-process, so a
+  // run one bounded sweepBatch() to backfill any gap. Market timers live in-process, so a
   // WS outage never loses a scheduled fill — the socket only sharpens the trigger.
   const REQUESTED = [
     "OpenRequested",
@@ -662,8 +757,9 @@ async function main() {
       logSys(`WS reconnect attempt ${wsTries}…`);
       setupWs();
       // Gap backfill: any *Requested logs missed while the socket was down are
-      // recovered by walking the id counter (chain state is authoritative).
-      await catchUpCounter().catch((e) => logSys(`reconnect catch-up failed: ${e.message}`));
+      // recovered by the per-tick oldest-first sweep (chain state is authoritative);
+      // kick one bounded pass now so recovery starts immediately.
+      await sweepBatch().catch((e) => logSys(`reconnect sweep failed: ${e.message}`));
     }, delay);
   }
 
@@ -724,27 +820,48 @@ async function main() {
   } catch (err) {
     logSys(`initial getBlock failed (will seed from newHeads): ${err.message}`);
   }
-  logSys("backfilling active requests from the id counter…");
-  await catchUpCounter();
-  logSys(`backfill complete — ${active.size} active request(s).`);
+  logSys("bounded discovery: the backlog is streamed OLDEST-FIRST in bounded batches —");
+  logSys(`at most ${cfg.batchSize} requests examined/held per cycle, never loaded all at once.`);
+  const warm = await sweepBatch();
+  logSys(`warm-up sweep — examined ${warm.examined} id(s), active ${active.size}, id-counter ${warm.next}.`);
 
   setupWs(); // attach the live WS subscriptions
-  setInterval(() => {
-    catchUpCounter().catch((e) => logSys(`periodic catch-up failed: ${e.message}`));
-  }, cfg.catchUpMs).unref?.(); // low-frequency backstop for any missed log
+  // NOTE: the old low-frequency catchUpCounter() interval is gone — the per-tick
+  // bounded sweep below IS the continuous, oldest-first discovery + missed-log
+  // backstop, and it can never load the whole backlog at once.
 
   // ---- main loop ----------------------------------------------------------
-  // Triggers run their per-tick static probe here (unchanged). Markets are
-  // scheduler-driven (timer + newHeads); the loop only acts as a post-floor
-  // backstop for them, so a stalled timer AND a dead socket can't strand a fill.
+  // Each tick: one BOUNDED oldest-first sweep (discovery, capped at cfg.batchSize),
+  // then screen only the small resulting working set. Triggers are screened by the
+  // gas-free static probe and released (skipped, not dropped); markets stay
+  // scheduler-driven (timer + newHeads), with this loop as their post-floor backstop
+  // so a stalled timer AND a dead socket can't strand a fill.
   let tick = 0;
   for (;;) {
+    let screened = 0;
+    let notMet = 0;
+    let preDelay = 0;
+    let probeErr = 0;
+    let fired = 0;
     try {
+      const sweep = await sweepBatch(); // bounded admission — never the whole backlog
       const blockTs = Math.floor(estChainNow());
-      // Snapshot to avoid mutating the map mid-iteration (execute() reconciles).
+      // Snapshot to avoid mutating the map mid-iteration (processTrigger/execute
+      // both delete). The set is bounded (<= cfg.maxActive), so this stays small.
       for (const entry of [...active.values()]) {
         if (entry.isTrigger) {
-          await processTrigger(entry, blockTs);
+          const r = await processTrigger(entry, blockTs);
+          if (r === "fillable") {
+            screened++;
+            fired++;
+          } else if (r === "not-met") {
+            screened++;
+            notMet++;
+          } else if (r === "pre-delay") {
+            preDelay++;
+          } else if (r === "error") {
+            probeErr++;
+          }
         } else if (
           blockTs >= entry.earliest &&
           !entry.firing &&
@@ -754,6 +871,14 @@ async function main() {
           await fireMarket(entry, "loop-backstop");
         }
       }
+      // Per-cycle drain telemetry (requirement 6): batch size, backlog depth, and
+      // the skipped-un-executable counts — so we can watch it drain without OOM and
+      // confirm the working set stays bounded.
+      logSys(
+        `cycle #${tick} — batch ${sweep.examined}, working-set ${active.size}/${cfg.maxActive}, ` +
+          `backlog≈${lastSweepBacklog} (id-counter ${sweep.next}, swept→${sweepCursor}) | ` +
+          `screened ${screened}, skipped[not-met ${notMet}, pre-delay ${preDelay}, err ${probeErr}], fired ${fired}`,
+      );
     } catch (err) {
       logSys(`loop error: ${err.message}`);
     }
