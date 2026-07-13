@@ -218,6 +218,33 @@ export function admits(activeSize, isTrigger, maxActive) {
   return activeSize < maxActive; // triggers capped — this is the memory bound
 }
 
+// ---- serial tx queue (nonce-ordering guarantee) ----------------------------
+// The keeper is a SINGLE account with ONE monotonic nonce sequence, and its
+// nonce is read (readyTx) and only incremented AFTER the awaited sendTransaction.
+// That is only safe if just one submission runs at a time — but execute() is fed
+// concurrently by the market fire path (onNewHead fires every past-floor market at
+// once, plus per-id timers / the scheduleMarket shortcut / the loop backstop), and
+// its per-id inFlight guard does NOT serialize DIFFERENT ids. Concurrent calls then
+// read the SAME nonce before either increments → duplicate nonces → "nonce has
+// already been used". This queue is the single serialization point: every execute()
+// runs through it, so at most one submission is between its nonce read and nonce++
+// at any instant, and each tx gets a unique, sequential nonce. Exported so the test
+// can drive the exact mechanism the keeper uses.
+export function makeSerialQueue() {
+  let chain = Promise.resolve();
+  // Run `task` only after every previously-queued task has fully settled. The
+  // returned promise resolves/rejects with `task`'s own outcome, but the internal
+  // chain swallows rejections so one failed task never wedges the queue for the next.
+  return function runSerial(task) {
+    const result = chain.then(task, task);
+    chain = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  };
+}
+
 // ---- lifecycle stage timing (baseline telemetry, STEP 1 task B) ------------
 // Pure observation — no behavior change. Each active entry carries an `t` object
 // of wall-clock-ms stamps captured the FIRST time each stage is reached:
@@ -487,7 +514,11 @@ async function main() {
   // ---- sequential nonce manager -------------------------------------------
   // One keeper account, one tx in flight at a time (we await each send). An
   // explicit nonce makes the ordering deterministic; we resync from chain after
-  // any send error so a dropped/replaced tx can't wedge the pipeline.
+  // any send error so a dropped/replaced tx can't wedge the pipeline. That
+  // one-at-a-time invariant is ENFORCED by runSerial(): every execute() runs
+  // through this single queue, so concurrent callers (the market fire path) can
+  // never read the same nonce before it is incremented.
+  const runSerial = makeSerialQueue();
   let nonce = await withRetry(() => provider.getTransactionCount(wallet.address, "latest"), {
     label: "getTransactionCount",
   });
@@ -569,7 +600,18 @@ async function main() {
   async function execute(entry, txReq) {
     const key = entry.id.toString();
     if (inFlight.has(key)) return;
-    inFlight.add(key);
+    inFlight.add(key); // reserve the id synchronously (BEFORE queuing) so the
+    // same-id double-fill guard still holds while this call waits its turn.
+    // Serialize the whole submission: only ONE runs between its nonce read and its
+    // nonce++, so the concurrent market fires can never collide on the nonce.
+    return runSerial(() => submitAndSettle(entry, txReq, key));
+  }
+
+  // The submit+settle body, run STRICTLY one-at-a-time via runSerial (above). The
+  // nonce read (readyTx) → sendTransaction → nonce++ discipline and the
+  // resyncNonce/reconcile safety are UNCHANGED — the queue is what makes that
+  // single-in-flight discipline hold under concurrent callers.
+  async function submitAndSettle(entry, txReq, key) {
     try {
       await readyTx(txReq);
       logId(key, "executing", `nonce ${nonce}`);
