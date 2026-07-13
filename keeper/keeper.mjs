@@ -107,6 +107,23 @@ const now = () => Math.floor(Date.now() / 1000);
 // attempts on one id so a post-floor revert can't busy-loop the submit path.
 const FIRE_BUFFER_MS = 150;
 const REFIRE_MS = 1000;
+// Market probe-fail backoff. A market that STATICALLY probes un-fillable on a
+// temporary gate (ExceedsUtilization, PriceTooStale, breaker, not-yet-crossed) is
+// retried with exponential backoff base→cap — so it never hammers every tick nor
+// occupies the serial submit queue, yet still fills within `cap` once the gate clears.
+const MARKET_BACKOFF_BASE_MS = 2_000;
+const MARKET_BACKOFF_CAP_MS = 60_000;
+// Quarantine: park a market only after this many CONSECUTIVE probes that all revert
+// with the SAME permanent-type error. Generous so we never park something that might
+// yet fill. Reached only by malformed-request errors below — never by temporary gates.
+const MARKET_QUARANTINE_ATTEMPTS = 18;
+// PERMANENT request errors: malformed params fixed at request time that can NEVER
+// become fillable however long we wait. Deliberately EXCLUDES every temporary gate
+// (ExceedsUtilization, ExceedsMaxOI, PriceTooStale, PriceFromFuture, PriceBeforeRequest,
+// BreakerTripped, Paused, TooEarly*) AND state-dependent errors (PositionAlreadyOpen,
+// NoOpenPosition, InvalidPrice) that could clear later — those retry indefinitely.
+const PERMANENT_REVERT =
+  /MarketNotSupported|CollateralTooLow|LeverageOutOfRange|InvalidAcceptablePrice|InvalidCloseBps|InvalidTriggerPrice|SecondaryDecimalsTooHigh/;
 
 // ---- structured per-id logging --------------------------------------------
 // One tagged line per id, with de-duplication on the steady-state phases
@@ -302,6 +319,7 @@ async function main() {
   // change. `fireTimer`/`firing`/`lastFireMs` drive the market scheduler.
   const active = new Map();
   const inFlight = new Set(); // ids with a tx mid-flight — never double-submit
+  const quarantined = new Set(); // ids parked after persistent PERMANENT-type probe reverts (NOT cancelled)
   let feesEarned = ethers.constants.Zero; // cumulative this session
   let fills = 0;
   // Bounded-sweep state. `sweepCursor` rolls OLDEST-FIRST over [0, nextRequestId)
@@ -333,6 +351,7 @@ async function main() {
   async function reconcile(id) {
     const key = id.toString();
     if (inFlight.has(key)) return "inflight"; // a fill is settling; let it finish first
+    if (quarantined.has(key)) return "quarantined"; // parked malformed request — do not re-admit or re-probe
     let req;
     try {
       req = await withRetry(() => pm.requests(id), { label: `requests(${key})` });
@@ -450,6 +469,59 @@ async function main() {
     entry.fireTimer = setTimeout(() => fireMarket(entry, "timer"), waitMs);
   }
 
+  // A MARKET that a gas-free static probe says would REVERT right now. RequestNotActive
+  // ⇒ it's gone (filled/cancelled/reclaimed) ⇒ let reconcile drop it. Anything else ⇒ a
+  // TEMPORARY gate ⇒ KEEP it and re-arm an exponential backoff so it retries later with
+  // no send and no per-tick re-probe. Logged once per reason-change so it can't flood.
+  //
+  // Quarantine (conservative): a request that keeps reverting with the SAME permanent
+  // malformed-param error for MARKET_QUARANTINE_ATTEMPTS consecutive probes is parked —
+  // it stops being probed/fired but is NOT treated as cancelled (it stays active
+  // on-chain). Any temporary gate resets the counter, so util/stale-blocked orders are
+  // NEVER quarantined and retry indefinitely, filling the instant their gate clears.
+  function deferMarket(entry, reason) {
+    const key = entry.id.toString();
+    if (/RequestNotActive/.test(reason)) {
+      reconcile(entry.id).catch((e) => logSys(`reconcile(${key}) failed: ${e.message}`));
+      return;
+    }
+    // Track only CONSECUTIVE, SAME permanent-type reverts toward quarantine. A temporary
+    // reason (or a different permanent one) resets the tally — so a long util/stale block
+    // can never accumulate to a park.
+    const permName = PERMANENT_REVERT.test(reason) ? reason.split("(")[0] : null;
+    if (permName && entry.permReason === permName) {
+      entry.permCount = (entry.permCount || 0) + 1;
+    } else if (permName) {
+      entry.permReason = permName;
+      entry.permCount = 1;
+    } else {
+      entry.permReason = null;
+      entry.permCount = 0;
+    }
+    if (entry.permCount >= MARKET_QUARANTINE_ATTEMPTS) {
+      if (entry.fireTimer) clearTimeout(entry.fireTimer);
+      entry.fireTimer = null;
+      entry.nextFireAt = 0;
+      quarantined.add(key); // persists across sweeps: reconcile won't re-admit
+      active.delete(key); // stop actively probing/firing
+      logId(key, "quarantined", `persistent ${permName} × ${entry.permCount} probes — parked (NOT cancelled; still active on-chain)`);
+      return;
+    }
+    // Temporary gate (or a permanent one not yet at the park threshold): exponential
+    // backoff, keep retrying. This is the path util/stale-blocked orders live on.
+    entry.backoffMs = entry.backoffMs
+      ? Math.min(entry.backoffMs * 2, MARKET_BACKOFF_CAP_MS)
+      : MARKET_BACKOFF_BASE_MS;
+    entry.nextFireAt = Date.now() + entry.backoffMs;
+    const phase = `deferred:${reason}`;
+    if (entry.phase !== phase) {
+      logId(key, "deferred", `probe not fillable (${reason}) — retry in ${(entry.backoffMs / 1000).toFixed(1)}s`);
+      entry.phase = phase;
+    }
+    if (entry.fireTimer) clearTimeout(entry.fireTimer);
+    entry.fireTimer = setTimeout(() => fireMarket(entry, "backoff"), entry.backoffMs);
+  }
+
   // Fire one MARKET request: fetch ONE fresh payload and run the STEP-2 hot path
   // (build -> sign -> broadcast). Guards make it safe to call from the timer, the
   // newHeads release, and the loop backstop at once. If released a hair early (wall
@@ -460,6 +532,8 @@ async function main() {
     if (!active.has(key) || entry.isTrigger) return;
     if (entry.firing || inFlight.has(key)) return;
     if (entry.lastFireMs && Date.now() - entry.lastFireMs < REFIRE_MS) return;
+    // Honour an active probe-defer cooldown so newHead/loop-backstop can't re-probe early.
+    if (entry.nextFireAt && Date.now() < entry.nextFireAt) return;
     if (entry.fireTimer) {
       clearTimeout(entry.fireTimer);
       entry.fireTimer = null;
@@ -491,9 +565,25 @@ async function main() {
       }
       entry.t.payload ??= Date.now(); // fresh-enough package obtained
       const txReq = await buildTx(entry, pkgs);
+      // PRE-SCREEN (gas-free callStatic) — same mechanism triggers use (see
+      // processTrigger). Only a green probe reaches the money path; a red probe
+      // defers with backoff instead of blind-sending a doomed, log-flooding,
+      // queue-clogging tx. Reuse the EXACT probed tx for the real send.
+      const probe = await staticExecuteCheck(provider, pm.interface, txReq, wallet.address);
+      if (!probe.ok) {
+        deferMarket(entry, probe.reason);
+        return;
+      }
+      entry.backoffMs = 0; // green light — clear any accrued backoff / quarantine tally
+      entry.nextFireAt = 0;
+      entry.permReason = null;
+      entry.permCount = 0;
+      entry.phase = "fillable";
       await execute(entry, txReq); // owns inFlight + re-reconciles (drops if filled)
     } catch (err) {
-      logId(key, "errored", `fire(${via}) failed (transient): ${err.message}`);
+      // Transient RedStone/RPC hiccup: treat like a red probe — defer with backoff
+      // and a phase-guarded log, so a feed outage across many markets can't flood.
+      deferMarket(entry, `fire(${via}) transient: ${err.message}`);
     } finally {
       entry.firing = false;
     }
