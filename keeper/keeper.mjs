@@ -160,7 +160,7 @@ function logSys(msg) {
 // (HTTP 5xx — esp. 504 — SERVER_ERROR, TIMEOUT, NETWORK_ERROR, and a CALL_EXCEPTION
 // that is really a server error with no revert data) are treated as transient.
 const TRANSIENT_MSG =
-  /\b50[0-9]\b|gateway ?time-?out|bad gateway|service unavailable|temporarily unavailable|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|EAI_AGAIN|socket hang up|timeout|network ?error/i;
+  /\b50[0-9]\b|gateway ?time-?out|bad gateway|service unavailable|temporarily unavailable|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|EAI_AGAIN|socket hang up|timeout|network ?error|bandwidth ?limit|rate[ -]?limit|too many requests|quota exceeded/i;
 
 export function isTransient(err) {
   if (!err) return false;
@@ -173,6 +173,12 @@ export function isTransient(err) {
   // 2. ethers v5 transient error codes.
   const code = err.code;
   if (code === "SERVER_ERROR" || code === "TIMEOUT" || code === "NETWORK_ERROR") return true;
+  // 2b. WS JSON-RPC rate/bandwidth-limit codes (Caldera -31002 "Bandwidth limit
+  //     exceeded"; -32005 is the generic "limit exceeded"). These arrive through the
+  //     WebSocketProvider onmessage callback, so they never pass through a read-call
+  //     try/catch — the process-level WS guard (installProcessGuards) relies on this
+  //     classification to recycle the socket instead of letting the process die.
+  if (code === -31002 || code === -32005) return true;
   // 3. HTTP 5xx surfaced on the error (esp. 504 from the gateway). ethers hangs the
   //    status off a few shapes; a CALL_EXCEPTION that is really a server error (5xx,
   //    no revert data — step 1 already let it through) is transient per spec.
@@ -297,6 +303,37 @@ function logTiming(entry) {
       `payload→submit ${dt(t.payload, t.submitted)} | submit→confirm ${dt(t.submitted, t.confirmed)} || ` +
       `TOTAL seen→confirm ${dt(t.seen, t.confirmed)}`,
   );
+}
+
+// ---- process-level WS-error guard (the async-escape backstop) --------------
+// The bandwidth/rate-limit (and any WS) error that killed the keeper arrives via
+// ethers' WebSocketProvider onmessage callback — it rejects the fire-and-forget
+// eth_subscribe promise and NEVER passes through the per-call withRetry, so only a
+// process-level net can catch it. main() publishes its socket-recycle closure here
+// (wsErrorRouter) once the WS teardown/reconnect functions exist; these guards route
+// any TRANSIENT async error into it (log → back off → reconnect) and leave genuine
+// fatals (real bugs, config, non-transient) to fail-fast with exit(1) as before.
+let wsErrorRouter = null;
+let processGuardsInstalled = false;
+function installProcessGuards() {
+  if (processGuardsInstalled) return; // survive supervise() re-running main()
+  processGuardsInstalled = true;
+  const guard = (err, origin) => {
+    if (wsErrorRouter && isTransient(err)) {
+      try {
+        wsErrorRouter(err, origin);
+      } catch (e) {
+        console.error(`WS recovery failed: ${e?.message || e}`);
+      }
+      return; // recovered — do NOT crash the keeper
+    }
+    // Genuine fatal (a real bug, bad config, or a non-transient error) — preserve the
+    // original fail-fast behavior so the orchestrator restarts on a true crash.
+    console.error(err);
+    process.exit(1);
+  };
+  process.on("unhandledRejection", (reason) => guard(reason, "unhandledRejection"));
+  process.on("uncaughtException", (err) => guard(err, "uncaughtException"));
 }
 
 async function main() {
@@ -977,10 +1014,15 @@ async function main() {
     } catch {}
   }
 
-  function scheduleReconnect() {
+  function scheduleReconnect(rateLimited = false) {
     if (reconnecting) return;
     reconnecting = true;
-    const delay = Math.min(1000 * (wsTries + 1), 15_000);
+    // Normal backoff climbs with wsTries (1s→15s). A bandwidth/rate-limit needs the
+    // quota window to recover before we re-subscribe, so floor it higher; jitter
+    // avoids a synchronized reconnect storm across parallel errors.
+    const base = Math.min(1000 * (wsTries + 1), 15_000);
+    const floored = rateLimited ? Math.max(base, 30_000) : base;
+    const delay = floored + Math.floor(Math.random() * 1000);
     setTimeout(async () => {
       reconnecting = false;
       wsTries++;
@@ -992,6 +1034,25 @@ async function main() {
       await sweepBatch().catch((e) => logSys(`reconnect sweep failed: ${e.message}`));
     }, delay);
   }
+
+  // Single router for WS-level errors that escape the read-call retry layer — the
+  // rejected eth_subscribe promise (e.g. -31002 "Bandwidth limit exceeded" delivered
+  // via the onmessage callback), a socket 'error' with no following 'close', or any
+  // transient surfaced by the process-level guard. Recycle the socket and reconnect
+  // on backoff; the debounce (reconnecting flag) collapses a burst into one reconnect.
+  function onWsError(err, origin = "ws") {
+    const rateLimited = err?.code === -31002 || err?.code === -32005 || /bandwidth ?limit|rate[ -]?limit|too many requests|quota exceeded/i.test(`${err?.message || err}`);
+    logSys(
+      `WS-level error (${origin})${rateLimited ? " [rate/bandwidth-limited]" : ""} — ` +
+        `${err?.code ?? ""} ${err?.message || err}`.trim() +
+        " — recycling socket + reconnecting",
+    );
+    teardownWs();
+    scheduleReconnect(rateLimited);
+  }
+  // Publish the router so the process-level guards can reach it, and arm the guards.
+  wsErrorRouter = onWsError;
+  installProcessGuards();
 
   function setupWs() {
     const url = cfg.wsUrls[wsTries % cfg.wsUrls.length];
@@ -1015,14 +1076,19 @@ async function main() {
     }
     // newHeads with the full header (timestamp) so we can release fills on the
     // crossing block without a per-block getBlock RPC.
-    wsProvider._subscribe("keeperHeads", ["newHeads"], (header) => {
-      try {
-        onNewHead(
-          ethers.BigNumber.from(header.number).toNumber(),
-          ethers.BigNumber.from(header.timestamp).toNumber(),
-        );
-      } catch {}
-    });
+    wsProvider
+      ._subscribe("keeperHeads", ["newHeads"], (header) => {
+        try {
+          onNewHead(
+            ethers.BigNumber.from(header.number).toNumber(),
+            ethers.BigNumber.from(header.timestamp).toNumber(),
+          );
+        } catch {}
+      })
+      // Fire-and-forget subscribe: if the eth_subscribe response is a WS error
+      // (e.g. -31002), catch it here instead of letting it become the unhandled
+      // rejection that killed the process — route it into the socket recycle.
+      .catch((e) => onWsError(e, "subscribe:newHeads"));
     const sock = wsProvider._websocket;
     sock.on("open", () => {
       wsTries = 0; // healthy — reset the URL rotation / backoff
