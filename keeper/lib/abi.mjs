@@ -27,3 +27,38 @@ function loadAbi(file) {
 
 export const PM_ABI = loadAbi("PositionManager.json");
 export const ERC20_ABI = loadAbi("MockERC20.json");
+
+// Multicall3 — canonical CREATE2 deployment, same address on every chain including
+// LitVM 4441 (verified on-chain: 7,618 bytes at this address). Used ONLY for
+// gas-free, read-only batch view reads (aggregate3 staticcall), never for anything
+// state-changing — so it can never touch the money path. Minimal fragment: only
+// aggregate3, which returns per-call (success, returnData) with allowFailure=true.
+export const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
+export const MULTICALL3_ABI = [
+  {
+    inputs: [
+      {
+        components: [
+          { name: "target", type: "address" },
+          { name: "allowFailure", type: "bool" },
+          { name: "callData", type: "bytes" },
+        ],
+        name: "calls",
+        type: "tuple[]",
+      },
+    ],
+    name: "aggregate3",
+    outputs: [
+      {
+        components: [
+          { name: "success", type: "bool" },
+          { name: "returnData", type: "bytes" },
+        ],
+        name: "returnData",
+        type: "tuple[]",
+      },
+    ],
+    stateMutability: "payable",
+    type: "function",
+  },
+];

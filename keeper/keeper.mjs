@@ -43,7 +43,7 @@
 
 import { pathToFileURL } from "url";
 import { ethers } from "ethers";
-import { PM_ABI, ERC20_ABI } from "./lib/abi.mjs";
+import { PM_ABI, ERC20_ABI, MULTICALL3_ABI, MULTICALL3_ADDRESS } from "./lib/abi.mjs";
 import { fetchPackages, wrapWithPackages, feedOf, fetchMark } from "./lib/redstone.mjs";
 import { revertReason, staticExecuteCheck, extractErrorData } from "./lib/revert.mjs";
 
@@ -63,6 +63,12 @@ const cfg = {
   dataService: process.env.REDSTONE_DATA_SERVICE || "redstone-primary-prod",
   startBlock: process.env.START_BLOCK ? Number(process.env.START_BLOCK) : undefined,
   loopMs: process.env.KEEPER_LOOP_MS ? Number(process.env.KEEPER_LOOP_MS) : 2500,
+  // Signed-package reuse window. All probes/screens in the same feed within this TTL
+  // reuse ONE RedStone fetch instead of one fetch per id — the dominant off-chain read
+  // volume. Kept tiny (<< the on-chain MAX_PRICE_AGE freshness window) so a reused
+  // package is always well within the contract's staleness bound. Money-path submit
+  // retries still force a fresh fetch (they bypass the cache).
+  pkgCacheMs: process.env.KEEPER_PKG_CACHE_MS ? Number(process.env.KEEPER_PKG_CACHE_MS) : 1000,
   catchUpMs: process.env.KEEPER_CATCHUP_MS ? Number(process.env.KEEPER_CATCHUP_MS) : 30_000,
   // ---- bounded-batch discovery (OOM guard) --------------------------------
   // The testnet gets flooded with thousands of resting trigger orders (bot spam).
@@ -344,6 +350,10 @@ async function main() {
   const wallet = new ethers.Wallet(cfg.pk, provider);
   const pm = new ethers.Contract(cfg.pmAddr, PM_ABI, wallet);
   const musd = new ethers.Contract(cfg.musdAddr, ERC20_ABI, provider);
+  // Read-only Multicall3 for the bounded sweep: collapses the per-id requests()+
+  // triggers() reads of a whole batch into ONE eth_call. Pure view staticcall — never
+  // used for anything state-changing, so the money path is untouched.
+  const multicall = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
 
   const net = await withRetry(() => provider.getNetwork(), { label: "getNetwork" });
   const MIN_DELAY = (
@@ -360,6 +370,7 @@ async function main() {
   logSys(`MIN_EXEC_DELAY:    ${MIN_DELAY}s     EXECUTION_FEE: ${f18(EXEC_FEE)} mUSD`);
   logSys(`WS endpoints:      ${cfg.wsUrls.join("  |  ")}`);
   logSys(`bounded batch:     ${cfg.batchSize}/cycle   max working set: ${cfg.maxActive}   loop: ${cfg.loopMs}ms`);
+  logSys(`read batching:     Multicall3 ${MULTICALL3_ADDRESS} (sweep)   pkg cache ${cfg.pkgCacheMs}ms   isTrigger cached/id`);
   logSys(`keeper zkLTC:      ${ethers.utils.formatEther(startZkltc)}`);
   logSys(`keeper mUSD:       ${f18(startMusd)}`);
   logSys("================================================================");
@@ -372,6 +383,15 @@ async function main() {
   const inFlight = new Set(); // ids with a tx mid-flight — never double-submit
   const quarantined = new Set(); // ids parked after persistent PERMANENT-type probe reverts (NOT cancelled)
   const hotTriggers = new Set(); // ids kept resident for short-cadence re-screening (near-money / met-but-gated)
+  // id(string) -> bool. triggers(id).triggerPrice is fixed at request time and NEVER
+  // changes for a given id, so once we know an id's kind we never re-read triggers()
+  // for it again — the sweep only re-reads requests() (the mutable part). Freed when
+  // the id goes inactive so the map stays bounded to live ids.
+  const isTriggerCache = new Map();
+  // feed -> { pkgs, ts, at } — short-TTL RedStone package cache. Many per-cycle probes
+  // on the same feed reuse ONE fetch (see getPackages); the on-chain freshness gate
+  // still applies, so a <=pkgCacheMs-old package can never settle a stale price.
+  const pkgCache = new Map();
   let feesEarned = ethers.constants.Zero; // cumulative this session
   let fills = 0;
   // Bounded-sweep state. `sweepCursor` rolls OLDEST-FIRST over [0, nextRequestId)
@@ -393,6 +413,21 @@ async function main() {
     return lastHead.tsSec + (Date.now() - lastHead.wallMs) / 1000;
   }
 
+  // Fetch signed RedStone packages for `feed`, reusing a very-recent result across the
+  // many per-cycle probes on the same feed. TTL is cfg.pkgCacheMs (default 1s) — far
+  // inside the on-chain MAX_PRICE_AGE window — so a reused package is always fresh
+  // enough to settle, and the pkgTs >= earliest floor gate still runs on the caller.
+  // Same { pkgs, ts } shape as fetchPackages. NOTE: the money-path submit-retry
+  // (submitAndSettle) deliberately calls the raw fetchPackages, never this, so a
+  // rejected-stale retry always forces a genuinely fresh fetch.
+  async function getPackages(feed) {
+    const hit = pkgCache.get(feed);
+    if (hit && Date.now() - hit.at < cfg.pkgCacheMs) return { pkgs: hit.pkgs, ts: hit.ts };
+    const { pkgs, ts } = await fetchPackages(cfg.dataService, feed);
+    pkgCache.set(feed, { pkgs, ts, at: Date.now() });
+    return { pkgs, ts };
+  }
+
   // Read chain state for one id and (re)concile it into the active set. This is
   // the single source of truth: WS events and the counter catch-up both funnel
   // through here, so the set can never drift from requests(id).active. On first
@@ -411,17 +446,33 @@ async function main() {
       logId(key, "errored", `requests() read failed: ${err.message}`);
       return "error";
     }
+    // triggers(id) is immutable per id — read it once (only if active + unknown) and
+    // cache it, so this and every future sweep never re-read it for this id.
+    let isTrigger = isTriggerCache.get(key);
+    if (req.active && isTrigger === undefined) {
+      try {
+        isTrigger = !(await withRetry(() => pm.triggers(id), { label: `triggers(${key})` })).triggerPrice.isZero();
+        isTriggerCache.set(key, isTrigger);
+      } catch {
+        isTrigger = false; // read failed — don't cache; a later pass retries
+      }
+    }
+    return applyReconcile(id, key, req, isTrigger ?? false);
+  }
+
+  // The pure, no-RPC core of reconcile: given an already-read requests() struct and
+  // known trigger-kind, fold the id into (or out of) the active set. Shared by the
+  // single-id reconcile() above and the batched multicall sweep below, so both funnel
+  // through ONE admission/scheduling code path (the set can never drift).
+  function applyReconcile(id, key, req, isTrigger) {
     if (!req.active) {
       const e = active.get(key);
       if (e && e.fireTimer) clearTimeout(e.fireTimer);
       hotTriggers.delete(key);
+      isTriggerCache.delete(key); // id retired — free the cache slot (ids only increment)
       if (active.delete(key)) logId(key, "removed", "no longer active on-chain");
       return "inactive";
     }
-    let isTrigger = false;
-    try {
-      isTrigger = !(await withRetry(() => pm.triggers(id), { label: `triggers(${key})` })).triggerPrice.isZero();
-    } catch {}
     const feed = feedOf(req.market);
     if (!active.has(key)) {
       // Memory bound: markets are always admitted; a new TRIGGER is admitted only
@@ -482,10 +533,85 @@ async function main() {
       return { examined: 0, next: 0 };
     }
     const { ids, nextCursor } = planSweep(sweepCursor, next, cfg.batchSize);
-    for (const id of ids) {
-      const status = await reconcile(id);
-      if (status === "added" || status === "updated" || status === "deferred") sweepActiveCount++;
+
+    // Skip ids reconcile would early-return on with no read (mid-fill / quarantined).
+    const readable = ids.filter((id) => {
+      const key = id.toString();
+      return !inFlight.has(key) && !quarantined.has(key);
+    });
+
+    // ONE Multicall3 aggregate3 for the whole batch: requests(id) for every readable
+    // id, plus triggers(id) ONLY for ids whose (immutable) kind we don't yet know.
+    // Collapses up to 2×batchSize sequential reads into a single eth_call.
+    const reqCalls = readable.map((id) => ({
+      target: cfg.pmAddr,
+      allowFailure: true,
+      callData: pm.interface.encodeFunctionData("requests", [id]),
+    }));
+    const trigIds = readable.filter((id) => !isTriggerCache.has(id.toString()));
+    const trigCalls = trigIds.map((id) => ({
+      target: cfg.pmAddr,
+      allowFailure: true,
+      callData: pm.interface.encodeFunctionData("triggers", [id]),
+    }));
+
+    let ret = [];
+    if (reqCalls.length || trigCalls.length) {
+      const all = [...reqCalls, ...trigCalls];
+      // aggregate3(allowFailure:true) can NEVER legitimately revert — a sub-call
+      // revert is captured as {success:false}, so the only way the batch call itself
+      // throws is infra (the degraded node intermittently returns an empty 0x under
+      // rate-limit load, surfaced as a reasonless CALL_EXCEPTION). isTransient stays
+      // strict for the money path and won't retry that shape, so retry the batch here
+      // directly. On exhaustion we skip THIS cycle WITHOUT advancing sweepCursor, so
+      // the same ids are re-swept next tick — no id is ever missed.
+      let lastErr = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          ret = await multicall.callStatic.aggregate3(all);
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          if (attempt < 3) await sleep(500 * attempt);
+        }
+      }
+      if (lastErr) {
+        logSys(`sweep multicall failed after retries (will re-sweep next tick): ${lastErr.message}`);
+        return { examined: 0, next };
+      }
     }
+
+    // Decode triggers first → populate the immutable-kind cache for these ids.
+    trigIds.forEach((id, i) => {
+      const r = ret[reqCalls.length + i];
+      if (r && r.success) {
+        try {
+          const dec = pm.interface.decodeFunctionResult("triggers", r.returnData);
+          isTriggerCache.set(id.toString(), !dec.triggerPrice.isZero());
+        } catch {}
+      }
+    });
+
+    // Decode requests → fold each id through the shared no-RPC applyReconcile core.
+    readable.forEach((id, i) => {
+      const key = id.toString();
+      const r = ret[i];
+      if (!r || !r.success) {
+        logId(key, "errored", "requests() multicall reverted");
+        return;
+      }
+      let req;
+      try {
+        req = pm.interface.decodeFunctionResult("requests", r.returnData);
+      } catch {
+        logId(key, "errored", "requests() multicall decode failed");
+        return;
+      }
+      const status = applyReconcile(id, key, req, isTriggerCache.get(key) ?? false);
+      if (status === "added" || status === "updated" || status === "deferred") sweepActiveCount++;
+    });
+
     sweepCursor = nextCursor;
     // A wrap back to the oldest id completes one rotation: snapshot the active-seen
     // tally as the current backlog depth, then reset for the next rotation.
@@ -602,9 +728,11 @@ async function main() {
     entry.lastFireMs = Date.now();
     entry.t.windowOpen ??= Date.now(); // window has opened — we are acting on it
     try {
-      // ONE fetch: read the package timestamp for the freshness gate AND hold the
-      // package to inject calldata — no second requestDataPackages on the submit path.
-      const { pkgs, ts: pkgTs } = await fetchPackages(cfg.dataService, entry.feed);
+      // ONE fetch (cached ≤pkgCacheMs across same-feed probes): read the package
+      // timestamp for the freshness gate AND hold the package to inject calldata — no
+      // second requestDataPackages on the submit path. The pkgTs >= earliest gate below
+      // still enforces on-chain freshness on the reused package.
+      const { pkgs, ts: pkgTs } = await getPackages(entry.feed);
       if (pkgTs < entry.earliest) {
         // Payload not yet stamped past the floor (clock skew) — brief bounded retry.
         if (entry.phase !== "waiting-payload") {
@@ -935,7 +1063,7 @@ async function main() {
     // it reuses that exact tx (no second RedStone fetch).
     let txReq, probe;
     try {
-      const { pkgs } = await fetchPackages(cfg.dataService, entry.feed);
+      const { pkgs } = await getPackages(entry.feed); // cached ≤pkgCacheMs across same-feed probes
       txReq = await buildTx(entry, pkgs);
       probe = await staticExecuteCheck(provider, pm.interface, txReq, wallet.address);
     } catch (err) {
