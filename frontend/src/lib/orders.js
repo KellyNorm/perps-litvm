@@ -43,24 +43,39 @@ export function removeOrderId(account, id) {
 }
 
 // Best-effort recovery of resting-order ids from the wallet's own trigger events.
-// `owner` is the 2nd indexed topic on every Trigger*Requested event. Public RPCs cap
-// getLogs ranges, so we scan a bounded recent window and swallow failures — the
-// localStorage ids are the dependable source; this only supplements them.
-const SCAN_LOOKBACK = 120_000;
+// `owner` is the 2nd indexed topic on every Trigger*Requested event. LitVM caps each
+// eth_getLogs at <=1000 blocks, so we PAGE a recent window in 1000-block chunks working
+// backwards (with a gentle inter-page delay), swallowing per-page failures — the
+// localStorage ids are the dependable source; this only supplements them. Resting orders
+// are recent, so we stop the walk the moment a page yields ids ("found what we need").
+// When nothing turns up we still cap the walk (MAX_SCAN_PAGES) rather than pounding a
+// possibly-degraded RPC every refresh.
+const SCAN_PAGE_SIZE = 1_000; // LitVM's per-getLogs block cap
+const MAX_SCAN_PAGES = 24; // bound the empty-scan walk (~24k blocks)
+const SCAN_PAGE_DELAY_MS = 75; // gentle spacing between pages on a shared RPC
 const TRIGGER_EVENTS = ["TriggerOpenRequested", "TriggerCloseRequested", "TriggerDecreaseRequested", "TriggerIncreaseRequested"];
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export async function scanOrderIds(pm, account) {
   if (!account) return [];
   const latest = await withRetry(() => pm.provider.getBlockNumber());
-  const fromBlock = Math.max(0, latest - SCAN_LOOKBACK);
+  const floor = Math.max(0, latest - SCAN_PAGE_SIZE * MAX_SCAN_PAGES);
   const ids = new Set();
-  for (const ev of TRIGGER_EVENTS) {
-    try {
-      const logs = await pm.queryFilter(pm.filters[ev](null, account), fromBlock, latest);
-      for (const l of logs) ids.add(l.args.requestId.toString());
-    } catch {
-      // range too wide / event unsupported — ignore, localStorage still covers us.
+  let to = latest;
+  for (let page = 0; page < MAX_SCAN_PAGES && to >= floor; page++) {
+    const from = Math.max(floor, to - SCAN_PAGE_SIZE + 1); // inclusive [from, to], <=1000 blocks
+    for (const ev of TRIGGER_EVENTS) {
+      try {
+        const logs = await pm.queryFilter(pm.filters[ev](null, account), from, to);
+        for (const l of logs) ids.add(l.args.requestId.toString());
+      } catch {
+        // range too wide / event unsupported — ignore, localStorage still covers us.
+      }
     }
+    if (ids.size) break; // recovered this wallet's recent orders — stop paging
+    to = from - 1;
+    if (to >= floor) await sleep(SCAN_PAGE_DELAY_MS);
   }
   return [...ids];
 }

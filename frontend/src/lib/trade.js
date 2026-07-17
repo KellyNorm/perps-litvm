@@ -245,7 +245,10 @@ export async function readRequestOutcome(pmReadCtr, id, fromBlock) {
       const latest = await withRetry(() => pmReadCtr.provider.getBlockNumber());
       from = Math.max(0, latest - OUTCOME_LOOKBACK);
     } catch {
-      from = 0;
+      // Can't determine the latest block — do NOT fall back to a genesis-wide scan.
+      // The request is gone either way, so return it unlabelled (the existing swallow
+      // path); the caller refreshes and stops watching regardless.
+      return { kind: "unknown" };
     }
   }
   try {
