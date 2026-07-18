@@ -128,6 +128,45 @@ reuse the perp keeper's service). `railway.json` is included. Set the env vars f
 `.env.example` in the dashboard: `LITVM_RPC_URL`, `PREDICTION_KEEPER_PRIVATE_KEY`,
 `PREDICTION_FACTORY_ADDRESS`.
 
+## Known issues / future work
+
+### O(n) cold-start market walk
+
+**Problem.** On startup the keeper seeds its live-set by scanning `marketCount()`
+from id `0` upward (`ingestNew(full=true)` → `getMarket(id)` for every id). It has to
+re-seed on every process start because the live-set is in-memory only, and Railway
+restarts the service on failure.
+
+**Why it's fine now.** The factory has ~7 markets total, so the cold-start walk is a
+handful of reads.
+
+**Why it won't stay fine.** The factory creates markets *continuously* — `replenish`
+keeps refilling the board as markets resolve, so **lifetime `marketCount()` grows
+monotonically and never shrinks** (resolved markets are pruned from the on-chain
+*live* set but their ids remain in `_markets`). Every restart therefore re-walks the
+entire history, and each `getMarket` is a round-trip on a **rate-limited, 502/504-prone
+RPC**. Left alone, cold-start time grows without bound and eventually dominates
+startup — a restart loop could fail to converge on the live board at all.
+
+Steady state is unaffected: after seeding, each tick only ingests the new tail
+(`[highestScanned, marketCount)`) and drops markets as they resolve. This is purely a
+**cold-start / restart** cost.
+
+**Candidate fixes.**
+- **Event-based seeding** — reconstruct the live-set from logs instead of per-id
+  reads: query `FactoryMarketCreated` (or base `MarketCreated`) minus `MarketResolved`
+  over a bounded recent block range. A live market is at most ~24h + betWindow old
+  (the longest timeframe), so a bounded `fromBlock` window captures every live market
+  in a couple of `getLogs` calls instead of O(n) `getMarket` calls. Watch Caldera's
+  `getLogs` range caps; page if needed.
+- **Persisted low-water cursor** — persist the lowest still-relevant id (e.g. to a
+  Railway volume or a tiny on-disk file) and resume the scan from there instead of `0`
+  on restart. Simplest change, but needs durable storage the current stateless
+  deployment doesn't have.
+
+Either removes the unbounded cold-start walk. Event-based seeding is preferred (no
+persistence dependency, and it also self-heals a desynced set).
+
 ## Isolation checklist (non-negotiable)
 
 - [x] New file / dir — not sharing the perp keeper's code path
