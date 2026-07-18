@@ -63,8 +63,8 @@ contract DeployPrediction is Script {
     //   dp      = UI display precision only (does NOT affect money)
     //
     // NOTE: "ZCASH"'s LIVE DIA key is "ZEC/USD" (NOT "ZCASH/USD").
-    // Verified LIVE 2026-07-17: BTC, ETH, LTC, SOL, ZEC, RAIN.  XRP verified 2026-07-08.
-    // UNVERIFIED keys — confirm live before Stage 2: BNB, TRX, HYPE, DOGE.
+    // All 11 keys verified returning a live 18-dec price with recent timestamps
+    // (BTC/ETH/LTC/SOL/ZEC/RAIN + XRP earlier; BNB/TRX/HYPE/DOGE on 2026-07-18).
     // The design doc lists 11 assets; trim rows here to reach the intended set.
     // =========================================================================
     function _assets() internal pure returns (string[] memory key, string[] memory display, uint8[] memory dp) {
@@ -79,7 +79,7 @@ contract DeployPrediction is Script {
         key[1] = "ETH/USD"; // verified live
         display[1] = "ETH";
         dp[1] = 2;
-        key[2] = "BNB/USD"; // UNVERIFIED
+        key[2] = "BNB/USD"; // verified live (~$566)
         display[2] = "BNB";
         dp[2] = 2;
         key[3] = "XRP/USD"; // verified live (07-08)
@@ -88,13 +88,13 @@ contract DeployPrediction is Script {
         key[4] = "SOL/USD"; // verified live
         display[4] = "SOL";
         dp[4] = 2;
-        key[5] = "TRX/USD"; // UNVERIFIED
+        key[5] = "TRX/USD"; // verified live (~$0.32)
         display[5] = "TRX";
         dp[5] = 5;
-        key[6] = "HYPE/USD"; // UNVERIFIED
+        key[6] = "HYPE/USD"; // verified live (~$60)
         display[6] = "HYPE";
-        dp[6] = 3;
-        key[7] = "DOGE/USD"; // UNVERIFIED
+        dp[6] = 2; // cents
+        key[7] = "DOGE/USD"; // verified live (~$0.07)
         display[7] = "DOGE";
         dp[7] = 5;
         key[8] = "RAIN/USD"; // verified live
