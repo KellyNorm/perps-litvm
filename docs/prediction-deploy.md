@@ -84,3 +84,102 @@ creatable now.
 - Keeper / `replenish` automation is **Stage 5b** — not set up in this deploy.
 - Ownership currently = deployer (required for in-script `addAsset`); transfer to a
   governance owner later if desired.
+
+## Stage 3: live deployment verified (chain 4441)
+
+The factory is **live and working end-to-end**. This section records that the
+auto-factory functions correctly; it is **not** a market-state snapshot to maintain
+(open markets are ephemeral — they lock and settle on their windows and roll over).
+
+- **Factory (`PredictionMarketFactory`):** `0x6338985C7f689C3e1959bfe1a8bb36E44849EA40`
+- **Params (on-chain verified):** `maxStaleness = 300`, `feeBps = 0`,
+  `owner = treasury = 0xE9Dd9bFf0ad5254673daaA77397e84Fec2312292` (deployer),
+  `musd = 0x4AedaB95d41A31f891EE12d13CD77102705e2dEF`.
+- **Asset registry:** `assetCount = 11`, all 11 enabled. Each adapter's live
+  `symbol()` matches its intended DIA key.
+
+| assetId | display | adapter | DIA key |
+|---------|---------|---------|---------|
+| 0  | BTC   | `0x7a75890ad9a2ecef4a3b64b62b4050d583fc1aee` | BTC/USD  |
+| 1  | ETH   | `0xd16526c879c7fc8caec6a45112c513e7012fbe71` | ETH/USD  |
+| 2  | BNB   | `0xd1632391626ab78d098a795d80ef5431426aadce` | BNB/USD  |
+| 3  | XRP   | `0x30c0b874aa4deefbb15f12eb650947ef5a4d51fb` | XRP/USD  |
+| 4  | SOL   | `0x3ab5383fb5be15c362b474a91ab3afed18450f2c` | SOL/USD  |
+| 5  | TRX   | `0xbda584811c879ed6f7466dbd2c47b4b85d644338` | TRX/USD  |
+| 6  | HYPE  | `0x914fceaf39b2c0f083431ebf16a1e9310a94259d` | HYPE/USD |
+| 7  | DOGE  | `0x7129116eb54d511cfe99d4fc296e008afc617a5c` | DOGE/USD |
+| 8  | RAIN  | `0xd943d73f213f4248df2491343e05c7e143ab44df` | RAIN/USD |
+| 9  | ZCASH | `0x70dbb5eabd852504d40c82b68cc5908658af3080` | **ZEC/USD** |
+| 10 | LTC   | `0x23ac0fe0a76e324cadc66fcbd81df7b294375fd3` | LTC/USD  |
+
+> assetId 9 **displays `ZCASH`** but queries DIA key **`ZEC/USD`** (not `ZCASH/USD`).
+
+### `replenish()` was called → healthy 7-market board
+
+`replenish()` (tx `0xdea435663675ca1fa4b41a82ba898a2e01b418489db245e22f9cfd54e2d11c6d`,
+block `0x1d3fa7f`) produced a full board: `boardCounts = (active 7, open 7)`,
+`liveMarketCount = 7`, `marketCount = 7`. All 7 markets `phase = Open`, offset 0
+(strike = spot). **5 distinct assets** (DOGE, BNB, TRX, ETH, XRP), **all 4
+timeframes** represented.
+
+| id | asset | tf  | bet/settle (s)   | window arithmetic | maxStaleness | feeBps |
+|----|-------|-----|------------------|-------------------|--------------|--------|
+| 0  | DOGE  | 1h  | 2400 / 1200      | ✅ | 300 | 0 |
+| 1  | BNB   | 15m | 600 / 300        | ✅ | 300 | 0 |
+| 2  | TRX   | 1h  | 2400 / 1200      | ✅ | 300 | 0 |
+| 3  | ETH   | 15m | 600 / 300        | ✅ | 300 | 0 |
+| 4  | DOGE  | 30m | 1200 / 600       | ✅ | 300 | 0 |
+| 5  | XRP   | 15m | 600 / 300        | ✅ | 300 | 0 |
+| 6  | ETH   | 24h | 84600 / 1800     | ✅ | 300 | 0 |
+
+**Verified 7/7:** every market satisfies `tLock = t0 + betWindow` and
+`tExpiry = tLock + settleWindow` for its timeframe, and snapshotted
+`maxStaleness = 300` / `feeBps = 0`. Duplicate (asset, timeframe) pairs share an
+identical strike (same feed, same creation block, offset 0) — expected; `_select`
+de-dups on (asset, timeframe), not asset alone.
+
+## Operational notes for the keeper (Stage 5b)
+
+### GOTCHA — send `replenish()` with an EXPLICIT gas limit, never estimation
+
+The first `replenish()` call (tx `0x9875190fd077fa4755148d295221c8e4b910ba952bd93008db6d91ba0143ed25`)
+**reverted out-of-gas** (`gasUsed == gasLimit` exactly) because `cast`/wallet gas
+*estimation* under-provisioned it. Resending with `--gas-limit 20000000` succeeded.
+
+Why estimation is unreliable here:
+- **RPC is degraded.** `eth_estimateGas` / `getFeeData` return 502/504 routinely on
+  this endpoint; a keeper that leans on them will intermittently get a bad/absent
+  estimate.
+- **`replenish()` has variable cost.** It reaps expired markets *and* fills the
+  board up to `TARGET_ACTIVE = 7` in a single call — cost scales with how many
+  markets it settles + creates this invocation. An estimate taken against one state
+  (few creatable feeds) under-covers execution against another (many). When the
+  estimate is too low, the tx OOGs and **silently fails to maintain the board** —
+  no markets opened, no obvious error unless the keeper checks receipt `status`.
+
+**Observed gas cost:** a cold `replenish()` that created **7 markets from an empty
+board** used **~1.20M gas** (`0x1256fe`). A replenish that also *reaps* (settles)
+expired markets costs more — each `settle()` loops the market's TWAP samples.
+
+**Guidance for 5b:**
+- Send `replenish()` with a **fixed** `--gas-limit` (e.g. **20,000,000**) — LitVM's
+  L2 gas ceiling is effectively unbounded, so over-providing is free (you pay only
+  `gasUsed`). ~15–17× headroom over the observed 1.2M absorbs reap-heavy calls.
+- **Always check the receipt `status`** (0x1) after sending — do not assume success.
+  On 0x0, re-send (state rolled back; safe to retry).
+- Do not rely on a successful dry-run/`eth_call` to imply the broadcast will fit:
+  the OOG here passed static simulation and still failed on-chain.
+
+### `addAsset` does no staleness check — config can't be bricked by a quiet feed
+
+`addAsset` reads only the feed's `decimals()` (to validate it is an aggregator and
+cache precision) — it does **not** read a price or check freshness. So wiring an
+asset **cannot** be blocked by a slow/quiet/stale DIA feed.
+
+Freshness gating lives entirely in **market creation**: `replenish` → `_select` /
+`_openMarket` → `SafeAggregatorReader.readFreshPrice(maxStaleness)`. Consequence for
+operations: if a feed goes quiet, `replenish` simply **skips creating markets on
+that asset** (it is filtered out of selection) and keeps serving the healthy ones —
+a quiet feed degrades gracefully (fewer markets) rather than bricking the registry
+or reverting `replenish`. The asset resumes automatically once its feed is fresh
+again; no config change needed.
