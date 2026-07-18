@@ -16,6 +16,18 @@ contract NotAFeed {
     uint256 public x;
 }
 
+/// Exposes the internal `_windows` map so the per-timeframe windows (and the
+/// no-silent-fallthrough revert) can be asserted directly.
+contract WindowProbe is PredictionMarketFactory {
+    constructor(IERC20 musd_, address treasury_, uint256 feeBps_, address owner_, uint256 maxStaleness_)
+        PredictionMarketFactory(musd_, treasury_, feeBps_, owner_, maxStaleness_)
+    {}
+
+    function windows(uint8 tf) external pure returns (uint64 betWindow, uint64 settleWindow) {
+        return _windows(tf);
+    }
+}
+
 /**
  * @title PredictionMarketFactoryTest
  * @notice Tests for the auto-factory / replenish layer (design section 2, section 9, section 14). The
@@ -38,7 +50,7 @@ contract PredictionMarketFactoryTest is Test {
 
     function setUp() public {
         musd = new MockERC20("Mock USD", "mUSD");
-        f = new PredictionMarketFactory(IERC20(address(musd)), treasury, 0, address(this));
+        f = new PredictionMarketFactory(IERC20(address(musd)), treasury, 0, address(this), 300);
         vm.warp(NOW);
 
         musd.mint(alice, 1e30);
@@ -100,8 +112,8 @@ contract PredictionMarketFactoryTest is Test {
         f.replenish();
         assertEq(f.liveMarketCount(), 7, "initial board");
 
-        // Warp past the longest timeframe so every market expires.
-        vm.warp(NOW + 4000);
+        // Warp past the longest timeframe (24h) so every market expires.
+        vm.warp(NOW + 86_401);
         _refreshFeeds(feeds);
 
         f.replenish(); // reaps all (empty => VOID) + refills
@@ -126,12 +138,12 @@ contract PredictionMarketFactoryTest is Test {
         MockAggregatorV3[] memory feeds = _addAssets(1);
         IAggregatorV3 feed = IAggregatorV3(address(feeds[0]));
 
-        // Hand-build a worst case: TARGET markets, all 5m, all created now.
+        // Hand-build a worst case: TARGET markets, all shortest-frame (15m), created now.
         for (uint256 i = 0; i < 7; i++) {
-            f.createMarket(0, feed, 200, 100, 0, false); // owner path, deterministic windows
+            f.createMarket(0, feed, 600, 300, 0, false); // owner path, deterministic 15m windows
         }
-        // Warp past every lock (200s) but before every expiry (300s): all Locked.
-        vm.warp(NOW + 250);
+        // Warp past every lock (600s) but before every expiry (900s): all Locked.
+        vm.warp(NOW + 700);
         (uint256 active, uint256 open) = f.boardCounts();
         assertEq(active, 7, "board full");
         assertEq(open, 0, "and nothing Open - the worst case");
@@ -162,20 +174,57 @@ contract PredictionMarketFactoryTest is Test {
 
     function test_Selection_SpansAssetsAndTimeframes() public {
         _addAssets(11);
-        bool[3] memory tfSeen;
+        bool[4] memory tfSeen;
         uint256 assetMask;
-        for (uint256 s = 0; s < 40; s++) {
+        for (uint256 s = 0; s < 60; s++) {
             vm.prevrandao(bytes32(uint256(keccak256(abi.encodePacked("seed", s)))));
             (bool ok, uint16 assetId, uint8 tf) = f.previewSelect();
             assertTrue(ok, "an enabled healthy asset is always selectable");
             tfSeen[tf] = true;
             assetMask |= (uint256(1) << assetId);
         }
-        uint256 tfCount = (tfSeen[0] ? 1 : 0) + (tfSeen[1] ? 1 : 0) + (tfSeen[2] ? 1 : 0);
-        assertEq(tfCount, 3, "selection spans all three timeframes");
+        uint256 tfCount = (tfSeen[0] ? 1 : 0) + (tfSeen[1] ? 1 : 0) + (tfSeen[2] ? 1 : 0) + (tfSeen[3] ? 1 : 0);
+        assertEq(tfCount, 4, "selection spans all four timeframes");
 
         uint256 distinctAssets = _popcount(assetMask);
         assertGe(distinctAssets, 3, "selection spans several assets");
+    }
+
+    // =========================================================================
+    // Timeframe windows: new 15m/30m/1h/24h set, 5m removed, 24h ratio exception
+    // =========================================================================
+
+    function test_MaxStaleness_ConstructorValue() public view {
+        assertEq(f.maxStaleness(), 300, "factory wires the staleness constructor arg");
+    }
+
+    function test_Windows_MapEachTimeframe() public {
+        WindowProbe p = new WindowProbe(IERC20(address(musd)), treasury, 0, address(this), 300);
+
+        (uint64 b15, uint64 s15) = p.windows(f.TF_15M());
+        assertEq(b15, 600, "15m bet");
+        assertEq(s15, 300, "15m settle (1/3)");
+
+        (uint64 b30, uint64 s30) = p.windows(f.TF_30M());
+        assertEq(b30, 1200, "30m bet");
+        assertEq(s30, 600, "30m settle (1/3)");
+
+        (uint64 b1h, uint64 s1h) = p.windows(f.TF_1H());
+        assertEq(b1h, 2400, "1h bet");
+        assertEq(s1h, 1200, "1h settle (1/3)");
+
+        // 24h: ratio exception — fixed 30m settlement window, bet = 24h − 30m.
+        (uint64 b24, uint64 s24) = p.windows(f.TF_24H());
+        assertEq(b24, 84_600, "24h bet = 24h - 30m");
+        assertEq(s24, 1800, "24h settle FIXED at 30m (not 8h)");
+        assertEq(uint256(b24) + uint256(s24), 86_400, "24h total life is exactly 24h");
+    }
+
+    function test_Windows_RevertsUnknownTimeframe() public {
+        WindowProbe p = new WindowProbe(IERC20(address(musd)), treasury, 0, address(this), 300);
+        // tf == 4 is out of the {0..3} set — must revert, never fall through to a default.
+        vm.expectRevert(PredictionMarketFactory.BadTimeframe.selector);
+        p.windows(4);
     }
 
     /// prevrandao steers WHICH market is listed, but never any money value.
@@ -316,7 +365,7 @@ contract PredictionMarketFactoryTest is Test {
     function test_CreateMarket_RejectsUnhealthyFeed() public {
         MockAggregatorV3 feed = new MockAggregatorV3(8);
         f.addAsset("X", IAggregatorV3(address(feed)), 2);
-        feed.setHealthy(PRICE, block.timestamp - 200); // stale (> 120s MAX_STALENESS)
+        feed.setHealthy(PRICE, block.timestamp - (f.maxStaleness() + 1)); // stale past the window
 
         vm.expectRevert(OracleResolvedMarket.FeedUnhealthyAtCreation.selector);
         f.createMarket(0, IAggregatorV3(address(feed)), 600, 300, 0, false);
@@ -347,7 +396,7 @@ contract PredictionMarketFactoryTest is Test {
         assertEq(f.liveMarketCount(), 7, "board built");
 
         f.pause();
-        vm.warp(NOW + 4000); // everything expires
+        vm.warp(NOW + 86_401); // everything expires (past the 24h frame)
         _refreshFeeds(feeds);
 
         f.replenish(); // reaps the expired (empty) markets to VOID, creates none

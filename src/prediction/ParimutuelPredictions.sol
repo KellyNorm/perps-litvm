@@ -98,7 +98,10 @@ contract ParimutuelPredictions is OracleResolvedMarket, Ownable, Pausable {
 
     // ------------------------------------------------------------ constructor
 
-    constructor(IERC20 musd_, address treasury_, uint256 feeBps_, address owner_) Ownable(owner_) {
+    constructor(IERC20 musd_, address treasury_, uint256 feeBps_, address owner_, uint256 maxStaleness_)
+        Ownable(owner_)
+        OracleResolvedMarket(maxStaleness_)
+    {
         if (address(musd_) == address(0) || treasury_ == address(0)) revert ZeroAddress();
         if (feeBps_ > FEE_CAP) revert FeeAboveCap();
         musd = musd_;
@@ -287,6 +290,12 @@ contract ParimutuelPredictions is OracleResolvedMarket, Ownable, Pausable {
         if (newTreasury == address(0)) revert ZeroAddress();
         treasury = newTreasury;
         emit TreasurySet(newTreasury);
+    }
+
+    /// @notice Governance: tune the oracle staleness window (design §3). Bounded
+    ///         in {_setMaxStaleness}; emits {MaxStalenessSet}.
+    function setMaxStaleness(uint256 newMaxStaleness) external onlyOwner {
+        _setMaxStaleness(newMaxStaleness);
     }
 
     // ------------------------------------------------------------- pool views

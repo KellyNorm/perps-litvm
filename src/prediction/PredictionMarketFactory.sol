@@ -52,10 +52,14 @@ contract PredictionMarketFactory is ParimutuelPredictions {
     /// Target rolling count of live (Open|Locked) markets (design §9.1).
     uint256 public constant TARGET_ACTIVE = 7;
 
-    /// Timeframe indices and their betting/settlement windows (design §4, ⅔/⅓).
-    uint8 public constant TF_5M = 0;
-    uint8 public constant TF_15M = 1;
+    /// Timeframe indices and their betting/settlement windows (design §4, ⅔/⅓;
+    /// 24h is the ratio exception — see {_windows}).
+    uint8 public constant TF_15M = 0;
+    uint8 public constant TF_30M = 1;
     uint8 public constant TF_1H = 2;
+    uint8 public constant TF_24H = 3;
+    /// Number of timeframes; keep in lockstep with the TF_* set and {_windows}.
+    uint256 internal constant TF_COUNT = 4;
 
     // ---------------------------------------------------------------- storage
 
@@ -80,11 +84,12 @@ contract PredictionMarketFactory is ParimutuelPredictions {
 
     error NoSuchAsset();
     error InvalidFeed();
+    error BadTimeframe();
 
     // ------------------------------------------------------------ constructor
 
-    constructor(IERC20 musd_, address treasury_, uint256 feeBps_, address owner_)
-        ParimutuelPredictions(musd_, treasury_, feeBps_, owner_)
+    constructor(IERC20 musd_, address treasury_, uint256 feeBps_, address owner_, uint256 maxStaleness_)
+        ParimutuelPredictions(musd_, treasury_, feeBps_, owner_, maxStaleness_)
     {}
 
     // -------------------------------------------- asset registry (design §2/§11)
@@ -176,7 +181,7 @@ contract PredictionMarketFactory is ParimutuelPredictions {
         // Structural — does not depend on the random draw.
         if (open == 0) {
             (bool ok, uint16 assetId) = _firstHealthyEnabled(enabled);
-            if (ok) _createFactoryMarket(assetId, TF_5M);
+            if (ok) _createFactoryMarket(assetId, TF_15M); // shortest frame
         }
     }
 
@@ -199,7 +204,7 @@ contract PredictionMarketFactory is ParimutuelPredictions {
         // because it steers only which market is listed, never any money value.
         uint256 seed = uint256(keccak256(abi.encodePacked(block.prevrandao, block.timestamp, nonce, len)));
         uint256 start = seed % len;
-        timeframe = uint8((seed >> 128) % 3);
+        timeframe = uint8((seed >> 128) % TF_COUNT);
 
         // Pass 1: healthy feed AND no identical live-Open market (variety).
         for (uint256 k = 0; k < len; k++) {
@@ -230,13 +235,20 @@ contract PredictionMarketFactory is ParimutuelPredictions {
     }
 
     function _windows(uint8 tf) internal pure returns (uint64 betWindow, uint64 settleWindow) {
-        if (tf == TF_5M) return (200, 100); // 5m: ⅔ bet / ⅓ settle
-        if (tf == TF_15M) return (600, 300); // 15m
-        return (2400, 1200); // 1h
+        if (tf == TF_15M) return (600, 300); // 15m: ⅔ bet / ⅓ settle
+        if (tf == TF_30M) return (1200, 600); // 30m: ⅔ bet / ⅓ settle
+        if (tf == TF_1H) return (2400, 1200); // 1h:  ⅔ bet / ⅓ settle
+        // 24h: settlement window FIXED at 1800s (30m), DECOUPLED from the ⅔/⅓ ratio
+        // (which would be an 8h window). An 8h window stores ~thousands of samples
+        // that settle() must loop — risking an unsettleable market — and needs 8h of
+        // continuous keeper sampling on a 502/504-prone RPC. 1800s clears the 60%
+        // coverage gate ~12x at 300s staleness. betWindow = 24h − 30m.
+        if (tf == TF_24H) return (84_600, 1_800);
+        revert BadTimeframe(); // no silent fallthrough to a default window
     }
 
     function _feedHealthy(uint16 assetId) internal view returns (bool ok) {
-        (ok,) = SafeAggregatorReader.readFreshPrice(assets[assetId].feed, MAX_STALENESS);
+        (ok,) = SafeAggregatorReader.readFreshPrice(assets[assetId].feed, maxStaleness);
     }
 
     /// Is there already a bettable (Open, pre-lock) market on this asset+timeframe?

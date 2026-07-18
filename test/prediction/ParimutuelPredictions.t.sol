@@ -39,7 +39,7 @@ contract ParimutuelPredictionsTest is Test {
     function setUp() public {
         musd = new MockERC20("Mock USD", "mUSD");
         feed = new MockAggregatorV3(8);
-        pm = new ParimutuelPredictions(IERC20(address(musd)), treasury, 0, address(this));
+        pm = new ParimutuelPredictions(IERC20(address(musd)), treasury, 0, address(this), 300);
         vm.warp(NOW);
 
         address[4] memory users = [alice, bob, carol, dave];
@@ -350,12 +350,12 @@ contract ParimutuelPredictionsTest is Test {
 
     function test_Constructor_RevertsFeeAboveCap() public {
         vm.expectRevert(ParimutuelPredictions.FeeAboveCap.selector);
-        new ParimutuelPredictions(IERC20(address(musd)), treasury, 301, address(this));
+        new ParimutuelPredictions(IERC20(address(musd)), treasury, 301, address(this), 300);
     }
 
     function test_Constructor_RevertsZeroAddress() public {
         vm.expectRevert(ParimutuelPredictions.ZeroAddress.selector);
-        new ParimutuelPredictions(IERC20(address(0)), treasury, 0, address(this));
+        new ParimutuelPredictions(IERC20(address(0)), treasury, 0, address(this), 300);
     }
 
     function test_SetFeeBps_CapAndOwnerEnforced() public {
@@ -365,6 +365,44 @@ contract ParimutuelPredictionsTest is Test {
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
         pm.setFeeBps(100);
+    }
+
+    // --- maxStaleness: constructor param + governance setter (design §3) --------
+
+    function test_Constructor_WiresMaxStaleness() public view {
+        assertEq(pm.maxStaleness(), 300, "constructor arg is the live staleness window");
+    }
+
+    function test_Constructor_RejectsBadMaxStaleness() public {
+        vm.expectRevert(OracleResolvedMarket.BadMaxStaleness.selector);
+        new ParimutuelPredictions(IERC20(address(musd)), treasury, 0, address(this), 0);
+
+        vm.expectRevert(OracleResolvedMarket.BadMaxStaleness.selector);
+        new ParimutuelPredictions(IERC20(address(musd)), treasury, 0, address(this), 1 hours + 1);
+    }
+
+    function test_SetMaxStaleness_OwnerOnly() public {
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        pm.setMaxStaleness(200);
+    }
+
+    function test_SetMaxStaleness_UpdatesValueAndEmits() public {
+        vm.expectEmit(true, true, true, true, address(pm));
+        emit OracleResolvedMarket.MaxStalenessSet(200);
+        pm.setMaxStaleness(200);
+        assertEq(pm.maxStaleness(), 200, "owner can tune the staleness window");
+    }
+
+    function test_SetMaxStaleness_RejectsOutOfBounds() public {
+        vm.expectRevert(OracleResolvedMarket.BadMaxStaleness.selector);
+        pm.setMaxStaleness(0); // 0 would reject every price
+
+        vm.expectRevert(OracleResolvedMarket.BadMaxStaleness.selector);
+        pm.setMaxStaleness(1 hours + 1); // above the cap
+
+        pm.setMaxStaleness(1 hours); // exactly the cap is allowed
+        assertEq(pm.maxStaleness(), 1 hours, "cap boundary accepted");
     }
 
     function test_SetTreasury_NonZeroAndOwnerEnforced() public {

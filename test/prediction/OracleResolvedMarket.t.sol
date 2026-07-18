@@ -30,7 +30,7 @@ contract OracleResolvedMarketTest is Test {
     int256 internal constant SPOT = 60_000e8; // BTC-style 8dp
 
     function setUp() public {
-        h = new ResolverHarness();
+        h = new ResolverHarness(120); // mechanism tests target the 120s gate boundary
         feed = new MockAggregatorV3(8);
         vm.warp(NOW);
     }
@@ -423,5 +423,55 @@ contract OracleResolvedMarketTest is Test {
         (bool valid, int256 twap) = PredictionTwap.compute(obs, _cfg());
         assertFalse(valid, "2 < MIN_SAMPLES => invalid");
         assertEq(twap, 0, "invalid => 0");
+    }
+
+    // =========================================================================
+    // maxStaleness is SNAPSHOT per-market (like feed/strike/feeBps): a later
+    // tighten cannot retroactively void a live market, and only NEW markets pick
+    // up the tightened default.
+    // =========================================================================
+
+    /// Drive observe() against an explicit harness (setUp's `_observe` targets `h`).
+    function _observeOn(ResolverHarness hh, uint256 id, uint256 ts, int256 price) internal {
+        vm.warp(ts);
+        feed.setHealthy(price, ts);
+        hh.observe(id);
+    }
+
+    function test_MaxStaleness_SnapshotFreezesLiveMarket_NewMarketPicksUpTighten() public {
+        ResolverHarness hs = new ResolverHarness(300);
+
+        // --- Market m1 created UNDER the 300s window ---
+        feed.setHealthy(SPOT, block.timestamp); // fresh strike source
+        uint64 bet = 100;
+        uint64 settle = 1_000;
+        uint256 m1 = hs.createMarket(ASSET, IAggregatorV3(address(feed)), bet, settle, 0, false);
+        uint256 tLock = NOW + bet;
+        uint256 tExpiry = tLock + settle;
+
+        // A set that is VALID under 300 but would be INVALID under 200: 3 samples,
+        // span 700 (>= 60% of 1000), last at tExpiry-250. 250 <= 300 (snapshot) but
+        // 250 > 200 (tightened) — this is precisely the goalpost the snapshot guards.
+        _observeOn(hs, m1, tLock + 50, 61_000e8);
+        _observeOn(hs, m1, tLock + 400, 61_000e8);
+        _observeOn(hs, m1, tLock + 750, 61_000e8); // tExpiry - last = 250
+
+        // Governance tightens the GLOBAL default while m1 is still in flight.
+        hs.setMaxStaleness(200);
+        assertEq(hs.maxStaleness(), 200, "global default is now 200");
+        assertEq(uint256(hs.getMarket(m1).maxStaleness), 300, "m1 keeps its 300s snapshot");
+
+        // HALF 1: m1 settles under its snapshot (300) — NOT voided by the live 200.
+        // (Had settle read the live 200, tExpiry-last=250>200 => invalid => VOID.)
+        vm.warp(tExpiry);
+        hs.settle(m1);
+        OracleResolvedMarket.Market memory r1 = hs.getMarket(m1);
+        assertEq(uint256(r1.phase), uint256(OracleResolvedMarket.Phase.Settled), "in-flight 300s market STILL settles");
+        assertEq(uint256(r1.outcome), uint256(OracleResolvedMarket.Outcome.Up), "TWAP 61k > 60k strike => Up");
+
+        // HALF 2: a market created AFTER the tighten snapshots the new 200s default.
+        feed.setHealthy(SPOT, block.timestamp);
+        uint256 m2 = hs.createMarket(ASSET, IAggregatorV3(address(feed)), bet, settle, 0, false);
+        assertEq(uint256(hs.getMarket(m2).maxStaleness), 200, "new market picks up the tightened 200s");
     }
 }

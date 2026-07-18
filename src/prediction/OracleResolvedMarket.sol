@@ -55,6 +55,8 @@ abstract contract OracleResolvedMarket is ReentrancyGuard {
         uint64 tLock; // betting closes; settlement window opens
         uint64 tExpiry; // settlement window closes; settle allowed
         uint64 lastObsTs; // last accepted observation time (min-spacing anchor)
+        uint64 maxStaleness; // staleness window SNAPSHOT at creation; observe/settle read THIS,
+        // so a later setMaxStaleness can never retroactively void a live market
         int256 strike; // captured at creation, immutable for the market's life
         int256 settlePrice; // TWAP fixed at settle; 0 until then
         Phase phase;
@@ -63,9 +65,17 @@ abstract contract OracleResolvedMarket is ReentrancyGuard {
 
     // ------------------------------------------------------------- constants
 
-    /// Tight staleness window for any fund-affecting price (design §3). Applied
-    /// both at strike capture and to every settlement sample.
-    uint256 internal constant MAX_STALENESS = 120;
+    /// Governance bounds for {maxStaleness}: must be > 0 (0 rejects every price)
+    /// and <= this cap, so a fat-fingered setter can never make a very stale price
+    /// look "fresh" on the money path.
+    uint256 internal constant MAX_STALENESS_CAP = 1 hours;
+
+    /// Tight staleness window for any fund-affecting price (design §3), applied at
+    /// strike capture, every settlement sample, and the final TWAP freshness gate.
+    /// Constructor-set and governance-tunable via the money layer's
+    /// {setMaxStaleness}. Sized to sit above the DIA heartbeat floor — see
+    /// docs/dia-cadence-diagnostic.md.
+    uint256 public maxStaleness;
 
     /// Minimum observations for a trustworthy TWAP (design §7.2).
     uint256 internal constant MIN_SAMPLES = 3;
@@ -102,6 +112,7 @@ abstract contract OracleResolvedMarket is ReentrancyGuard {
     );
     event Observed(uint256 indexed marketId, uint64 ts, int256 price, uint256 count);
     event MarketResolved(uint256 indexed marketId, Phase phase, Outcome outcome, int256 settlePrice);
+    event MaxStalenessSet(uint256 maxStaleness);
 
     // ---------------------------------------------------------------- errors
 
@@ -115,6 +126,22 @@ abstract contract OracleResolvedMarket is ReentrancyGuard {
     error AlreadyResolved();
     error BeforeExpiry();
     error AwaitGrace();
+    error BadMaxStaleness();
+
+    // ------------------------------------------------------------ constructor
+
+    /// @param maxStaleness_ Initial oracle staleness window; see {maxStaleness}.
+    constructor(uint256 maxStaleness_) {
+        _setMaxStaleness(maxStaleness_);
+    }
+
+    /// Validate + set the staleness window. Shared by the constructor and the
+    /// money layer's onlyOwner {setMaxStaleness}. Bounds guard the money path.
+    function _setMaxStaleness(uint256 newMaxStaleness) internal {
+        if (newMaxStaleness == 0 || newMaxStaleness > MAX_STALENESS_CAP) revert BadMaxStaleness();
+        maxStaleness = newMaxStaleness;
+        emit MaxStalenessSet(newMaxStaleness);
+    }
 
     // ------------------------------------------------------- market creation
 
@@ -143,8 +170,9 @@ abstract contract OracleResolvedMarket is ReentrancyGuard {
         if (offsetBps > OFFSET_CAP) revert OffsetTooLarge();
 
         // Strike capture — the ONLY price that must exist at creation. Reject
-        // anything but a healthy, fresh read (design §3/§6).
-        (bool ok, int256 spot) = feed.readFreshPrice(MAX_STALENESS);
+        // anything but a healthy, fresh read (design §3/§6). Reads the live
+        // `maxStaleness`, which equals the value snapshotted into the market below.
+        (bool ok, int256 spot) = feed.readFreshPrice(maxStaleness);
         if (!ok) revert FeedUnhealthyAtCreation();
 
         int256 strike = _applyOffset(spot, offsetBps, offsetUp);
@@ -161,6 +189,12 @@ abstract contract OracleResolvedMarket is ReentrancyGuard {
                 tLock: tLock,
                 tExpiry: tExpiry,
                 lastObsTs: 0,
+                // Snapshot the staleness window: observe()/settle() read THIS, frozen for
+                // the market's life like feed/strike/feeBps, so a later setMaxStaleness can
+                // never retroactively void a live market. The uint64 cast is safe because
+                // _setMaxStaleness bounds EVERY write to (0, 1 hours = 3600], so maxStaleness
+                // is always <= 3600 before it is read here (same guarantee as feeBps->uint16).
+                maxStaleness: uint64(maxStaleness),
                 strike: strike,
                 settlePrice: 0,
                 phase: Phase.Open,
@@ -204,7 +238,7 @@ abstract contract OracleResolvedMarket is ReentrancyGuard {
             revert ObservationTooSoon();
         }
 
-        (bool ok, int256 price) = m.feed.readFreshPrice(MAX_STALENESS);
+        (bool ok, int256 price) = m.feed.readFreshPrice(m.maxStaleness);
         if (!ok) revert UnhealthySample(); // excluded, not recorded
 
         _observations[marketId].push(PredictionTwap.Obs({ts: nowTs, price: price}));
@@ -248,7 +282,7 @@ abstract contract OracleResolvedMarket is ReentrancyGuard {
                 tExpiry: m.tExpiry,
                 minSamples: MIN_SAMPLES,
                 minCoverageBps: MIN_COVERAGE_BPS,
-                maxStaleness: MAX_STALENESS
+                maxStaleness: m.maxStaleness
             })
         );
 

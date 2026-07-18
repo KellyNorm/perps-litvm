@@ -26,8 +26,9 @@ library SafeAggregatorReader {
      * @notice Read + fully validate the feed's latest price.
      * @param feed          The AggregatorV3-shaped feed (a DIA adapter in prod).
      * @param maxStaleness  Max age, in seconds, of `updatedAt` vs `block.timestamp`.
-     *                      The market passes its MAX_STALENESS constant (design
-     *                      recommends 120s on testnet).
+     *                      The market passes its governance-set `maxStaleness`
+     *                      (300s default, above the DIA heartbeat floor — see
+     *                      docs/dia-cadence-diagnostic.md).
      * @return ok     True IFF the read succeeded AND every guard held. When false,
      *                `price` is meaningless (always 0) and MUST NOT be used.
      * @return price  The raw `answer` at the feed's native decimals when `ok`; else 0.
