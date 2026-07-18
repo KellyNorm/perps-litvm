@@ -41,3 +41,46 @@ Canaries:
 
 > Note: DIA feed cadence on LitVM updates every ~6–29 min (not ~1 min); a tight
 > `MAX_STALENESS` breaks the market. See [dia-cadence-diagnostic.md](dia-cadence-diagnostic.md).
+
+## Stage 2: PredictionMarketFactory + wire assets (chain 4441)
+
+Deployed via `deployFactoryAndWire(address[])` (adapters passed in Stage 1 tx order).
+Artifact: `broadcast/DeployPrediction.s.sol/4441/deployFactoryAndWire-latest.json`
+
+- **Factory (`PredictionMarketFactory`):** `0x6338985C7f689C3e1959bfe1a8bb36E44849EA40`
+- **Collateral (mUSD, reused):** `0x4AedaB95d41A31f891EE12d13CD77102705e2dEF` (`symbol()=="mUSD"`)
+- **Treasury:** `0xE9Dd9bFf0ad5254673daaA77397e84Fec2312292` (= deployer, testnet)
+- **Owner:** `0xE9Dd9bFf0ad5254673daaA77397e84Fec2312292` (= deployer)
+- **feeBps:** `0` (fair 50/50, testnet)
+- **maxStaleness:** `300` s
+- **assetCount:** `11` (confirmed on-chain)
+
+### Asset registry (on-chain `assets(assetId)` — verified)
+
+| assetId | display | feed (adapter)                               | feedDecimals | displayDp | enabled |
+|---------|---------|----------------------------------------------|--------------|-----------|---------|
+| 0  | BTC   | `0x7a75890ad9a2ecef4a3b64b62b4050d583fc1aee` | 18 | 2 | true |
+| 1  | ETH   | `0xd16526c879c7fc8caec6a45112c513e7012fbe71` | 18 | 2 | true |
+| 2  | BNB   | `0xd1632391626ab78d098a795d80ef5431426aadce` | 18 | 2 | true |
+| 3  | XRP   | `0x30c0b874aa4deefbb15f12eb650947ef5a4d51fb` | 18 | 4 | true |
+| 4  | SOL   | `0x3ab5383fb5be15c362b474a91ab3afed18450f2c` | 18 | 2 | true |
+| 5  | TRX   | `0xbda584811c879ed6f7466dbd2c47b4b85d644338` | 18 | 5 | true |
+| 6  | HYPE  | `0x914fceaf39b2c0f083431ebf16a1e9310a94259d` | 18 | 2 | true |
+| 7  | DOGE  | `0x7129116eb54d511cfe99d4fc296e008afc617a5c` | 18 | 5 | true |
+| 8  | RAIN  | `0xd943d73f213f4248df2491343e05c7e143ab44df` | 18 | 6 | true |
+| 9  | ZCASH | `0x70dbb5eabd852504d40c82b68cc5908658af3080` | 18 | 2 | true |
+| 10 | LTC   | `0x23ac0fe0a76e324cadc66fcbd81df7b294375fd3` | 18 | 2 | true |
+
+> assetId 9's **display symbol is `ZCASH`** while its adapter queries DIA key
+> **`ZEC/USD`** — intentional (display label ≠ oracle key).
+
+`addAsset` reads only `decimals()`; it does **not** enforce staleness, so wiring
+cannot revert on DIA cadence. Feed-freshness gating lives in market *creation*
+(`replenish`/`_select` → `SafeAggregatorReader`), not in Stage 2.
+`previewSelect()` returned `found=true` post-deploy → ≥1 feed healthy, a market is
+creatable now.
+
+### Not done here (later stages)
+- Keeper / `replenish` automation is **Stage 5b** — not set up in this deploy.
+- Ownership currently = deployer (required for in-script `addAsset`); transfer to a
+  governance owner later if desired.
