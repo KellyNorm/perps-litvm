@@ -46,10 +46,10 @@ contract DeployPrediction is Script {
     /// Reuse the existing testnet mUSD collateral (also used by the perps stack).
     address internal constant MUSD = 0x4AedaB95d41A31f891EE12d13CD77102705e2dEF;
     /// Fee / dust sink (segregated — never the perps LP). MUST be set before Stage 2.
-    address internal constant TREASURY = address(0); // <-- SET before Stage 2
+    address internal constant TREASURY = 0xE9Dd9bFf0ad5254673daaA77397e84Fec2312292; // deployer (testnet)
     /// Governance owner. MUST equal the deployer for in-script wiring (addAsset is
     /// onlyOwner); transfer ownership afterwards if a different owner is desired.
-    address internal constant OWNER = address(0); // <-- SET before Stage 2 (= deployer)
+    address internal constant OWNER = 0xE9Dd9bFf0ad5254673daaA77397e84Fec2312292; // = deployer
     /// Protocol fee in bps (design default: fair 50/50 = 0). Capped at 300 by the factory.
     uint256 internal constant FEE_BPS = 0;
     /// Oracle staleness window (seconds). Shipped default 300s — sized above the DIA
