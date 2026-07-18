@@ -20,6 +20,7 @@ docs/*
 !docs/dia-cadence-diagnostic.md
 !docs/dia-cadence-raw-2026-07-08.csv
 !docs/dia-cadence-raw-2026-07-17.csv
+!docs/prediction-deploy.md
 
 # Dotenv file
 .env
