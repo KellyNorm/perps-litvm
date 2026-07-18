@@ -18,7 +18,8 @@ docs/*
 !docs/TESTNET_LAUNCH.md
 !docs/prediction-market-design.md
 !docs/dia-cadence-diagnostic.md
-!docs/dia_poll.csv
+!docs/dia-cadence-raw-2026-07-08.csv
+!docs/dia-cadence-raw-2026-07-17.csv
 
 # Dotenv file
 .env
