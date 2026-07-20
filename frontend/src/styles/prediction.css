@@ -1,0 +1,562 @@
+/* Prediction view styles.
+ *
+ * SCOPING: every selector is prefixed .pm- and the whole tree lives under .pm-root.
+ * Nothing here targets a bare element or a perps class, so this file cannot restyle
+ * the perps app even though both stylesheets are loaded at once. Do not add
+ * unprefixed selectors.
+ *
+ * Design tokens are taken from frontend/design/TachyonFi_Predictions_decoded.html. */
+
+.pm-root {
+  --pm-bg: #080b14;
+  --pm-card: #131a2e;
+  --pm-line: rgba(255, 255, 255, 0.09);
+  --pm-text: #f4f8ff;
+  --pm-muted: rgba(244, 248, 255, 0.42);
+  --pm-green: #00d98b;
+  --pm-red: #ff4d6d;
+  --pm-violet: #a24dff;
+  --pm-warm: #ffb84d;
+  --pm-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  position: relative;
+  min-height: 100vh;
+  background: var(--pm-bg);
+  color: var(--pm-text);
+  font-family: "Space Grotesk", system-ui, sans-serif;
+  overflow-x: hidden;
+}
+
+.pm-root .mono,
+.pm-root .pm-lbl {
+  font-family: var(--pm-mono);
+}
+
+/* ---------------------------------------------------------------- backdrop */
+
+.pm-flame {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.pm-flame-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.pm-flame-pool {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(90px);
+}
+.pm-flame-pool-a {
+  width: 46vw;
+  height: 46vw;
+  top: -12vw;
+  left: -10vw;
+  background: radial-gradient(circle, rgba(41, 169, 255, 0.13), transparent 68%);
+}
+.pm-flame-pool-b {
+  width: 40vw;
+  height: 40vw;
+  bottom: -14vw;
+  right: -8vw;
+  background: radial-gradient(circle, rgba(0, 217, 139, 0.09), transparent 70%);
+}
+
+@keyframes pm-breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.pm-crack-breathe {
+  animation-name: pm-breathe;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+}
+
+.pm-content {
+  position: relative;
+  z-index: 1;
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 26px 20px 64px;
+}
+
+/* ------------------------------------------------------------------ header */
+
+.pm-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 26px;
+}
+.pm-logo {
+  flex: none;
+  border-radius: 13px;
+  object-fit: contain;
+}
+.pm-header-text {
+  flex: 1;
+  min-width: 0;
+}
+.pm-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.pm-title {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.pm-sub {
+  margin: 5px 0 0;
+  font-size: 12.5px;
+  color: rgba(244, 248, 255, 0.55);
+  max-width: 62ch;
+}
+
+.pm-mascot {
+  flex: none;
+  overflow: visible;
+}
+@keyframes pm-idle-bob {
+  0%,
+  100% {
+    transform: translateY(0) scaleY(1);
+  }
+  50% {
+    transform: translateY(-4px) scaleY(1.02);
+  }
+}
+/* Gentle idle bob — deliberately NOT landing's .62s runner `hop`, which is far too
+   energetic inline beside a heading. */
+.pm-mascot-idle .pm-mascot-body {
+  transform-origin: bottom center;
+  animation: pm-idle-bob 2.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pm-mascot-idle .pm-mascot-body,
+  .pm-crack-breathe {
+    animation: none;
+  }
+}
+
+.pm-mascot-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.pm-toggle-k {
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  color: var(--pm-muted);
+}
+
+/* -------------------------------------------------------------- board chrome */
+
+.pm-boardbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.pm-lbl {
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  color: var(--pm-muted);
+}
+.pm-filters {
+  display: flex;
+  gap: 6px;
+}
+
+.pm-tab {
+  font-family: var(--pm-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  padding: 6px 11px;
+  border-radius: 99px;
+  color: var(--pm-muted);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition:
+    color 0.16s ease,
+    background 0.16s ease,
+    border-color 0.16s ease,
+    transform 0.16s ease;
+}
+.pm-tab:hover {
+  color: var(--pm-text);
+  background: rgba(255, 255, 255, 0.08);
+  transform: translateY(-1px);
+}
+.pm-tab.is-on {
+  color: var(--pm-text);
+  background: rgba(41, 169, 255, 0.14);
+  border-color: rgba(41, 169, 255, 0.4);
+}
+.pm-tab:focus-visible,
+.pm-card:focus-visible {
+  outline: 2px solid #29a9ff;
+  outline-offset: 2px;
+}
+
+.pm-note {
+  padding: 13px 15px;
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--pm-line);
+  font-size: 12.5px;
+  color: rgba(244, 248, 255, 0.62);
+  margin-bottom: 14px;
+}
+.pm-note-warn {
+  background: rgba(255, 184, 77, 0.08);
+  border-color: rgba(255, 184, 77, 0.3);
+  color: #ffd79a;
+}
+.pm-note-dim {
+  margin-top: 16px;
+  font-size: 11.5px;
+  color: var(--pm-muted);
+}
+.pm-note code {
+  font-family: var(--pm-mono);
+  font-size: 11px;
+  color: #bfe4ff;
+}
+
+/* -------------------------------------------------------------------- grid */
+
+.pm-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+@media (max-width: 760px) {
+  .pm-grid {
+    grid-template-columns: 1fr;
+  }
+  .pm-header {
+    flex-wrap: wrap;
+  }
+  .pm-mascot-toggle {
+    width: 100%;
+  }
+}
+
+/* -------------------------------------------------------------------- card */
+
+.pm-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 15px;
+  border-radius: 18px;
+  background: var(--pm-card);
+  border: 1px solid var(--pm-line);
+  overflow: hidden;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition:
+    transform 0.18s ease,
+    border-color 0.18s ease,
+    box-shadow 0.18s ease;
+}
+.pm-card:hover {
+  transform: translateY(-3px);
+  border-color: rgba(41, 169, 255, 0.38);
+  box-shadow:
+    0 14px 34px rgba(0, 0, 0, 0.45),
+    0 0 0 1px rgba(41, 169, 255, 0.1);
+}
+.pm-card-accent {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+}
+
+.pm-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.pm-card-asset {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pm-card-ticker {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.1;
+}
+.pm-card-sym {
+  font-weight: 600;
+  font-size: 14px;
+}
+.pm-card-tf {
+  font-size: 10px;
+  color: var(--pm-muted);
+}
+.pm-card-q {
+  font-size: 14.5px;
+  font-weight: 500;
+}
+
+.pm-coin {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9px;
+  overflow: hidden;
+  flex: none;
+}
+.pm-coin img {
+  display: block;
+  border-radius: 50%;
+}
+.pm-coin-fallback {
+  font-family: var(--pm-mono);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+/* -------------------------------------------------------------------- odds */
+
+.pm-odds {
+  display: block;
+}
+.pm-odds-row {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  font-size: 11.5px;
+}
+.pm-up {
+  color: var(--pm-green);
+  font-weight: 600;
+}
+.pm-down {
+  color: var(--pm-red);
+  font-weight: 600;
+}
+.pm-barwrap {
+  display: block;
+  position: relative;
+  height: 9px;
+  border-radius: 99px;
+  background: rgba(255, 77, 109, 0.22);
+  overflow: hidden;
+}
+.pm-barfill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  border-radius: 99px;
+  background: linear-gradient(90deg, #00d98b, #00b877);
+  transition: width 0.4s ease;
+}
+
+/* ------------------------------------------------------------------- stats */
+
+.pm-card-stats {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.pm-stat {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+}
+.pm-stat-r {
+  text-align: right;
+}
+.pm-stat-k {
+  font-size: 9.5px;
+  color: rgba(244, 248, 255, 0.4);
+  letter-spacing: 0.06em;
+}
+.pm-stat-v {
+  font-size: 13px;
+  font-weight: 600;
+}
+.pm-stat-sub {
+  font-size: 9.5px;
+  color: var(--pm-muted);
+}
+.pm-warm {
+  color: var(--pm-warm);
+}
+
+/* ------------------------------------------------------------------ pills */
+
+.pm-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: 99px;
+  font-family: var(--pm-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.pm-pill-open {
+  background: rgba(0, 217, 139, 0.14);
+  color: var(--pm-green);
+  border: 1px solid rgba(0, 217, 139, 0.3);
+}
+.pm-pill-locked {
+  background: rgba(162, 77, 255, 0.14);
+  color: #d9b3ff;
+  border: 1px solid rgba(162, 77, 255, 0.3);
+}
+.pm-pill-settled,
+.pm-pill-void {
+  background: rgba(255, 255, 255, 0.07);
+  color: rgba(244, 248, 255, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+.pm-pill-testnet {
+  background: rgba(162, 77, 255, 0.12);
+  color: #e3c9ff;
+  border: 1px solid rgba(162, 77, 255, 0.3);
+}
+
+/* ----------------------------------------------------------------- actions */
+
+.pm-actions {
+  display: flex;
+  gap: 9px;
+}
+.pm-btn {
+  flex: 1;
+  text-align: center;
+  padding: 10px;
+  border-radius: 12px;
+  font-weight: 700;
+  font-size: 14px;
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    transform 0.16s ease,
+    box-shadow 0.16s ease;
+}
+.pm-btn-up {
+  color: var(--pm-green);
+  background: rgba(0, 217, 139, 0.12);
+  border: 1px solid rgba(0, 217, 139, 0.35);
+}
+.pm-card:hover .pm-btn-up {
+  background: rgba(0, 217, 139, 0.2);
+  border-color: var(--pm-green);
+  box-shadow: 0 0 16px rgba(0, 217, 139, 0.22);
+}
+.pm-btn-down {
+  color: var(--pm-red);
+  background: rgba(255, 77, 109, 0.12);
+  border: 1px solid rgba(255, 77, 109, 0.35);
+}
+.pm-card:hover .pm-btn-down {
+  background: rgba(255, 77, 109, 0.2);
+  border-color: var(--pm-red);
+  box-shadow: 0 0 16px rgba(255, 77, 109, 0.22);
+}
+
+.pm-locked {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(162, 77, 255, 0.1);
+  border: 1px solid rgba(162, 77, 255, 0.28);
+}
+.pm-locked-t {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #e3c9ff;
+}
+.pm-void {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.14);
+}
+.pm-void .pm-locked-t {
+  color: rgba(244, 248, 255, 0.7);
+}
+
+.pm-settled {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(0, 217, 139, 0.1);
+  border: 1px solid rgba(0, 217, 139, 0.3);
+  color: var(--pm-green);
+}
+.pm-settled-down {
+  background: rgba(255, 77, 109, 0.1);
+  border-color: rgba(255, 77, 109, 0.3);
+  color: var(--pm-red);
+}
+.pm-settled-t {
+  font-weight: 700;
+  font-size: 13.5px;
+  flex: 1;
+}
+.pm-claim {
+  padding: 7px 14px;
+  border-radius: 10px;
+  font-weight: 700;
+  font-size: 13px;
+  color: #061018;
+  background: linear-gradient(135deg, #00d98b, #00b877);
+  transition:
+    filter 0.16s ease,
+    box-shadow 0.16s ease;
+}
+.pm-card:hover .pm-claim {
+  filter: brightness(1.08);
+  box-shadow: 0 0 18px rgba(0, 217, 139, 0.35);
+}
+
+/* --------------------------------------------------------------- mode switch */
+
+.pm-modeswitch {
+  position: fixed;
+  z-index: 60;
+  right: 18px;
+  bottom: 18px;
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 99px;
+  background: rgba(8, 11, 20, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(8px);
+}
