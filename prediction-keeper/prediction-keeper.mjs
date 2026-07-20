@@ -45,6 +45,9 @@ const cfg = {
   factory: process.env.PREDICTION_FACTORY_ADDRESS,
   loopMs: num(process.env.PREDICTION_LOOP_MS, 10_000),
   reconcileMs: num(process.env.PREDICTION_RECONCILE_MS, 120_000),
+  // Keeper-side observe cadence, in seconds. This is POLICY, distinct from the
+  // contract's MIN_OBS_SPACING floor (10s) — see OBSERVE_SPACING note below.
+  observeSpacing: num(process.env.PREDICTION_OBSERVE_SPACING, 60),
   gas: {
     replenish: num(process.env.PREDICTION_GAS_REPLENISH, 20_000_000),
     observe: num(process.env.PREDICTION_GAS_OBSERVE, 500_000),
@@ -70,7 +73,25 @@ if (!ONCE && KEY_PLACEHOLDER) throw new Error("missing env PREDICTION_KEEPER_PRI
 // ---- constants mirrored from the contract (for local gating; authoritative
 //      checks stay on-chain via static probes) --------------------------------
 const TARGET_ACTIVE = 7;
-const MIN_OBS_SPACING = 10; // seconds
+const MIN_OBS_SPACING = 10; // seconds — mirrors the contract constant (the FLOOR
+// below which observe() reverts ObservationTooSoon). Kept for reference; the
+// keeper deliberately paces itself well above it — see cfg.observeSpacing.
+//
+// OBSERVE_SPACING (cfg.observeSpacing, default 60s) is the keeper's own cadence.
+// Gating observes at the contract FLOOR made us sample every ~13-16s against a DIA
+// feed whose real heartbeat is ~135-140s (docs/dia-cadence-diagnostic.md), so ~9 of
+// every 10 samples re-recorded a price that had not changed. Coverage is a SPAN
+// (last.ts - first.ts in block time, PredictionTwap._valid), not a count, so those
+// extra samples bought no coverage — mkt#9 hit 97% on a 600s window with 39
+// observes and 5 distinct prices. 60s reaches >=9 samples / 94.7% coverage on the
+// same window at ~1/4 the gas.
+//
+// Why 60 and not higher: the 15m timeframe's settlement window is only 300s
+// (PredictionMarketFactory._windows), and it is the binding case. Effective spacing
+// is this value plus up to one loop period (~11s). At 80s a delayed first observe
+// yields 3 samples spanning 182s = 60.7% against the 60.0% MIN_COVERAGE_BPS gate —
+// one slow tick from voiding a market. 60s leaves margin on every timeframe
+// (15m ~71%, 30m ~94.7%). Raise it only alongside the 15m window.
 const PHASE = { 0: "Open", 1: "Locked", 2: "Settled", 3: "Void" };
 const TF = { 0: "15m", 1: "30m", 2: "1h", 3: "24h" };
 const isTerminal = (p) => p === 2 || p === 3;
@@ -119,7 +140,7 @@ async function main() {
 
   const net = await withRetry("getNetwork", () => provider.getNetwork());
   log(`prediction-keeper up — chain ${net.chainId}, factory ${cfg.factory}`);
-  log(`account ${from}  mode=${ONCE ? "ONCE(read-only)" : "LOOP"}  loop=${cfg.loopMs}ms`);
+  log(`account ${from}  mode=${ONCE ? "ONCE(read-only)" : "LOOP"}  loop=${cfg.loopMs}ms  observeSpacing=${cfg.observeSpacing}s`);
 
   // Explicit gas price — ONE deliberate lookup with a hardcoded fallback so we
   // never depend on getFeeData per-tx (502/504-prone). Configurable via env.
@@ -268,9 +289,11 @@ async function main() {
       if (nowTs >= tExpiry) {
         await probeThenSend("settle", "settle", [id], cfg.gas.settle);
       } else {
-        // settlement window: respect min spacing off the last accepted sample.
+        // settlement window: pace off the last accepted sample at the keeper's own
+        // cadence (cfg.observeSpacing), NOT the contract's MIN_OBS_SPACING floor —
+        // sampling at the floor is ~9x redundant against the DIA heartbeat.
         const lastObs = m.lastObsTs.toNumber();
-        if (lastObs !== 0 && nowTs < lastObs + MIN_OBS_SPACING) continue;
+        if (lastObs !== 0 && nowTs < lastObs + cfg.observeSpacing) continue;
         await probeThenSend("observe", "observe", [id], cfg.gas.observe);
       }
     }
