@@ -127,12 +127,24 @@ export default function PredictionApp() {
       .sort((a, b) => (a.phase !== b.phase ? a.phase - b.phase : a.tLock - b.tLock));
   }, [markets, filter, account, everBet]);
 
-  // Surfaces which live assets are still on the monogram fallback, so a missing logo
-  // is visible during the preview instead of being quietly absorbed.
+  // Which live assets are still on the monogram fallback (styled ticker badge). The
+  // fallback is intentional in production; this list only drives a DEV-ONLY console
+  // reminder so a missing logo is noticed while building — never rendered in the UI.
   const missingLogos = useMemo(() => {
     if (!markets) return [];
     return [...new Set(markets.map((m) => m.symbol))].filter((s) => !hasIcon(s)).sort();
   }, [markets]);
+
+  useEffect(() => {
+    // Dev reminder only — stripped from production (import.meta.env.DEV is false there).
+    // To replace a monogram with a real logo, drop <symbol>.svg into src/assets/coins/.
+    if (import.meta.env.DEV && missingLogos.length > 0) {
+      console.warn(
+        `[predictions] monogram fallback in use for: ${missingLogos.join(", ")} — ` +
+          `drop ${missingLogos[0].toLowerCase()}.svg into src/assets/coins/ to replace.`,
+      );
+    }
+  }, [missingLogos]);
 
   return (
     <div className="pm-root">
@@ -216,12 +228,6 @@ export default function PredictionApp() {
           ))}
         </div>
 
-        {missingLogos.length > 0 && (
-          <div className="pm-note pm-note-dim">
-            Monogram fallback in use for: <strong>{missingLogos.join(", ")}</strong> — drop{" "}
-            <code>{missingLogos[0].toLowerCase()}.svg</code> into <code>src/assets/coins/</code> to replace.
-          </div>
-        )}
       </div>
 
       {ticketMarket && (
