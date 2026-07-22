@@ -28,7 +28,7 @@ export default function PredictionApp() {
   // window.ethereum and share the disconnect flag via localStorage.
   const { account, wrongChain, hasWallet, connect, connecting, getSigner } = useWallet();
 
-  const { markets, error, loading, chainTime, refresh } = usePredictionBoard(account);
+  const { markets, error, loading, chainTime, everBet, refresh } = usePredictionBoard(account);
   const [filter, setFilter] = useState("live");
 
   // Lightweight toast, self-contained (the perps toast lives in the perps tree).
@@ -100,6 +100,18 @@ export default function PredictionApp() {
 
   const shown = useMemo(() => {
     if (!markets) return [];
+    // Terminal-market visibility: visible(terminal) = stakeOf>0 OR everBet(id). A resolved/
+    // void market stays on the board if the wallet has an unclaimed position (stake>0) OR has
+    // ever bet in it (participation history) — so a user keeps sight of their own markets,
+    // including ones already claimed (stake zeroed). Empty-book test voids (no stake, never
+    // bet) are hidden. Unconnected → all terminal hidden. everBet may be null (loading/failed)
+    // → degrades to stake-only, so a PENDING claim is never hidden by a history hiccup.
+    const userInvolved = (m) => {
+      if (account == null) return false;
+      const staked = m.userStake != null && !m.userStake.isZero();
+      const bet = everBet != null && everBet.has(String(m.id));
+      return staked || bet;
+    };
     const by = {
       live: (m) => m.phase === PHASE.OPEN || m.phase === PHASE.LOCKED,
       open: (m) => m.phase === PHASE.OPEN,
@@ -107,9 +119,13 @@ export default function PredictionApp() {
       settled: (m) => m.phase === PHASE.SETTLED || m.phase === PHASE.VOID,
     };
     return markets
-      .filter(by[filter] || by.live)
+      .filter((m) => {
+        const terminal = m.phase === PHASE.SETTLED || m.phase === PHASE.VOID;
+        if (terminal && !userInvolved(m)) return false; // global rule, applies across all tabs
+        return (by[filter] || by.live)(m);
+      })
       .sort((a, b) => (a.phase !== b.phase ? a.phase - b.phase : a.tLock - b.tLock));
-  }, [markets, filter]);
+  }, [markets, filter, account, everBet]);
 
   // Surfaces which live assets are still on the monogram fallback, so a missing logo
   // is visible during the preview instead of being quietly absorbed.
@@ -120,7 +136,9 @@ export default function PredictionApp() {
 
   return (
     <div className="pm-root">
-      <FlameBackdrop />
+      {/* Backdrop intensity chosen from the restrained/dramatic preview: 0.6 — depth and
+          embers are clearly present but stay behind the data (readability wins). */}
+      <FlameBackdrop intensity={0.6} />
 
       <div className="pm-content">
         <header className="pm-header">
@@ -175,7 +193,15 @@ export default function PredictionApp() {
 
         {loading && <div className="pm-note">Reading the board from chain 4441…</div>}
 
-        {!loading && !shown.length && <div className="pm-note">No markets in this view right now.</div>}
+        {!loading && !shown.length && (
+          <div className="pm-note">
+            {filter === "settled"
+              ? account
+                ? "None of your markets have resolved yet — your settled and voided bets land here so you can claim."
+                : "Connect your wallet to see your resolved and voided markets (and claim them)."
+              : "No markets in this view right now."}
+          </div>
+        )}
 
         <div className="pm-grid">
           {shown.map((m) => (

@@ -47,6 +47,37 @@
   width: 100%;
   height: 100%;
 }
+/* Parallax depth planes — each holds pool glows and drifts autonomously; different
+   amplitude/speed reads as depth. Transform-only animation (compositor-cheap). */
+.pm-flame-plane {
+  position: absolute;
+  inset: 0;
+  will-change: transform;
+}
+.pm-flame-deep {
+  animation: pm-drift-deep 46s ease-in-out infinite;
+}
+.pm-flame-mid {
+  animation: pm-drift-mid 32s ease-in-out infinite;
+}
+@keyframes pm-drift-deep {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(2.5%, -1.8%, 0) scale(1.06);
+  }
+}
+@keyframes pm-drift-mid {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  50% {
+    transform: translate3d(-3%, 2.4%, 0);
+  }
+}
 .pm-flame-pool {
   position: absolute;
   border-radius: 50%;
@@ -57,14 +88,58 @@
   height: 46vw;
   top: -12vw;
   left: -10vw;
-  background: radial-gradient(circle, rgba(41, 169, 255, 0.13), transparent 68%);
+  background: radial-gradient(circle, rgba(41, 169, 255, 0.15), transparent 68%);
 }
 .pm-flame-pool-b {
   width: 40vw;
   height: 40vw;
   bottom: -14vw;
   right: -8vw;
-  background: radial-gradient(circle, rgba(0, 217, 139, 0.09), transparent 70%);
+  background: radial-gradient(circle, rgba(0, 217, 139, 0.1), transparent 70%);
+}
+.pm-flame-pool-c {
+  width: 34vw;
+  height: 34vw;
+  top: 30vh;
+  left: 42vw;
+  filter: blur(110px);
+  background: radial-gradient(circle, rgba(94, 200, 255, 0.08), transparent 72%);
+}
+
+/* Rising ember particles (canvas) — behind the fissures and vignette. */
+.pm-ember-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* Travelling spark along each fissure — a short bright dash chasing the crack. */
+.pm-crack-spark {
+  fill: none;
+  stroke: #8ffce8;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-dasharray: 24 1600;
+  filter: drop-shadow(0 0 4px #5ec8ff);
+  animation-name: pm-crack-travel;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+@keyframes pm-crack-travel {
+  from {
+    stroke-dashoffset: 1624;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* Edge vignette: keeps the centre (where cards live) clear and pushes the frame back. */
+.pm-flame-vignette {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(125% 95% at 50% 42%, transparent 52%, rgba(4, 6, 12, 0.55) 100%);
 }
 
 @keyframes pm-breathe {
@@ -147,7 +222,11 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .pm-mascot-idle .pm-mascot-body,
-  .pm-crack-breathe {
+  .pm-crack-breathe,
+  .pm-price-line.is-fresh .pm-price-dot,
+  .pm-crack-spark,
+  .pm-flame-deep,
+  .pm-flame-mid {
     animation: none;
   }
 }
@@ -450,8 +529,50 @@
   font-size: 9.5px;
   color: var(--pm-muted);
 }
+.pm-price-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: color 0.5s ease;
+}
 .pm-price-age {
   opacity: 0.6;
+}
+/* Freshness dot — dim by default; flashes green on a real oracle publish. */
+.pm-price-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--pm-muted);
+  transition:
+    background 0.4s ease,
+    box-shadow 0.4s ease;
+}
+.pm-price-line.is-fresh {
+  color: var(--pm-green);
+}
+.pm-price-line.is-fresh .pm-price-age {
+  opacity: 0.85;
+}
+.pm-price-line.is-fresh .pm-price-dot {
+  background: var(--pm-green);
+  box-shadow: 0 0 8px var(--pm-green);
+  animation: pm-price-pulse 1.1s ease-out;
+}
+@keyframes pm-price-pulse {
+  0% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(0, 217, 139, 0.55);
+  }
+  60% {
+    transform: scale(1.5);
+    box-shadow: 0 0 0 6px rgba(0, 217, 139, 0);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 8px rgba(0, 217, 139, 0.4);
+  }
 }
 .pm-warm {
   color: var(--pm-warm);

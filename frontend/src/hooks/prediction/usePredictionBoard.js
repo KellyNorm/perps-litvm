@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ethers } from "ethers";
 import { readProvider } from "../../lib/contracts.js";
 import { batchReadChunked, multicall3 } from "../../lib/prediction/multicall.js";
+import { scanParticipation } from "../../lib/prediction/participation.js";
 import { PREDICTION_FACTORY_ABI, AGGREGATOR_V3_ABI } from "../../lib/prediction/predictionAbi.js";
 import { PREDICTION_FACTORY_ADDRESS, PHASE } from "../../lib/prediction/predictionConfig.js";
 
@@ -26,6 +27,11 @@ export function usePredictionBoard(account) {
   const [markets, setMarkets] = useState(null); // null = first load
   const [assets, setAssets] = useState([]);
   const [error, setError] = useState(null);
+  // Set of marketId strings this wallet has ever bet on (participation history). null =
+  // not yet loaded / unavailable → callers fall back to stake-only visibility. Scanned
+  // ONCE per wallet per session (not per poll), tracked here so a poll can reuse it.
+  const [everBet, setEverBet] = useState(null);
+  const partRef = useRef({ account: null, started: false });
   // Chain-clock anchor: { ts } is block.timestamp at the last poll, { at } is the
   // Date.now() ms when we sampled it. The UI interpolates ts + elapsed-wall between
   // polls, so countdowns count down to CHAIN time (what the keeper acts on), not the
@@ -36,6 +42,12 @@ export function usePredictionBoard(account) {
   const load = useCallback(async () => {
     const f = factory();
     const mc = multicall3();
+    // Reset the participation cache when the connected wallet changes (or disconnects), so
+    // one account's history can never leak into another's board.
+    if (partRef.current.account !== (account || null)) {
+      partRef.current = { account: account || null, started: false };
+      setEverBet(null);
+    }
     try {
       // ---- pass 1: sizes + chain clock -----------------------------------
       const [countRes, assetCountRes, tsRes] = await batchReadChunked([
@@ -113,13 +125,13 @@ export function usePredictionBoard(account) {
         contract: new ethers.Contract(addr, AGGREGATOR_V3_ABI, readProvider()),
         fn: "latestRoundData",
       }));
-      const claimCalls = account
-        ? rows
-            .filter((r) => r.phase === PHASE.SETTLED || r.phase === PHASE.VOID)
-            .map((r) => ({ contract: f, fn: "claimable", args: [r.id, account] }))
-        : [];
+      // Terminal (SETTLED/VOID) markets get two per-user reads when a wallet is connected:
+      // claimable() for the claim amount, and stakeOf() for visibility (see board filter).
+      const terminalTargets = account ? rows.filter((r) => r.phase === PHASE.SETTLED || r.phase === PHASE.VOID) : [];
+      const claimCalls = terminalTargets.map((r) => ({ contract: f, fn: "claimable", args: [r.id, account] }));
+      const stakeCalls = terminalTargets.map((r) => ({ contract: f, fn: "stakeOf", args: [r.id, account] }));
 
-      const tail = await batchReadChunked([...priceCalls, ...claimCalls]);
+      const tail = await batchReadChunked([...priceCalls, ...claimCalls, ...stakeCalls]);
       const priceByFeed = {};
       feeds.forEach((addr, i) => {
         const r = tail[i];
@@ -128,17 +140,22 @@ export function usePredictionBoard(account) {
         priceByFeed[addr] = r.ok ? { answer: r.value.answer, updatedAt: r.value.updatedAt.toNumber() } : null;
       });
 
-      const claimTargets = rows.filter((r) => r.phase === PHASE.SETTLED || r.phase === PHASE.VOID);
       const claimById = {};
-      claimTargets.forEach((r, i) => {
-        const res2 = tail[feeds.length + i];
-        if (res2 && res2.ok) claimById[r.id] = res2.value;
+      const stakeById = {};
+      terminalTargets.forEach((r, i) => {
+        const cRes = tail[feeds.length + i];
+        if (cRes && cRes.ok) claimById[r.id] = cRes.value;
+        const sRes = tail[feeds.length + terminalTargets.length + i];
+        if (sRes && sRes.ok) stakeById[r.id] = sRes.value.upStake.add(sRes.value.downStake);
       });
 
       const enriched = rows.map((r) => ({
         ...r,
         price: priceByFeed[r.feed.toLowerCase()] || null,
         claimable: claimById[r.id] || null,
+        // Total stake this wallet holds on the market (0 if none / no wallet). null when
+        // not a terminal market or unread — the board filter treats null-on-terminal as "no stake".
+        userStake: stakeById[r.id] || null,
       }));
 
       if (!alive.current) return;
@@ -146,6 +163,24 @@ export function usePredictionBoard(account) {
       setAssets(assetRows);
       setMarkets(enriched);
       setError(null);
+
+      // Participation history — kicked ONCE per wallet (partRef.started), fire-and-forget so
+      // the slow, bounded log scan never blocks or repeats with the 12s board poll. Terminal
+      // ids are passed so the scan can early-exit once every board terminal is accounted for.
+      if (account && !partRef.current.started) {
+        partRef.current.started = true;
+        const targetIds = enriched
+          .filter((r) => r.phase === PHASE.SETTLED || r.phase === PHASE.VOID)
+          .map((r) => String(r.id));
+        scanParticipation(f, account, targetIds)
+          .then((set) => {
+            // Guard against a wallet switch mid-scan (partRef.account moved on).
+            if (alive.current && partRef.current.account === account) setEverBet(set);
+          })
+          .catch(() => {
+            /* leave everBet null → stake-only fallback; never blanks a pending claim */
+          });
+      }
     } catch (e) {
       if (!alive.current) return;
       // Keep the last good board on screen; surface the error without blanking.
@@ -163,5 +198,5 @@ export function usePredictionBoard(account) {
     };
   }, [load]);
 
-  return { markets, assets, error, chainTime, loading: markets === null, refresh: load };
+  return { markets, assets, error, chainTime, everBet, loading: markets === null, refresh: load };
 }

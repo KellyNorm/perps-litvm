@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import CoinIcon from "./CoinIcon.jsx";
 import { PHASE, PHASE_LABEL, TIMEFRAME_LABEL, OUTCOME, SIDE } from "../../lib/prediction/predictionConfig.js";
 import {
@@ -22,6 +23,24 @@ export default function MarketCard({ market, now, onBet, onClaim, pending }) {
 
   const share = upShare(upPool, downPool);
   const upPct = Math.round(share * 100);
+
+  // Flash the price when the FEED actually publishes a new round (updatedAt changes), so a
+  // real oracle tick is visible. This is distinct from our 12s poll — the number only moves
+  // when DIA republishes (~135-140s flat / ~24s when price moves). The age readout carries
+  // the rest: a static number with "12s ago" reads as "oracle hasn't ticked", not "app frozen".
+  const [fresh, setFresh] = useState(false);
+  const prevUpdated = useRef(null);
+  useEffect(() => {
+    const u = price?.updatedAt;
+    if (u == null) return;
+    if (prevUpdated.current != null && u !== prevUpdated.current) {
+      setFresh(true);
+      prevUpdated.current = u;
+      const t = setTimeout(() => setFresh(false), 1200);
+      return () => clearTimeout(t);
+    }
+    prevUpdated.current = u;
+  }, [price?.updatedAt]);
 
   // Price-vs-strike drift, surfaced so a stale strike is SEEN, not discovered after a bet.
   const delta = price ? strikeDelta(price.answer, strike) : null;
@@ -138,13 +157,12 @@ export default function MarketCard({ market, now, onBet, onClaim, pending }) {
           <span className="pm-stat-k">POOL</span>
           <span className="pm-stat-v mono">{fmtPool(upPool.add(downPool))} mUSD</span>
           {phase === PHASE.OPEN && price && (
-            <span className="pm-stat-sub mono">
+            <span className={`pm-stat-sub mono pm-price-line ${fresh ? "is-fresh" : ""}`}>
+              {/* Dot pulses on a real oracle tick; the age is ALWAYS shown so a flat number
+                  reads as "DIA hasn't published" (its ~140s heartbeat), never "app frozen". */}
+              <span className="pm-price-dot" aria-hidden="true" />
               now {fmtFeedPrice(price.answer, displayDp)}
-              {/* Age from the feed's updatedAt vs the chain clock — makes it visible that a
-                  static number is DIA's ~140s heartbeat, not a frozen fetch. */}
-              {fmtPriceAge(price.updatedAt, now) && (
-                <span className="pm-price-age"> · {fmtPriceAge(price.updatedAt, now)}</span>
-              )}
+              <span className="pm-price-age"> · updated {fmtPriceAge(price.updatedAt, now) ?? "—"}</span>
             </span>
           )}
         </span>

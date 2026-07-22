@@ -16,6 +16,10 @@ export const PREDICTION_FACTORY_ABI = [
   // reuse the global feeBps(), which can drift from what a live market settles at.
   "function pools(uint256 marketId) view returns (uint256 upPool,uint256 downPool,uint16 marketFeeBps)",
   "function claimable(uint256 marketId,address who) view returns (uint256)",
+  // Per-user stake on a market (up + down). Used to decide whether a TERMINAL market is
+  // still relevant to this wallet — a settled loss has claimable()==0 but non-zero stake,
+  // so we key visibility off stake, not claimable, to keep the user's own history/claims.
+  "function stakeOf(uint256 marketId,address who) view returns (uint256 upStake,uint256 downStake)",
   // ---- money-path WRITES (Step 6) ----
   // side is ParimutuelPredictions.Side: 0 = Up, 1 = Down (SEPARATE from Outcome).
   // Reverts: BettingClosed() once locked, BelowMinBet() under 1e18, EnforcedPause().
