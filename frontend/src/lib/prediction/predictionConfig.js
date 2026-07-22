@@ -24,9 +24,9 @@ export const OUTCOME = { NONE: 0, UP: 1, DOWN: 2 };
 
 export const PHASE_LABEL = { 0: "OPEN", 1: "LOCKED", 2: "SETTLED", 3: "VOID" };
 
-// TF_15M=0, TF_30M=1, TF_1H=2, TF_24H=3. The 5-min frame shown in the design mockup
+// TF_15M=0, TF_30M=1, TF_1H=2, TF_8H=3. The 5-min frame shown in the design mockup
 // does NOT exist on-chain — TF_COUNT is 4. Do not add it.
-export const TIMEFRAME_LABEL = { 0: "15-min", 1: "30-min", 2: "1-hour", 3: "24-hour" };
+export const TIMEFRAME_LABEL = { 0: "15-min", 1: "30-min", 2: "1-hour", 3: "8-hour" };
 
 // --- display metadata ---
 
