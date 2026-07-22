@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ethers } from "ethers";
 import { readProvider } from "../../lib/contracts.js";
-import { batchReadChunked } from "../../lib/prediction/multicall.js";
+import { batchReadChunked, multicall3 } from "../../lib/prediction/multicall.js";
 import { PREDICTION_FACTORY_ABI, AGGREGATOR_V3_ABI } from "../../lib/prediction/predictionAbi.js";
 import { PREDICTION_FACTORY_ADDRESS, PHASE } from "../../lib/prediction/predictionConfig.js";
 
@@ -26,17 +26,28 @@ export function usePredictionBoard(account) {
   const [markets, setMarkets] = useState(null); // null = first load
   const [assets, setAssets] = useState([]);
   const [error, setError] = useState(null);
+  // Chain-clock anchor: { ts } is block.timestamp at the last poll, { at } is the
+  // Date.now() ms when we sampled it. The UI interpolates ts + elapsed-wall between
+  // polls, so countdowns count down to CHAIN time (what the keeper acts on), not the
+  // browser clock, which on LitVM runs ahead of chain time.
+  const [chainTime, setChainTime] = useState(null);
   const alive = useRef(true);
 
   const load = useCallback(async () => {
     const f = factory();
+    const mc = multicall3();
     try {
-      // ---- pass 1: sizes -------------------------------------------------
-      const [countRes, assetCountRes] = await batchReadChunked([
+      // ---- pass 1: sizes + chain clock -----------------------------------
+      const [countRes, assetCountRes, tsRes] = await batchReadChunked([
         { contract: f, fn: "marketCount" },
         { contract: f, fn: "assetCount" },
+        { contract: mc, fn: "getCurrentBlockTimestamp" },
       ]);
       if (!countRes.ok || !assetCountRes.ok) throw new Error("factory unreachable");
+
+      // Anchor to chain time; if the clock read failed, fall back to wall-clock so
+      // countdowns still run rather than freezing.
+      const chainTs = tsRes.ok ? tsRes.value.toNumber() : Math.floor(Date.now() / 1000);
 
       const marketCount = countRes.value.toNumber();
       const assetCount = assetCountRes.value.toNumber();
@@ -131,6 +142,7 @@ export function usePredictionBoard(account) {
       }));
 
       if (!alive.current) return;
+      setChainTime({ ts: chainTs, at: Date.now() });
       setAssets(assetRows);
       setMarkets(enriched);
       setError(null);
@@ -151,5 +163,5 @@ export function usePredictionBoard(account) {
     };
   }, [load]);
 
-  return { markets, assets, error, loading: markets === null, refresh: load };
+  return { markets, assets, error, chainTime, loading: markets === null, refresh: load };
 }

@@ -22,6 +22,14 @@ export const MULTICALL3_ADDRESS = (
 export const PHASE = { OPEN: 0, LOCKED: 1, SETTLED: 2, VOID: 3 };
 export const OUTCOME = { NONE: 0, UP: 1, DOWN: 2 };
 
+// Bet SIDE is a SEPARATE enum from OUTCOME on-chain (ParimutuelPredictions.Side):
+// `enum Side { Up, Down }` → Up=0, Down=1. Do NOT pass OUTCOME.UP (1) as a bet side —
+// on-chain that is Side.Down. bet(marketId, side, amount) takes THIS.
+export const SIDE = { UP: 0, DOWN: 1 };
+
+// Contract floor: bets below 1 mUSD revert BelowMinBet(). 18-dec.
+export const MIN_BET = "1000000000000000000";
+
 export const PHASE_LABEL = { 0: "OPEN", 1: "LOCKED", 2: "SETTLED", 3: "VOID" };
 
 // TF_15M=0, TF_30M=1, TF_1H=2, TF_24H=3. The 5-min frame shown in the design mockup

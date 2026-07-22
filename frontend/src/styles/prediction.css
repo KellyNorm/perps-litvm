@@ -152,18 +152,6 @@
   }
 }
 
-.pm-mascot-toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: none;
-}
-.pm-toggle-k {
-  font-size: 9.5px;
-  letter-spacing: 0.14em;
-  color: var(--pm-muted);
-}
-
 /* -------------------------------------------------------------- board chrome */
 
 .pm-boardbar {
@@ -255,9 +243,6 @@
   .pm-header {
     flex-wrap: wrap;
   }
-  .pm-mascot-toggle {
-    width: 100%;
-  }
 }
 
 /* -------------------------------------------------------------------- card */
@@ -342,6 +327,41 @@
   letter-spacing: 0.02em;
 }
 
+/* ------------------------------------------------------- price vs strike */
+
+.pm-delta {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  align-self: flex-start;
+  padding: 4px 10px;
+  border-radius: 8px;
+  font-size: 11.5px;
+}
+.pm-delta-move {
+  font-weight: 700;
+  font-size: 13px;
+}
+.pm-delta-pct {
+  font-weight: 600;
+  opacity: 0.9;
+}
+.pm-delta-up {
+  color: var(--pm-green);
+  background: rgba(0, 217, 139, 0.1);
+  border: 1px solid rgba(0, 217, 139, 0.28);
+}
+.pm-delta-down {
+  color: var(--pm-red);
+  background: rgba(255, 77, 109, 0.1);
+  border: 1px solid rgba(255, 77, 109, 0.28);
+}
+.pm-delta-flat {
+  color: var(--pm-muted);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--pm-line);
+}
+
 /* -------------------------------------------------------------------- odds */
 
 .pm-odds {
@@ -361,6 +381,19 @@
   color: var(--pm-red);
   font-weight: 600;
 }
+/* The payout multiple, dimmed a touch so the crowd-share % stays the headline number
+   while the "· 1.05×" reads as the real payout signal beside it. */
+.pm-mult {
+  font-weight: 700;
+  opacity: 0.85;
+}
+.pm-odds-empty {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: var(--pm-muted);
+  font-style: italic;
+}
 .pm-barwrap {
   display: block;
   position: relative;
@@ -368,6 +401,16 @@
   border-radius: 99px;
   background: rgba(255, 77, 109, 0.22);
   overflow: hidden;
+}
+/* Empty book: a neutral, unfilled track — no green/red split that would imply a lean. */
+.pm-barwrap.is-empty {
+  background: repeating-linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.06) 0,
+    rgba(255, 255, 255, 0.06) 6px,
+    transparent 6px,
+    transparent 12px
+  );
 }
 .pm-barfill {
   position: absolute;
@@ -406,6 +449,9 @@
 .pm-stat-sub {
   font-size: 9.5px;
   color: var(--pm-muted);
+}
+.pm-price-age {
+  opacity: 0.6;
 }
 .pm-warm {
   color: var(--pm-warm);
@@ -460,18 +506,22 @@
   border-radius: 12px;
   font-weight: 700;
   font-size: 14px;
+  cursor: pointer;
   transition:
     background 0.16s ease,
     border-color 0.16s ease,
     transform 0.16s ease,
     box-shadow 0.16s ease;
 }
+.pm-btn:active {
+  transform: translateY(1px);
+}
 .pm-btn-up {
   color: var(--pm-green);
   background: rgba(0, 217, 139, 0.12);
   border: 1px solid rgba(0, 217, 139, 0.35);
 }
-.pm-card:hover .pm-btn-up {
+.pm-btn-up:hover {
   background: rgba(0, 217, 139, 0.2);
   border-color: var(--pm-green);
   box-shadow: 0 0 16px rgba(0, 217, 139, 0.22);
@@ -481,7 +531,7 @@
   background: rgba(255, 77, 109, 0.12);
   border: 1px solid rgba(255, 77, 109, 0.35);
 }
-.pm-card:hover .pm-btn-down {
+.pm-btn-down:hover {
   background: rgba(255, 77, 109, 0.2);
   border-color: var(--pm-red);
   box-shadow: 0 0 16px rgba(255, 77, 109, 0.22);
@@ -535,14 +585,27 @@
   font-weight: 700;
   font-size: 13px;
   color: #061018;
+  border: none;
+  cursor: pointer;
   background: linear-gradient(135deg, #00d98b, #00b877);
   transition:
     filter 0.16s ease,
     box-shadow 0.16s ease;
 }
-.pm-card:hover .pm-claim {
+.pm-claim:hover:not(:disabled) {
   filter: brightness(1.08);
   box-shadow: 0 0 18px rgba(0, 217, 139, 0.35);
+}
+.pm-claim:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.pm-claim-void {
+  color: #061018;
+  background: linear-gradient(135deg, #cdd6e6, #a9b3c6);
+}
+.pm-claim-void:hover:not(:disabled) {
+  box-shadow: 0 0 18px rgba(200, 211, 232, 0.3);
 }
 
 /* --------------------------------------------------------------- mode switch */
@@ -550,13 +613,323 @@
 .pm-modeswitch {
   position: fixed;
   z-index: 60;
-  right: 18px;
-  bottom: 18px;
+  right: 22px;
+  bottom: 22px;
   display: flex;
-  gap: 4px;
-  padding: 4px;
+  gap: 5px;
+  padding: 6px;
   border-radius: 99px;
-  background: rgba(8, 11, 20, 0.9);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  backdrop-filter: blur(8px);
+  background: rgba(8, 11, 20, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  backdrop-filter: blur(10px);
+  box-shadow:
+    0 10px 30px rgba(0, 0, 0, 0.5),
+    0 0 0 1px rgba(41, 169, 255, 0.12);
+}
+
+/* Bolder than the filter tabs — this is the primary app-level switch, so it gets a
+   larger hit target, heavier type, and a glowing active state. */
+.pm-modeswitch .pm-tab {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 9px 18px;
+}
+.pm-modeswitch .pm-tab.is-on {
+  background: linear-gradient(180deg, rgba(41, 169, 255, 0.32), rgba(41, 169, 255, 0.18));
+  border-color: rgba(41, 169, 255, 0.7);
+  color: #fff;
+  box-shadow:
+    0 0 16px rgba(41, 169, 255, 0.4),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+/* ------------------------------------------------------------------ wallet */
+
+.pm-wallet {
+  flex: none;
+  margin-left: auto;
+  align-self: flex-start;
+}
+.pm-connect {
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 9px 16px;
+  border-radius: 99px;
+  color: #061018;
+  background: linear-gradient(135deg, #5ec8ff, #2b8feb);
+  border: none;
+  cursor: pointer;
+  transition:
+    filter 0.16s ease,
+    box-shadow 0.16s ease;
+}
+.pm-connect:hover:not(:disabled) {
+  filter: brightness(1.08);
+  box-shadow: 0 0 18px rgba(94, 200, 255, 0.4);
+}
+.pm-connect:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.pm-acct {
+  display: inline-block;
+  font-size: 11.5px;
+  padding: 8px 13px;
+  border-radius: 99px;
+  color: var(--pm-text);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--pm-line);
+}
+
+/* ------------------------------------------------------------- bet modal */
+
+.pm-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(4, 6, 12, 0.72);
+  backdrop-filter: blur(4px);
+}
+.pm-modal {
+  width: 100%;
+  max-width: 380px;
+  background: var(--pm-card);
+  border: 1px solid var(--pm-line);
+  border-radius: 18px;
+  padding: 18px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+}
+.pm-modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.pm-modal-asset {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.pm-modal-q {
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.pm-modal-x {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  color: var(--pm-muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--pm-line);
+  cursor: pointer;
+}
+.pm-modal-x:hover:not(:disabled) {
+  color: var(--pm-text);
+}
+
+.pm-side-pick {
+  display: flex;
+  gap: 9px;
+  margin-bottom: 14px;
+}
+.pm-side-btn {
+  flex: 1;
+  padding: 11px;
+  border-radius: 12px;
+  font-weight: 700;
+  font-size: 14px;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid transparent;
+  color: var(--pm-muted);
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease;
+}
+.pm-side-up.is-on {
+  color: var(--pm-green);
+  background: rgba(0, 217, 139, 0.14);
+  border-color: var(--pm-green);
+}
+.pm-side-down.is-on {
+  color: var(--pm-red);
+  background: rgba(255, 77, 109, 0.14);
+  border-color: var(--pm-red);
+}
+
+.pm-amt-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.pm-amt-k {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--pm-muted);
+}
+.pm-amt-bal {
+  font-size: 11px;
+  color: var(--pm-muted);
+}
+.pm-amt-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 4px 4px 14px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--pm-line);
+}
+.pm-amt-row.is-bad {
+  border-color: rgba(255, 77, 109, 0.55);
+}
+.pm-amt-input {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--pm-text);
+  font-size: 20px;
+  padding: 8px 0;
+}
+.pm-amt-max {
+  flex: none;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 7px 12px;
+  border-radius: 9px;
+  color: #bfe4ff;
+  background: rgba(41, 169, 255, 0.14);
+  border: 1px solid rgba(41, 169, 255, 0.3);
+  cursor: pointer;
+}
+.pm-amt-max:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.pm-preview {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--pm-line);
+}
+.pm-preview-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 12.5px;
+  padding: 3px 0;
+}
+.pm-preview-payout {
+  color: var(--pm-green);
+  font-weight: 700;
+  font-size: 14px;
+}
+.pm-muted {
+  color: var(--pm-muted);
+}
+.pm-preview-note {
+  margin: 8px 0 0;
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--pm-muted);
+}
+
+.pm-flow {
+  margin: 10px 0;
+  padding: 10px 13px;
+  border-radius: 11px;
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--pm-line);
+  color: rgba(244, 248, 255, 0.75);
+}
+.pm-flow.is-ok {
+  background: rgba(0, 217, 139, 0.1);
+  border-color: rgba(0, 217, 139, 0.3);
+  color: #8fffd0;
+}
+.pm-flow.is-err {
+  background: rgba(255, 77, 109, 0.1);
+  border-color: rgba(255, 77, 109, 0.3);
+  color: #ffb0c0;
+}
+
+.pm-submit {
+  width: 100%;
+  padding: 13px;
+  border-radius: 13px;
+  font-weight: 700;
+  font-size: 14.5px;
+  color: #061018;
+  border: none;
+  cursor: pointer;
+  transition:
+    filter 0.16s ease,
+    box-shadow 0.16s ease;
+}
+.pm-submit-up {
+  background: linear-gradient(135deg, #00d98b, #00b877);
+}
+.pm-submit-down {
+  background: linear-gradient(135deg, #ff6d84, #ff4d6d);
+}
+.pm-submit:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.pm-submit:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.pm-modal-foot {
+  margin: 12px 0 0;
+  text-align: center;
+  font-size: 10.5px;
+  color: var(--pm-muted);
+}
+
+/* ------------------------------------------------------------------- toast */
+
+.pm-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 78px;
+  transform: translate(-50%, 12px);
+  z-index: 90;
+  max-width: 88vw;
+  padding: 11px 18px;
+  border-radius: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #061018;
+  background: #00d98b;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
+}
+.pm-toast.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+.pm-toast.err {
+  background: #ff4d6d;
+  color: #fff;
 }

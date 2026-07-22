@@ -16,6 +16,18 @@ export const PREDICTION_FACTORY_ABI = [
   // reuse the global feeBps(), which can drift from what a live market settles at.
   "function pools(uint256 marketId) view returns (uint256 upPool,uint256 downPool,uint16 marketFeeBps)",
   "function claimable(uint256 marketId,address who) view returns (uint256)",
+  // ---- money-path WRITES (Step 6) ----
+  // side is ParimutuelPredictions.Side: 0 = Up, 1 = Down (SEPARATE from Outcome).
+  // Reverts: BettingClosed() once locked, BelowMinBet() under 1e18, EnforcedPause().
+  "function bet(uint256 marketId,uint8 side,uint256 amount)",
+  // Pays a winner's pro-rata payout or a void refund; amount comes from claimable().
+  // Emits Claimed(marketId, claimer, phase, amount). Idempotent — a second call pays 0.
+  "function claim(uint256 marketId)",
+  // The mUSD token this factory pulls bets from / pays claims in. Approve THIS spender.
+  "function musd() view returns (address)",
+  // Events we parse from receipts to confirm the EXACT on-chain amounts.
+  "event BetPlaced(uint256 indexed marketId,address indexed better,uint8 side,uint256 amount)",
+  "event Claimed(uint256 indexed marketId,address indexed claimer,uint8 phase,uint256 amount)",
   // asset registry — symbols come from here, never from a hardcoded map
   "function assetCount() view returns (uint256)",
   "function assets(uint256) view returns (string symbol,address feed,uint8 feedDecimals,uint8 displayDp,bool enabled)",
@@ -30,4 +42,7 @@ export const AGGREGATOR_V3_ABI = [
 
 export const MULTICALL3_ABI = [
   "function aggregate3((address target,bool allowFailure,bytes callData)[] calls) view returns ((bool success,bytes returnData)[] returnData)",
+  // Chain clock. The keeper locks/settles on block.timestamp, so countdowns must count
+  // down to CHAIN time, not the browser's Date.now(). Read once per poll and interpolate.
+  "function getCurrentBlockTimestamp() view returns (uint256 timestamp)",
 ];

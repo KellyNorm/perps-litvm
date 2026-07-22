@@ -47,8 +47,10 @@ export default function EyesMascot({ size = 34, mode = "idle", className = "" })
       const dx = e.clientX - (r.left + r.width / 2);
       const dy = e.clientY - (r.top + r.height / 2);
       const d = Math.hypot(dx, dy) || 1;
-      const reach = Math.min(d, 260) / 260;
-      setLook({ x: (dx / d) * 9 * reach, y: (dy / d) * 7 * reach });
+      // Ramp to full deflection over a shorter radius and push the pupils further, so
+      // the tracking is unmistakable at the larger header size.
+      const reach = Math.min(d, 180) / 180;
+      setLook({ x: (dx / d) * 13 * reach, y: (dy / d) * 11 * reach });
     };
     window.addEventListener("pointermove", onMove, { passive: true });
     return () => window.removeEventListener("pointermove", onMove);
