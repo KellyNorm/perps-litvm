@@ -53,11 +53,11 @@ contract PredictionMarketFactory is ParimutuelPredictions {
     uint256 public constant TARGET_ACTIVE = 7;
 
     /// Timeframe indices and their betting/settlement windows (design §4, ⅔/⅓;
-    /// 24h is the ratio exception — see {_windows}).
+    /// 8h is the ratio exception — see {_windows}).
     uint8 public constant TF_15M = 0;
     uint8 public constant TF_30M = 1;
     uint8 public constant TF_1H = 2;
-    uint8 public constant TF_24H = 3;
+    uint8 public constant TF_8H = 3;
     /// Number of timeframes; keep in lockstep with the TF_* set and {_windows}.
     uint256 internal constant TF_COUNT = 4;
 
@@ -238,12 +238,16 @@ contract PredictionMarketFactory is ParimutuelPredictions {
         if (tf == TF_15M) return (600, 300); // 15m: ⅔ bet / ⅓ settle
         if (tf == TF_30M) return (1200, 600); // 30m: ⅔ bet / ⅓ settle
         if (tf == TF_1H) return (2400, 1200); // 1h:  ⅔ bet / ⅓ settle
-        // 24h: settlement window FIXED at 1800s (30m), DECOUPLED from the ⅔/⅓ ratio
-        // (which would be an 8h window). An 8h window stores ~thousands of samples
-        // that settle() must loop — risking an unsettleable market — and needs 8h of
-        // continuous keeper sampling on a 502/504-prone RPC. 1800s clears the 60%
-        // coverage gate ~12x at 300s staleness. betWindow = 24h − 30m.
-        if (tf == TF_24H) return (84_600, 1_800);
+        // 8h (longest frame): TOTAL life 28_800s (8h) = 27_000s betting + 1_800s settle, so
+        // label == total life holds across all four frames (like 15m/30m/1h). Settlement
+        // window FIXED at 1800s (30m), DECOUPLED from the ⅔/⅓ ratio: a multi-hour settle
+        // window would store ~thousands of samples that settle() must loop (risking an
+        // unsettleable market) and need hours of continuous keeper sampling on a 502/504-prone
+        // RPC. The fixed 1800s window is UNCHANGED, so it still clears the 60% coverage gate
+        // ~12x at 300s staleness. betWindow shortened 84_600 → 27_000 (23.5h → 7.5h): the
+        // strike is set at t0, so it can now be stale at most 7.5h, cutting the strike-drift
+        // the long window caused (was avg ~1.0%/max ~2.7%).
+        if (tf == TF_8H) return (27_000, 1_800);
         revert BadTimeframe(); // no silent fallthrough to a default window
     }
 

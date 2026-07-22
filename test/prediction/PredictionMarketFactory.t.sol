@@ -112,7 +112,7 @@ contract PredictionMarketFactoryTest is Test {
         f.replenish();
         assertEq(f.liveMarketCount(), 7, "initial board");
 
-        // Warp past the longest timeframe (24h) so every market expires.
+        // Warp well past the longest timeframe (8h) so every market expires.
         vm.warp(NOW + 86_401);
         _refreshFeeds(feeds);
 
@@ -191,7 +191,7 @@ contract PredictionMarketFactoryTest is Test {
     }
 
     // =========================================================================
-    // Timeframe windows: new 15m/30m/1h/24h set, 5m removed, 24h ratio exception
+    // Timeframe windows: 15m/30m/1h/8h set, 5m removed, 8h ratio exception
     // =========================================================================
 
     function test_MaxStaleness_ConstructorValue() public view {
@@ -213,11 +213,12 @@ contract PredictionMarketFactoryTest is Test {
         assertEq(b1h, 2400, "1h bet");
         assertEq(s1h, 1200, "1h settle (1/3)");
 
-        // 24h: ratio exception — fixed 30m settlement window, bet = 24h − 30m.
-        (uint64 b24, uint64 s24) = p.windows(f.TF_24H());
-        assertEq(b24, 84_600, "24h bet = 24h - 30m");
-        assertEq(s24, 1800, "24h settle FIXED at 30m (not 8h)");
-        assertEq(uint256(b24) + uint256(s24), 86_400, "24h total life is exactly 24h");
+        // 8h (longest frame): ratio exception — fixed 30m settlement window. TOTAL life is
+        // exactly 8h so label == total life (like the other frames); strike now stale <=7.5h.
+        (uint64 b8, uint64 s8) = p.windows(f.TF_8H());
+        assertEq(b8, 27_000, "8h bet window = 7.5h (was 84_600 under the 24h frame)");
+        assertEq(s8, 1800, "8h settle FIXED at 30m");
+        assertEq(uint256(b8) + uint256(s8), 28_800, "8h frame total life is exactly 8h");
     }
 
     function test_Windows_RevertsUnknownTimeframe() public {
@@ -396,7 +397,7 @@ contract PredictionMarketFactoryTest is Test {
         assertEq(f.liveMarketCount(), 7, "board built");
 
         f.pause();
-        vm.warp(NOW + 86_401); // everything expires (past the 24h frame)
+        vm.warp(NOW + 86_401); // everything expires (well past the 8h frame)
         _refreshFeeds(feeds);
 
         f.replenish(); // reaps the expired (empty) markets to VOID, creates none
