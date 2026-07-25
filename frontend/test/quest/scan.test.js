@@ -203,8 +203,11 @@ describe("chunking", () => {
     }
   });
 
-  test("the default chunk size is the measured-safe 50k", () => {
-    assert.equal(CHUNK_BLOCKS, 50_000);
+  // 10k, not 50k: getLogs costs ~0.3ms/block either way (measured 2026-07-25), so the
+  // smaller chunk buys the same coverage in ~3.5s steps instead of ~15s ones — less waste
+  // when the time budget cuts off mid-chunk, and a tenth the coverage lost to a bad chunk.
+  test("the default chunk size is the measured 10k", () => {
+    assert.equal(CHUNK_BLOCKS, 10_000);
   });
 
   test("sources share one budget rather than getting one each", async () => {

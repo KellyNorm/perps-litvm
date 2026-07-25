@@ -2,11 +2,19 @@
 // is verified. The handler knows nothing about any individual quest — it looks the id up
 // here, runs whatever tiers are registered, and shapes the envelope.
 //
-// STAGE 1 registers `first_trade` only, and only its Tier 1. Unregistered ids are a 400,
-// not a false — answering "not completed" for a quest we cannot actually check would be
-// the exact silent-wrong-answer failure this endpoint exists to avoid.
+// Unregistered ids are a 400, not a false — answering "not completed" for a quest we
+// cannot check would be the exact silent-wrong-answer failure this endpoint exists to
+// avoid. A registered-but-unavailable quest (daily_active) is different: it is a real id
+// the platform will call, so it answers 200 INDETERMINATE rather than pretending to know.
 
-import { firstTradeTier1 } from "./checks.js";
+import {
+  firstPredictionTier1,
+  firstPredictionTier2,
+  firstTradeTier1,
+  firstTradeTier2,
+  provideLiquidityTier1,
+  provideLiquidityTier2,
+} from "./checks.js";
 
 /**
  * The three answers this endpoint can give. `indeterminate` is the load-bearing one: it
@@ -42,7 +50,52 @@ export const QUESTS = {
     id: "first_trade",
     kind: QUEST_KIND.ONE_TIME,
     tier1: firstTradeTier1,
-    tier2: null, // PositionOpened scan — stage 3
+    tier2: firstTradeTier2,
+  },
+
+  first_prediction: {
+    id: "first_prediction",
+    kind: QUEST_KIND.ONE_TIME,
+    tier1: firstPredictionTier1,
+    tier2: firstPredictionTier2,
+  },
+
+  provide_liquidity: {
+    id: "provide_liquidity",
+    kind: QUEST_KIND.ONE_TIME,
+    tier1: provideLiquidityTier1,
+    tier2: provideLiquidityTier2,
+  },
+
+  // Composition only — issues no chain calls of its own. Each part is resolved through the
+  // ordinary cache-first path, so a wallet that already verified both quests is answered
+  // entirely from cache.
+  both_products: {
+    id: "both_products",
+    kind: QUEST_KIND.COMPOSITE,
+    parts: ["first_trade", "first_prediction"],
+    tier1: null,
+    tier2: null,
+  },
+
+  // NOT SHIPPABLE AS A LIVE SCAN, and deliberately registered anyway.
+  //
+  // "Active in the last 24h" spans ~345,600 blocks. At the measured ~0.3ms/block that is
+  // ~104 seconds of eth_getLogs — over triple the function's 30s ceiling — and unlike the
+  // one-time quests it has no Tier 1 shortcut, because there is no current-state read that
+  // means "did something today".
+  //
+  // So it answers INDETERMINATE every time, honestly, rather than shipping a check that
+  // structurally cannot complete and would hand out a stream of wrong falses. It needs the
+  // forward indexer (phase 2): rows written as events arrive turn this into an O(1) "is
+  // there a row for this wallet today" lookup instead of a backward walk.
+  daily_active: {
+    id: "daily_active",
+    kind: QUEST_KIND.DAILY,
+    available: false,
+    unavailableReason: "needs_indexer",
+    tier1: null,
+    tier2: null,
   },
 };
 

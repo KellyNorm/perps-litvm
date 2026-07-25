@@ -7,6 +7,9 @@
   "functions": {
     "api/tachy.js": {
       "maxDuration": 10
+    },
+    "api/quest/verify.js": {
+      "maxDuration": 30
     }
   }
 }

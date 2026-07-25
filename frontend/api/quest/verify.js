@@ -144,21 +144,7 @@ export default async function handler(req, res) {
   const definition = getQuest(quest);
 
   try {
-    const key = cacheKey({
-      chainId: chainId(),
-      quest,
-      address,
-      bucket: definition.kind === QUEST_KIND.DAILY ? utcDay() : null,
-    });
-
-    const hit = await getCache().get(key);
-    if (hit) {
-      return send(res, 200, { ...hit, address, quest, source: SOURCE.CACHE });
-    }
-
-    const result = await verifyQuest(definition, address);
-    await getCache().set(key, result);
-
+    const result = await resolveQuest(definition, address);
     return send(res, 200, { ...result, address, quest });
   } catch (err) {
     // Two distinct 503s, because they need different fixes: ConfigError means WE are
@@ -166,36 +152,72 @@ export default async function handler(req, res) {
     // failed. Neither is cached — see cache.js.
     const reason = err instanceof ConfigError ? "not_configured" : "rpc_unavailable";
     console.error(`[quest] ${reason} verifying ${quest}:`, err?.message);
-    return send(
-      res,
-      503,
-      {
-        address,
-        quest,
-        // Non-200: no consumer should read `completed` here. It stays a boolean rather
-        // than null purely so the response schema does not change shape between statuses.
-        completed: false,
-        status: STATUS.UNAVAILABLE,
-        source: null,
-        checkedThroughBlock: null,
-      },
+    return send(res, 503, {
+      address,
+      quest,
+      // Non-200: no consumer should read `completed` here. It stays a boolean rather than
+      // null purely so the response schema does not change shape between statuses.
+      completed: false,
+      status: STATUS.UNAVAILABLE,
+      source: null,
+      checkedThroughBlock: null,
       reason,
-    );
+    });
   }
+}
+
+/**
+ * Cache-first resolution of one quest. This is the single entry point for a verdict —
+ * both the handler and composite quests go through it, which is what makes
+ * `both_products` free for a wallet that has already verified its two parts.
+ */
+export async function resolveQuest(definition, address) {
+  const key = cacheKey({
+    chainId: chainId(),
+    quest: definition.id,
+    address,
+    bucket: definition.kind === QUEST_KIND.DAILY ? utcDay() : null,
+  });
+
+  const hit = await getCache().get(key);
+  if (hit) return { ...hit, source: SOURCE.CACHE };
+
+  const result = await verifyQuest(definition, address);
+  // Silently ignored unless this is a proven completion — see the policy in cache.js.
+  await getCache().set(key, result);
+
+  return result;
 }
 
 /**
  * Run a quest's tiers and turn them into a verdict. Exported so the tier→status mapping —
  * the rule this endpoint exists to get right — is unit-testable without HTTP or a chain.
  *
- * Stage 1 has Tier 1 only, so a Tier 1 false is INDETERMINATE, never a confirmed false:
- * an open position proves a trade, but a closed one leaves no current state, and until
- * the Tier 2 event scan exists we genuinely cannot tell "never traded" from "traded and
- * closed". Stage 3 adds the scan and only then can a false be confirmed.
+ * The ONLY route to a confirmed false is a Tier 2 scan that walked every source to a
+ * validated floor. Everything short of that is indeterminate: a Tier 1 false cannot tell
+ * "never traded" from "traded and closed", and a budget-limited scan cannot tell "never"
+ * from "not in the range we managed to read".
  */
 export async function verifyQuest(definition, address) {
+  // A registered quest we cannot yet answer (daily_active until the indexer exists). It
+  // gets an honest indeterminate rather than a fabricated false.
+  if (definition.available === false) {
+    return {
+      completed: false,
+      status: STATUS.INDETERMINATE,
+      source: null,
+      checkedThroughBlock: null,
+      reason: definition.unavailableReason ?? "not_yet_available",
+    };
+  }
+
+  if (definition.kind === QUEST_KIND.COMPOSITE) {
+    return composeQuest(definition, address);
+  }
+
   const tier1 = await definition.tier1(address);
 
+  // A positive is proof and stops here — no scan needed.
   if (tier1.completed) {
     return {
       completed: true,
@@ -205,26 +227,115 @@ export async function verifyQuest(definition, address) {
     };
   }
 
+  // A Tier 1 false whose reads did not all land says nothing at all — not even enough to
+  // justify the cost of a scan.
+  if (!tier1.reliable) {
+    return {
+      completed: false,
+      status: STATUS.INDETERMINATE,
+      source: SOURCE.TIER1,
+      checkedThroughBlock: tier1.checkedThroughBlock,
+      reason: "tier1_unreliable",
+    };
+  }
+
+  if (!definition.tier2) {
+    return {
+      completed: false,
+      status: STATUS.INDETERMINATE,
+      source: SOURCE.TIER1,
+      checkedThroughBlock: tier1.checkedThroughBlock,
+    };
+  }
+
+  // Reuses Tier 1's head, so both tiers together cost one eth_blockNumber.
+  const scan = await definition.tier2(address, { head: tier1.checkedThroughBlock });
+
+  if (scan.found) {
+    return {
+      completed: true,
+      status: STATUS.CONFIRMED,
+      source: SOURCE.TIER2,
+      checkedThroughBlock: tier1.checkedThroughBlock,
+    };
+  }
+
+  // The one path to a confirmed false: every source walked to a validated floor, no holes.
+  if (scan.complete) {
+    return {
+      completed: false,
+      status: STATUS.CONFIRMED,
+      source: SOURCE.TIER2,
+      checkedThroughBlock: tier1.checkedThroughBlock,
+    };
+  }
+
   return {
     completed: false,
     status: STATUS.INDETERMINATE,
-    source: SOURCE.TIER1,
+    source: SOURCE.TIER2,
     checkedThroughBlock: tier1.checkedThroughBlock,
+    reason: scan.reason ?? "scan_incomplete",
   };
 }
 
-/** Single success/verdict exit, so every answer has the documented shape. */
-function send(res, status, verdict, reason = null) {
+/**
+ * A composite quest is the AND of its parts, resolved through the ordinary cache-first
+ * path so it issues no chain calls of its own beyond what the parts need.
+ *
+ * THREE-VALUED AND (Kleene), because a part can be unknown:
+ *   all parts complete            → confirmed true
+ *   any part PROVEN incomplete    → confirmed false  (unknown ∧ false is still false, so a
+ *                                   proven-false part settles the whole on its own)
+ *   otherwise (an unknown part)   → indeterminate    (unknown ∧ true is unknown)
+ * The last line is the one that matters: a part we could not settle must not be allowed to
+ * produce a settled TRUE for the whole.
+ */
+async function composeQuest(definition, address) {
+  const parts = await Promise.all(
+    definition.parts.map((id) => {
+      const part = getQuest(id);
+      // A registry typo would otherwise surface as a null-dereference and be reported as
+      // "rpc_unavailable" — a misleading 503 for what is our own config error.
+      if (!part) throw new ConfigError(`${definition.id} names unknown part quest ${JSON.stringify(id)}`);
+      return resolveQuest(part, address);
+    }),
+  );
+
+  // Conservative: the composite is only checked as far as its least-checked part.
+  const blocks = parts.map((p) => p.checkedThroughBlock).filter((b) => typeof b === "number");
+  const checkedThroughBlock = blocks.length === parts.length ? Math.min(...blocks) : null;
+
+  if (parts.every((p) => p.completed)) {
+    return { completed: true, status: STATUS.CONFIRMED, source: SOURCE.COMPOSED, checkedThroughBlock };
+  }
+
+  if (parts.some((p) => p.completed === false && p.status === STATUS.CONFIRMED)) {
+    return { completed: false, status: STATUS.CONFIRMED, source: SOURCE.COMPOSED, checkedThroughBlock };
+  }
+
+  return {
+    completed: false,
+    status: STATUS.INDETERMINATE,
+    source: SOURCE.COMPOSED,
+    checkedThroughBlock,
+    reason: "part_indeterminate",
+  };
+}
+
+/**
+ * Single success/verdict exit, so every answer has the documented shape:
+ *   { address, quest, completed, status, source, checkedThroughBlock, asOf }
+ * plus `reason` whenever the answer is not a settled one — a short code naming WHY, which
+ * is what makes an indeterminate actionable instead of mysterious.
+ */
+function send(res, status, verdict) {
   res.setHeader("content-type", "application/json; charset=utf-8");
   // Per-wallet and time-sensitive: a cached HTTP response would hand a stale "not
   // completed" to the next caller. Our own cache is the only caching layer allowed.
   res.setHeader("cache-control", "no-store");
 
-  return res.status(status).json({
-    ...verdict,
-    asOf: new Date().toISOString(),
-    ...(reason ? { reason } : {}),
-  });
+  return res.status(status).json({ ...verdict, asOf: new Date().toISOString() });
 }
 
 /** Client-error exit: no verdict, because a malformed question has no answer. */

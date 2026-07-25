@@ -282,18 +282,245 @@ describe("cache-first", () => {
   });
 });
 
-describe("verifyQuest", () => {
-  test("maps the tiers without touching HTTP", async () => {
-    const yes = await verifyQuest({ tier1: async () => tier1(true), tier2: null }, ADDRESS);
-    assert.deepEqual(
-      { completed: yes.completed, status: yes.status },
-      { completed: true, status: STATUS.CONFIRMED },
+/** A scanForEvent result. */
+const scan = ({ found = false, complete = false, exhausted = false, reason = null } = {}) => ({
+  found,
+  complete,
+  exhausted,
+  reason,
+  chunksUsed: 1,
+  scannedFrom: 33_000_000,
+  scannedDownTo: 32_990_000,
+});
+
+describe("tier 1 → tier 2 escalation", () => {
+  test("a Tier 1 positive short-circuits: Tier 2 is never run", async () => {
+    let scanned = false;
+    const out = await verifyQuest(
+      {
+        tier1: async () => tier1(true),
+        tier2: async () => {
+          scanned = true;
+          return scan({ found: true });
+        },
+      },
+      ADDRESS,
     );
 
-    const no = await verifyQuest({ tier1: async () => tier1(false), tier2: null }, ADDRESS);
-    assert.deepEqual(
-      { completed: no.completed, status: no.status },
-      { completed: false, status: STATUS.INDETERMINATE },
+    assert.equal(out.completed, true);
+    assert.equal(out.source, SOURCE.TIER1);
+    assert.equal(scanned, false, "a proven positive must not pay for a scan");
+  });
+
+  test("a Tier 1 negative escalates and a scan hit CONFIRMS completion", async () => {
+    const out = await verifyQuest(
+      { tier1: async () => tier1(false), tier2: async () => scan({ found: true }) },
+      ADDRESS,
     );
+
+    assert.equal(out.completed, true);
+    assert.equal(out.status, STATUS.CONFIRMED);
+    assert.equal(out.source, SOURCE.TIER2);
+  });
+
+  // The ONLY route to a confirmed false.
+  test("a COMPLETE scan finding nothing is the one path to a confirmed false", async () => {
+    const out = await verifyQuest(
+      { tier1: async () => tier1(false), tier2: async () => scan({ complete: true }) },
+      ADDRESS,
+    );
+
+    assert.equal(out.completed, false);
+    assert.equal(out.status, STATUS.CONFIRMED);
+    assert.equal(out.source, SOURCE.TIER2);
+  });
+
+  test("an exhausted scan stays INDETERMINATE and carries the reason", async () => {
+    const out = await verifyQuest(
+      {
+        tier1: async () => tier1(false),
+        tier2: async () => scan({ exhausted: true, reason: "budget_exhausted" }),
+      },
+      ADDRESS,
+    );
+
+    assert.equal(out.completed, false);
+    assert.equal(out.status, STATUS.INDETERMINATE);
+    assert.equal(out.reason, "budget_exhausted");
+  });
+
+  test("a floor-unverified scan cannot produce a confirmed false", async () => {
+    const out = await verifyQuest(
+      {
+        tier1: async () => tier1(false),
+        tier2: async () => scan({ exhausted: true, reason: "floor_unverified" }),
+      },
+      ADDRESS,
+    );
+
+    assert.equal(out.status, STATUS.INDETERMINATE);
+    assert.equal(out.reason, "floor_unverified");
+  });
+
+  // An unreliable Tier 1 says nothing — not even enough to justify the scan's cost.
+  test("an unreliable Tier 1 does not escalate", async () => {
+    let scanned = false;
+    const out = await verifyQuest(
+      {
+        tier1: async () => tier1(false, { reliable: false }),
+        tier2: async () => {
+          scanned = true;
+          return scan({ complete: true });
+        },
+      },
+      ADDRESS,
+    );
+
+    assert.equal(out.status, STATUS.INDETERMINATE);
+    assert.equal(out.reason, "tier1_unreliable");
+    assert.equal(scanned, false);
+  });
+
+  test("Tier 2 reuses Tier 1's head rather than re-reading it", async () => {
+    let headSeen = null;
+    await verifyQuest(
+      {
+        tier1: async () => tier1(false, { checkedThroughBlock: 33_123_456 }),
+        tier2: async (_addr, ctx) => {
+          headSeen = ctx.head;
+          return scan({ complete: true });
+        },
+      },
+      ADDRESS,
+    );
+
+    assert.equal(headSeen, 33_123_456);
+  });
+});
+
+describe("unavailable quests", () => {
+  // daily_active cannot be a live scan: ~345,600 blocks ≈ 104s of getLogs against a 30s
+  // limit, with no Tier 1 shortcut. It answers honestly rather than fabricating falses.
+  test("daily_active answers 200 INDETERMINATE, not a false and not a 400", async () => {
+    const res = await call({ body: { address: ADDRESS, quest: "daily_active" } });
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.completed, false);
+    assert.equal(res.body.status, STATUS.INDETERMINATE);
+    assert.equal(res.body.source, null);
+    assert.equal(res.body.reason, "needs_indexer");
+  });
+
+  test("an unavailable quest is never cached, so it cannot harden into a false", async () => {
+    await call({ body: { address: ADDRESS, quest: "daily_active" } });
+    const second = await call({ body: { address: ADDRESS, quest: "daily_active" } });
+
+    assert.equal(second.body.source, null, "must not be served from cache");
+    assert.equal(second.body.status, STATUS.INDETERMINATE);
+  });
+});
+
+describe("composite quests", () => {
+  const composite = (parts) => ({ id: "t_comp", kind: QUEST_KIND.COMPOSITE, parts });
+
+  test("both parts complete → CONFIRMED complete", async () => {
+    registerQuest("t_p1", { tier1: async () => tier1(true) });
+    registerQuest("t_p2", { tier1: async () => tier1(true) });
+
+    const out = await verifyQuest(composite(["t_p1", "t_p2"]), ADDRESS);
+
+    assert.equal(out.completed, true);
+    assert.equal(out.status, STATUS.CONFIRMED);
+    assert.equal(out.source, SOURCE.COMPOSED);
+  });
+
+  test("a PROVEN incomplete part → confirmed false", async () => {
+    registerQuest("t_p1", { tier1: async () => tier1(true) });
+    registerQuest("t_p2", {
+      tier1: async () => tier1(false),
+      tier2: async () => scan({ complete: true }),
+    });
+
+    const out = await verifyQuest(composite(["t_p1", "t_p2"]), ADDRESS);
+
+    assert.equal(out.completed, false);
+    assert.equal(out.status, STATUS.CONFIRMED);
+  });
+
+  // Three-valued AND: unknown ∧ false is FALSE — a proven-false part settles the whole no
+  // matter how uncertain the other part is. (Nothing is cached either way: a confirmed
+  // false is not a cacheable result.)
+  test("a proven false settles the composite even alongside an indeterminate part", async () => {
+    registerQuest("t_p1", { tier1: async () => tier1(false) }); // indeterminate
+    registerQuest("t_p2", {
+      tier1: async () => tier1(false),
+      tier2: async () => scan({ complete: true }),
+    }); // proven false
+
+    const out = await verifyQuest(composite(["t_p1", "t_p2"]), ADDRESS);
+
+    assert.equal(out.completed, false);
+    assert.equal(out.status, STATUS.CONFIRMED);
+  });
+
+  // ...but unknown ∧ true is UNKNOWN: an unsettled part with nothing to short-circuit on
+  // must not yield a settled whole.
+  test("an indeterminate part alongside a complete one stays indeterminate", async () => {
+    registerQuest("t_p1", { tier1: async () => tier1(false) }); // indeterminate
+    registerQuest("t_p2", { tier1: async () => tier1(true) }); // confirmed complete
+
+    const out = await verifyQuest(composite(["t_p1", "t_p2"]), ADDRESS);
+
+    assert.equal(out.status, STATUS.INDETERMINATE);
+    assert.equal(out.reason, "part_indeterminate");
+  });
+
+  test("reports the LEAST-checked part's block, not the most", async () => {
+    registerQuest("t_p1", { tier1: async () => tier1(true, { checkedThroughBlock: 100 }) });
+    registerQuest("t_p2", { tier1: async () => tier1(true, { checkedThroughBlock: 90 }) });
+
+    const out = await verifyQuest(composite(["t_p1", "t_p2"]), ADDRESS);
+
+    assert.equal(out.checkedThroughBlock, 90);
+  });
+
+  test("parts resolve through the cache, so a repeat composite is free", async () => {
+    let p1Checks = 0;
+    registerQuest("t_p1", {
+      tier1: async () => {
+        p1Checks++;
+        return tier1(true);
+      },
+    });
+    registerQuest("t_p2", { tier1: async () => tier1(true) });
+
+    await verifyQuest(composite(["t_p1", "t_p2"]), ADDRESS);
+    await verifyQuest(composite(["t_p1", "t_p2"]), ADDRESS);
+
+    assert.equal(p1Checks, 1, "the second composite must reuse the cached part");
+  });
+});
+
+describe("the registry", () => {
+  test("registers exactly the five planned quests", () => {
+    assert.deepEqual(Object.keys(QUESTS).filter((id) => !id.startsWith("t_")).sort(), [
+      "both_products",
+      "daily_active",
+      "first_prediction",
+      "first_trade",
+      "provide_liquidity",
+    ]);
+  });
+
+  test("every one-time quest has both tiers wired", () => {
+    for (const id of ["first_trade", "first_prediction", "provide_liquidity"]) {
+      assert.equal(typeof QUESTS[id].tier1, "function", `${id} tier1`);
+      assert.equal(typeof QUESTS[id].tier2, "function", `${id} tier2`);
+    }
+  });
+
+  test("both_products composes the two product quests", () => {
+    assert.deepEqual(QUESTS.both_products.parts, ["first_trade", "first_prediction"]);
+    assert.equal(QUESTS.both_products.kind, QUEST_KIND.COMPOSITE);
   });
 });

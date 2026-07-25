@@ -14,7 +14,26 @@
 // That asymmetry — a positive is proof, a negative is a hint — is the whole design. It is
 // why nothing here may ever return a bare boolean.
 
-import { batchRead, headBlock, marketKey, positionKey, positionManagerRead } from "./chain.js";
+// CONTRACT FOR EVERY TIER 2 CHECK:
+//   takes (address, { head }) and returns scanForEvent's result unchanged.
+//   found                   → proof. Permanent.
+//   !found && complete      → a PROVEN negative: every source walked to a validated floor.
+//   exhausted               → we ran out of budget or lost a chunk. Indeterminate.
+// Tier 2 reuses the head block Tier 1 already fetched, so the two tiers together cost one
+// eth_blockNumber, not two.
+
+import {
+  batchRead,
+  deployBlocks,
+  headBlock,
+  liquidityPoolRead,
+  marketKey,
+  positionKey,
+  positionManagerRead,
+  predictionFactoryOldRead,
+  predictionFactoryRead,
+} from "./chain.js";
+import { scanForEvent } from "./scan.js";
 
 // The markets PositionManager actually supports for perps. bytes32("BTC") / bytes32("ETH")
 // are MARKET_BTC / MARKET_ETH on-chain. SOL/LTC appear in the frontend's CANDIDATE_MARKETS
@@ -58,4 +77,149 @@ export async function firstTradeTier1(address) {
   const reliable = completed || results.every((r) => r.ok);
 
   return { completed, reliable, checkedThroughBlock };
+}
+
+/** first_trade, Tier 2: has this wallet EVER opened a position? `owner` is indexed. */
+export async function firstTradeTier2(address, { head }) {
+  const pm = positionManagerRead();
+  return scanForEvent(
+    [
+      {
+        contract: pm,
+        filter: pm.filters.PositionOpened(address),
+        floor: deployBlocks.positionManager(),
+        address: pm.address,
+        label: "PositionManager",
+      },
+    ],
+    { head },
+  );
+}
+
+// How many of the newest market ids Tier 1 inspects. Live markets are always the newest
+// ids, so walking from the tail finds them immediately; the bound stops the batch growing
+// with marketCount. Mirrors the frontend board's HISTORY_DEPTH reasoning.
+const PREDICTION_TAIL = 48;
+
+/**
+ * first_prediction, Tier 1: does the wallet hold stake on any recent market?
+ *
+ * Two round trips: marketCount, then stakeOf across the newest ids.
+ *
+ * DELIBERATELY BROADER THAN "LIVE MARKETS": every recent market is checked regardless of
+ * phase, because stakeOf is zeroed by claim(), NOT by settlement — a settled-but-unclaimed
+ * stake is still proof of a bet, and catching it here saves an expensive Tier 2 scan. That
+ * also means getMarket is never called: the phase is irrelevant to the question.
+ *
+ * Only the NEW factory is read. The old one is draining and its markets were empty-book,
+ * so a live stake there is not a realistic positive — but bets placed on it before the
+ * 2026-07-22 redeploy are real, which is why Tier 2 scans both.
+ */
+export async function firstPredictionTier1(address) {
+  const factory = predictionFactoryRead();
+  const checkedThroughBlock = await headBlock();
+
+  const [countRes] = await batchRead([{ contract: factory, fn: "marketCount" }]);
+  if (!countRes.ok) return { completed: false, reliable: false, checkedThroughBlock };
+
+  const marketCount = countRes.value.toNumber();
+  if (marketCount === 0) {
+    // No markets have ever existed, so nobody can have bet. Reliable, and a true negative.
+    return { completed: false, reliable: true, checkedThroughBlock };
+  }
+
+  const newest = marketCount - 1;
+  const oldest = Math.max(0, newest - PREDICTION_TAIL + 1);
+  const calls = [];
+  for (let id = newest; id >= oldest; id--) {
+    calls.push({ contract: factory, fn: "stakeOf", args: [id, address] });
+  }
+
+  const results = await batchRead(calls);
+
+  const completed = results.some((r) => r.ok && (r.value.upStake.gt(0) || r.value.downStake.gt(0)));
+  // `reliable` asks only whether the READS LANDED — not whether the tail covered every
+  // market. The bound is irrelevant here because a Tier 1 negative never proves anything
+  // in the first place; markets older than the tail are exactly what Tier 2 is for.
+  // (Treating a short tail as "unreliable" would suppress the escalation and leave this
+  // quest permanently unanswerable — which is precisely what it did before this comment.)
+  const reliable = completed || results.every((r) => r.ok);
+
+  return { completed, reliable, checkedThroughBlock };
+}
+
+/**
+ * first_prediction, Tier 2: has this wallet EVER bet? `better` is the 2nd indexed topic.
+ *
+ * BOTH FACTORIES. The 24h factory was superseded on 2026-07-22 but bets placed on it are
+ * real bets, and it is immutable — a user who bet there must not be told they never bet.
+ * The live factory is scanned first because recent activity is likelier; if the budget
+ * runs out before the old one is reached, the result is `exhausted` (indeterminate), never
+ * a false.
+ */
+export async function firstPredictionTier2(address, { head }) {
+  const factory = predictionFactoryRead();
+  const oldFactory = predictionFactoryOldRead();
+
+  return scanForEvent(
+    [
+      {
+        contract: factory,
+        filter: factory.filters.BetPlaced(null, address),
+        floor: deployBlocks.predictionFactory(),
+        address: factory.address,
+        label: "prediction factory (8h, live)",
+      },
+      {
+        contract: oldFactory,
+        filter: oldFactory.filters.BetPlaced(null, address),
+        floor: deployBlocks.predictionFactoryOld(),
+        address: oldFactory.address,
+        label: "prediction factory (24h, draining)",
+      },
+    ],
+    { head },
+  );
+}
+
+/**
+ * provide_liquidity, Tier 1: does the wallet hold LP shares right now? One read.
+ *
+ * KNOWN HOLE, ACCEPTED: shares are transferable ERC-20, so a non-zero balance proves
+ * custody, not deposit — someone could be credited for shares they were sent. The reverse
+ * hole (deposited, then redeemed) is the common one and is what Tier 2 exists for. The
+ * trade is deliberate: this is one call and catches the overwhelming majority of real LPs.
+ */
+export async function provideLiquidityTier1(address) {
+  const pool = liquidityPoolRead();
+  const checkedThroughBlock = await headBlock();
+
+  const [res] = await batchRead([{ contract: pool, fn: "balanceOf", args: [address] }]);
+  if (!res.ok) return { completed: false, reliable: false, checkedThroughBlock };
+
+  return { completed: res.value.gt(0), reliable: true, checkedThroughBlock };
+}
+
+/**
+ * provide_liquidity, Tier 2: has this wallet EVER deposited?
+ *
+ * Filtered on `sender` — the account that PAID the assets — not on `owner`, which merely
+ * received the shares. Depositing on someone else's behalf credits the payer, which is the
+ * honest reading of "provide liquidity". Both are indexed, so switching is a one-line
+ * change if that call ever goes the other way.
+ */
+export async function provideLiquidityTier2(address, { head }) {
+  const pool = liquidityPoolRead();
+  return scanForEvent(
+    [
+      {
+        contract: pool,
+        filter: pool.filters.Deposit(address),
+        floor: deployBlocks.liquidityPool(),
+        address: pool.address,
+        label: "LiquidityPool",
+      },
+    ],
+    { head },
+  );
 }

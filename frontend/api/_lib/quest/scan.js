@@ -17,7 +17,7 @@
 //  3. THE BUDGET IS A CEILING, NOT A TARGET. The function runs under a 30s platform
 //     limit; it stops at 12 chunks or ~15s, whichever comes first, and says so.
 //
-// CHUNK SIZE IS 50,000 BLOCKS — safe, but far slower than the frontend's note implies.
+// CHUNK SIZE IS 10,000 BLOCKS, chosen on measurement rather than on the frontend's note.
 // `src/lib/prediction/participation.js` records 50k ranges returning in ~0.7s. MEASURED
 // DIRECTLY on 2026-07-25 against this endpoint, they do not:
 //
@@ -28,10 +28,13 @@
 //     50k   topic-filtered  12.2s / 15.8s
 //
 // Cost is LINEAR IN SPAN — ~0.3ms/block — and essentially independent of the filter or the
-// number of logs returned. So the real throughput is ~3,300 blocks/sec, and the binding
-// constraint is TIME_BUDGET_MS, not MAX_CHUNKS: one invocation covers ~50k blocks (~15s),
-// i.e. about 4.5 hours of chain history at ~0.32s/block. MAX_CHUNKS is a backstop that
-// will not normally be reached.
+// number of logs returned. Throughput is therefore ~3,300 blocks/sec whatever the chunk
+// size, which is exactly why 10k beats 50k here: it buys the SAME coverage in ~3.5s steps
+// instead of ~15s ones, so the budget cutoff wastes a third of a chunk rather than most of
+// one, and a lost chunk costs a tenth as much coverage.
+//
+// TIME_BUDGET_MS binds long before MAX_CHUNKS: one invocation covers ~50k blocks (~15s),
+// about 4.5 hours of chain history at ~0.32s/block. MAX_CHUNKS is a backstop.
 //
 // NOTE ON REACH — READ BEFORE RELYING ON A NEGATIVE. The perps contracts sit ~10M blocks
 // below head; a full walk there is ~3,000 seconds of getLogs, two orders of magnitude past
@@ -44,12 +47,22 @@
 import { hasCodeAt } from "./chain.js";
 import { withRetry } from "../chain/withRetry.js";
 
-/** 50k blocks per eth_getLogs call — measured safe on this RPC. See the note above. */
-export const CHUNK_BLOCKS = 50_000;
-/** Chunks per verification. 12 × 50k = 600k blocks ≈ 41h of history. */
+/** 10k blocks per eth_getLogs call — ~3.5s each on this RPC. See the note above. */
+export const CHUNK_BLOCKS = 10_000;
+/** Backstop only; the time budget is what actually stops a scan. */
 export const MAX_CHUNKS = 12;
-/** Wall-clock ceiling, well under the function's 30s maxDuration. */
-export const TIME_BUDGET_MS = 15_000;
+/**
+ * Wall-clock ceiling. THE REAL RUNTIME OVERRUNS THIS by up to one chunk: the budget is
+ * checked before a chunk starts, and a chunk already in flight is never abandoned (an
+ * abandoned chunk is wasted work AND lost coverage). So the worst case is roughly
+ * budget + one slow chunk + retry backoff.
+ *
+ * Measured at a 15s budget, real scans finished at 16-19s — fine on its own, but the
+ * function's ceiling is 30s and a chunk can take ~15s when the RPC is slow, so 15s left
+ * no margin against a platform kill (which surfaces as a raw 504, strictly worse than an
+ * honest indeterminate). 10s keeps the worst case near ~25s.
+ */
+export const TIME_BUDGET_MS = 10_000;
 
 /**
  * Walk one or more (contract, filter) sources backward from `head`.
