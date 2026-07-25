@@ -4,7 +4,7 @@ import { readProvider } from "../../lib/contracts.js";
 import { batchReadChunked, multicall3 } from "../../lib/prediction/multicall.js";
 import { scanParticipation } from "../../lib/prediction/participation.js";
 import { PREDICTION_FACTORY_ABI, AGGREGATOR_V3_ABI } from "../../lib/prediction/predictionAbi.js";
-import { PREDICTION_FACTORY_ADDRESS, PHASE } from "../../lib/prediction/predictionConfig.js";
+import { requirePredictionFactoryAddress, PHASE } from "../../lib/prediction/predictionConfig.js";
 
 const POLL_MS = 12_000;
 
@@ -13,8 +13,10 @@ const POLL_MS = 12_000;
 // SETTLED cards. Bounded so the batch cannot grow without limit as marketCount rises.
 const HISTORY_DEPTH = 24;
 
+// Throws when the factory address is unconfigured — called inside load()'s try, so the
+// board surfaces the message via `error` instead of dying in an unhandled rejection.
 function factory() {
-  return new ethers.Contract(PREDICTION_FACTORY_ADDRESS, PREDICTION_FACTORY_ABI, readProvider());
+  return new ethers.Contract(requirePredictionFactoryAddress(), PREDICTION_FACTORY_ABI, readProvider());
 }
 
 /**
@@ -40,8 +42,6 @@ export function usePredictionBoard(account) {
   const alive = useRef(true);
 
   const load = useCallback(async () => {
-    const f = factory();
-    const mc = multicall3();
     // Reset the participation cache when the connected wallet changes (or disconnects), so
     // one account's history can never leak into another's board.
     if (partRef.current.account !== (account || null)) {
@@ -49,6 +49,10 @@ export function usePredictionBoard(account) {
       setEverBet(null);
     }
     try {
+      // Inside the try on purpose: factory() throws on unconfigured env, and that message
+      // is exactly what the user needs to see in the board's error slot.
+      const f = factory();
+      const mc = multicall3();
       // ---- pass 1: sizes + chain clock -----------------------------------
       const [countRes, assetCountRes, tsRes] = await batchReadChunked([
         { contract: f, fn: "marketCount" },
