@@ -137,20 +137,24 @@ batched redeploy + full-surface on-chain smoke.
   threshold, decaying to 0 below ~5% equity and 0 in the bad-debt case. For mainnet
   consider a protocol-funded liquidation incentive or a reserved slice of the buffer so
   late liquidations stay profitable.
-- **CI is permanently red on EIP-170 — resolve before the next contract change.** Not
-  urgent and not a broken product: `forge build --sizes` exits 1 because eight *test
-  harnesses* exceed the 24,576-byte runtime cap (24,762–24,858: `TwoStepHarness`,
-  `TriggerExitsHarness`, `PositionManagerHarness`, `PositionIncreaseHarness`,
-  `PartialCloseHarness`, `TriggerEntriesHarness`, `GovHarness`, `RegistryHarness`). All
-  eight live in `test/` and are never broadcast, so EIP-170 never applies where it would
-  bite. **No `src/` contract is over the cap** and `forge test` passes in full (306 tests,
-  13 suites) — CI only looks broken because the size gate runs before the test step and
-  kills the job first. Two reasons it still needs fixing: a permanently-red `main` masks
-  the next *real* CI failure, and `PositionManager` is at 23,919 bytes — **+657 of margin,
-  ~2.7%** — so the next feature that grows it turns this from a red badge into an actual
-  deploy blocker. `refactor/eip170-library-extraction` is the apparent fix (library
-  extraction is the standard way under the cap). Separate concern from any frontend work;
-  pick it up when Solidity is next touched.
+- ~~**CI is permanently red on EIP-170.**~~ **Fixed** — the size gate was scoped to
+  deployable contracts (`forge build --sizes --skip test --skip script`). The eight
+  oversized contracts were all *test harnesses* (`TwoStepHarness`, `TriggerExitsHarness`,
+  `PositionManagerHarness`, `PositionIncreaseHarness`, `PartialCloseHarness`,
+  `TriggerEntriesHarness`, `GovHarness`, `RegistryHarness`, 24,762–24,858 bytes). They
+  live in `test/` and are never broadcast, so EIP-170 — a *deployment* limit — could
+  never apply to them; the gate was failing on code the rule does not govern. No `src/`
+  contract was ever over the cap. The build step still compiles tests, so a broken
+  harness is still caught, and `forge test` passes in full (306 tests, 13 suites).
+- **`PositionManager` is at 23,919 bytes — +657 of margin, ~2.7% — and that is the real
+  constraint.** This is a *separate* issue from the CI red above, and fixing the gate did
+  not shrink it by a byte; it made the gate able to catch it. `optimizer_runs = 1` is
+  already spent on size. The next feature that grows `PositionManager` by ~657 bytes turns
+  this into a genuine deploy blocker on chain 4441. `refactor/eip170-library-extraction`
+  is the standard remedy (move logic into `library` contracts, which link as `DELEGATECALL`
+  and do not count toward the caller's runtime size). This touches the money path, so per
+  CLAUDE.md it needs a written plan and a go-ahead before implementation — do it when
+  Solidity is next touched, and check the margin before adding to that contract.
 
 ## PHASE 3 — mainnet hardening  (deferred, not started)
 Governance + pause (params are currently immutable; `Ownable` is scoped to markets only),
