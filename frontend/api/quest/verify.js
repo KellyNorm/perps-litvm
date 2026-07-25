@@ -24,7 +24,7 @@
 // Response: { address, quest, completed, status, source, checkedThroughBlock, asOf }
 
 import { createLimiter, memoryDriver } from "../_lib/rateLimit.js";
-import { cacheKey, createCache, nullCacheDriver, utcDay } from "../_lib/quest/cache.js";
+import { cacheKey, createCache, memoryCacheDriver, nullCacheDriver, utcDay } from "../_lib/quest/cache.js";
 import { ConfigError, chainId } from "../_lib/quest/chain.js";
 import { QUEST_IDS, QUEST_KIND, SOURCE, STATUS, getQuest } from "../_lib/quest/quests.js";
 import { clientKey } from "../_lib/request.js";
@@ -60,13 +60,25 @@ function getLimiter() {
   return limiter;
 }
 
-// Likewise module-scoped: a warm instance reuses whatever the cache remembers. Stage 1
-// wires the null driver, so every request is a live check; the point of building it in
-// now is that the ORDER (cache before chain) is real and tested from the start.
+// Likewise module-scoped: a warm instance reuses whatever the cache remembers, which is
+// the only reason an in-memory driver caches anything at all.
+//
+// QUEST_CACHE selects the driver: "memory" (default) or "none". "none" is for debugging a
+// wallet whose cached completion you want to bypass — and it is safe to leave on, because
+// the cache only ever holds proven completions, so disabling it costs latency and nothing
+// else. A durable Supabase driver joins the switch in phase 2.
 let cache;
 function getCache() {
-  if (!cache) cache = createCache(nullCacheDriver());
+  if (!cache) {
+    const driver = (process.env.QUEST_CACHE || "memory").trim() === "none" ? nullCacheDriver() : memoryCacheDriver();
+    cache = createCache(driver);
+  }
   return cache;
+}
+
+/** Test seam: drop the cached driver so the next request rebuilds it from current env. */
+export function _resetCache() {
+  cache = null;
 }
 
 /**

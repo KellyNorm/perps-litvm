@@ -17,7 +17,7 @@ process.env.QUEST_RPH = "100";
 // handler never reaches the chain on any tested path.
 delete process.env.QUEST_POSITION_MANAGER_ADDRESS;
 
-const { default: handler, normalizeQuestBody, verifyQuest } = await import("../../api/quest/verify.js");
+const { default: handler, normalizeQuestBody, verifyQuest, _resetCache } = await import("../../api/quest/verify.js");
 const { QUESTS, STATUS, SOURCE, QUEST_KIND } = await import("../../api/_lib/quest/quests.js");
 const { ConfigError } = await import("../../api/_lib/quest/chain.js");
 
@@ -43,6 +43,9 @@ function registerQuest(id, definition) {
 afterEach(() => {
   for (const id of registered) delete QUESTS[id];
   registered.clear();
+  // The cache is module-scoped and survives between requests by design; drop it so one
+  // test's stored completion cannot answer another's.
+  _resetCache();
 });
 
 let ipCounter = 0;
@@ -212,6 +215,70 @@ describe("verdicts", () => {
     assert.equal(res.statusCode, 503);
     assert.equal(res.body.status, STATUS.UNAVAILABLE);
     assert.equal(res.body.reason, "rpc_unavailable");
+  });
+});
+
+describe("cache-first", () => {
+  test("a proven completion is served from cache without re-checking the chain", async () => {
+    let checks = 0;
+    const quest = registerQuest("t_cache_hit", {
+      tier1: async () => {
+        checks++;
+        return tier1(true);
+      },
+    });
+
+    const first = await call({ body: { address: ADDRESS, quest } });
+    assert.equal(first.body.source, SOURCE.TIER1);
+
+    const second = await call({ body: { address: ADDRESS, quest } });
+    assert.equal(second.body.completed, true);
+    assert.equal(second.body.status, STATUS.CONFIRMED);
+    assert.equal(second.body.source, SOURCE.CACHE);
+    assert.equal(checks, 1, "the second request must not re-read the chain");
+  });
+
+  // The whole point of the storage-layer policy: a scan that could not prove anything is
+  // re-run next time rather than being remembered as "no".
+  test("an indeterminate is NOT cached — the next request re-checks", async () => {
+    let checks = 0;
+    const quest = registerQuest("t_cache_miss", {
+      tier1: async () => {
+        checks++;
+        return tier1(false);
+      },
+    });
+
+    await call({ body: { address: ADDRESS, quest } });
+    const second = await call({ body: { address: ADDRESS, quest } });
+
+    assert.equal(second.body.status, STATUS.INDETERMINATE);
+    assert.equal(second.body.source, SOURCE.TIER1, "must not be served from cache");
+    assert.equal(checks, 2);
+  });
+
+  test("one wallet's completion never answers for another", async () => {
+    const quest = registerQuest("t_cache_scope", {
+      tier1: async (address) => tier1(address === ADDRESS),
+    });
+
+    await call({ body: { address: ADDRESS, quest } });
+    const other = await call({
+      body: { address: "0x0000000000000000000000000000000000000001", quest },
+    });
+
+    assert.equal(other.body.completed, false);
+    assert.equal(other.body.status, STATUS.INDETERMINATE);
+  });
+
+  test("a completion for one quest never answers for another", async () => {
+    const done = registerQuest("t_cache_q1", { tier1: async () => tier1(true) });
+    const notDone = registerQuest("t_cache_q2", { tier1: async () => tier1(false) });
+
+    await call({ body: { address: ADDRESS, quest: done } });
+    const res = await call({ body: { address: ADDRESS, quest: notDone } });
+
+    assert.equal(res.body.completed, false);
   });
 });
 

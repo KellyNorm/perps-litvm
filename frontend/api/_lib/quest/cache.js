@@ -32,6 +32,55 @@ export function nullCacheDriver() {
   };
 }
 
+// Bounds memory for the in-process driver. A confirmed completion is a small object and
+// entries are only ever added on proof, so this is far above any plausible warm-instance
+// working set; it exists so a long-lived instance cannot grow without limit.
+const MAX_ENTRIES = 50_000;
+
+/**
+ * In-process cache. Entries survive only for the life of a warm lambda instance, and
+ * instances are neither shared nor durable — so this is a LATENCY optimisation, not a
+ * source of truth. Two things follow, and both are fine:
+ *   - a cold start re-verifies from chain (correct, just slower);
+ *   - two instances can hold the same entry (identical value — it is a proven completion).
+ *
+ * What it must never do is remember a negative, and it cannot: createCache() filters
+ * writes before they reach any driver.
+ *
+ * DURABILITY IS PHASE 2 (Supabase). The driver interface exists so that is a new file
+ * rather than a rewrite; the service-role key for it is SERVER-ONLY and must never be
+ * given a VITE_ prefix, or Vite would inline it into the browser bundle.
+ */
+export function memoryCacheDriver() {
+  const entries = new Map();
+
+  return {
+    async get(key) {
+      return entries.get(key) ?? null;
+    },
+
+    async set(key, value) {
+      // Re-inserting moves the key to the end of Map iteration order, which is what makes
+      // the eviction below oldest-first.
+      entries.delete(key);
+      entries.set(key, value);
+
+      if (entries.size > MAX_ENTRIES) {
+        const overflow = entries.size - MAX_ENTRIES;
+        let dropped = 0;
+        for (const k of entries.keys()) {
+          entries.delete(k);
+          if (++dropped >= overflow) break;
+        }
+      }
+    },
+
+    // Test seams. `_keys` is insertion-ordered, which is also eviction order.
+    _size: () => entries.size,
+    _keys: () => [...entries.keys()],
+  };
+}
+
 /** UTC day stamp (YYYY-MM-DD) for daily quests' cache keys. */
 export function utcDay(now = new Date()) {
   return now.toISOString().slice(0, 10);

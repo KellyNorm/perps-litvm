@@ -13,8 +13,11 @@
 
 import { ethers } from "ethers";
 
+import { withRetry } from "../chain/withRetry.js";
+import { LIQUIDITY_POOL_ABI } from "./abi/liquidityPool.js";
 import { MULTICALL3_ABI, MULTICALL3_ADDRESS } from "./abi/multicall3.js";
 import { POSITION_MANAGER_ABI } from "./abi/positionManager.js";
+import { PREDICTION_FACTORY_ABI } from "./abi/predictionFactory.js";
 
 /** Server misconfiguration (missing/invalid env), as distinct from an RPC failure. */
 export class ConfigError extends Error {
@@ -57,6 +60,53 @@ export function chainId() {
 
 export const addresses = {
   positionManager: () => requireAddress("QUEST_POSITION_MANAGER_ADDRESS"),
+  liquidityPool: () => requireAddress("QUEST_LIQUIDITY_POOL_ADDRESS"),
+  predictionFactory: () => requireAddress("QUEST_PREDICTION_FACTORY_ADDRESS"),
+  // The superseded 24h factory. Bets placed there are still real bets, so first_prediction
+  // scans BOTH — a user who bet before the 2026-07-22 redeploy must not be told they
+  // never bet. It is immutable and draining; it is never written to and never bet on again.
+  predictionFactoryOld: () => requireAddress("QUEST_PREDICTION_FACTORY_OLD_ADDRESS"),
+};
+
+// SCAN FLOORS — the block each contract was deployed in. A backward log scan stops here:
+// below it the contract does not exist, so there is nothing to find.
+//
+// RECOVERED 2026-07-25 by eth_getCode binary search against the live RPC, because NO
+// deploy record contains them (`docs/prediction-deploy.md` logs the deployer nonce only).
+// Each was corroborated: no code at block-1, code at the block, and the contract's first
+// log in the deploy block itself.
+//
+//   PositionManager / LiquidityPool  23302630  (2026-06-26T16:56:09Z — same block, one
+//                                               deploy run; matches the stack redeploy)
+//   prediction factory (8h, live)    32222320  (2026-07-22T15:14:00Z)
+//   prediction factory (24h, old)    30665562  (2026-07-18T02:45:20Z)
+//
+// A FLOOR IS COUPLED TO ITS ADDRESS. Override the address without the floor and the scan
+// walks the wrong range — too low merely wastes time, but TOO HIGH would skip the very
+// events it is looking for and turn a real completion into a proven-looking false. The
+// scanner therefore verifies the floor before it reports any negative (see scan.js).
+const DEFAULT_DEPLOY_BLOCKS = {
+  QUEST_POSITION_MANAGER_DEPLOY_BLOCK: 23_302_630,
+  QUEST_LIQUIDITY_POOL_DEPLOY_BLOCK: 23_302_630,
+  QUEST_PREDICTION_FACTORY_DEPLOY_BLOCK: 32_222_320,
+  QUEST_PREDICTION_FACTORY_OLD_DEPLOY_BLOCK: 30_665_562,
+};
+
+function deployBlock(varName) {
+  const raw = process.env[varName];
+  const n = Number.parseInt(raw ?? "", 10);
+  if (Number.isFinite(n) && n >= 0) return n;
+  if (raw != null && String(raw).trim() !== "") {
+    throw new ConfigError(`${varName} is set but is not a block number: ${JSON.stringify(raw)}`);
+  }
+  return DEFAULT_DEPLOY_BLOCKS[varName];
+}
+
+export const deployBlocks = {
+  positionManager: () => deployBlock("QUEST_POSITION_MANAGER_DEPLOY_BLOCK"),
+  liquidityPool: () => deployBlock("QUEST_LIQUIDITY_POOL_DEPLOY_BLOCK"),
+  predictionFactory: () => deployBlock("QUEST_PREDICTION_FACTORY_DEPLOY_BLOCK"),
+  predictionFactoryOld: () => deployBlock("QUEST_PREDICTION_FACTORY_OLD_DEPLOY_BLOCK"),
 };
 
 // StaticJsonRpcProvider pinned to an explicit network, for the reason documented in
@@ -85,6 +135,24 @@ export function _resetProvider() {
 
 export function positionManagerRead() {
   return new ethers.Contract(addresses.positionManager(), POSITION_MANAGER_ABI, readProvider());
+}
+
+export function liquidityPoolRead() {
+  return new ethers.Contract(addresses.liquidityPool(), LIQUIDITY_POOL_ABI, readProvider());
+}
+
+export function predictionFactoryRead() {
+  return new ethers.Contract(addresses.predictionFactory(), PREDICTION_FACTORY_ABI, readProvider());
+}
+
+export function predictionFactoryOldRead() {
+  return new ethers.Contract(addresses.predictionFactoryOld(), PREDICTION_FACTORY_ABI, readProvider());
+}
+
+/** Does `address` have contract code at `block`? Used to validate a scan floor. */
+export async function hasCodeAt(address, block) {
+  const code = await withRetry(() => readProvider().getCode(address, block));
+  return code != null && code !== "0x";
 }
 
 export function multicall3() {
@@ -128,7 +196,9 @@ export async function batchRead(calls) {
     callData: contract.interface.encodeFunctionData(fn, args),
   }));
 
-  const results = await multicall3().callStatic.aggregate3(encoded);
+  // Retried: a dropped aggregate3 is transport noise on this RPC, and losing the whole
+  // batch to one blip would surface as an unnecessary indeterminate.
+  const results = await withRetry(() => multicall3().callStatic.aggregate3(encoded));
 
   return results.map((res, i) => {
     if (!res.success) return { ok: false, value: null };
@@ -145,5 +215,5 @@ export async function batchRead(calls) {
 }
 
 export async function headBlock() {
-  return readProvider().getBlockNumber();
+  return withRetry(() => readProvider().getBlockNumber());
 }

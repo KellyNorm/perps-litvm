@@ -7,7 +7,14 @@
 import assert from "node:assert/strict";
 import test, { after, before, describe } from "node:test";
 
-import { cacheKey, createCache, isCacheable, nullCacheDriver, utcDay } from "../../api/_lib/quest/cache.js";
+import {
+  cacheKey,
+  createCache,
+  isCacheable,
+  memoryCacheDriver,
+  nullCacheDriver,
+  utcDay,
+} from "../../api/_lib/quest/cache.js";
 import { STATUS } from "../../api/_lib/quest/quests.js";
 
 const ADDRESS = "0xE9Dd9bFf0ad5254673daaA77397e84Fec2312292";
@@ -139,5 +146,60 @@ describe("null driver", () => {
     const cache = createCache(nullCacheDriver());
     await cache.set("k", confirmedTrue);
     assert.equal(await cache.get("k"), null);
+  });
+});
+
+describe("memory driver", () => {
+  test("round-trips a value within one instance", async () => {
+    const driver = memoryCacheDriver();
+    await driver.set("k", confirmedTrue);
+    assert.deepEqual(await driver.get("k"), confirmedTrue);
+  });
+
+  test("misses on an unknown key rather than returning undefined", async () => {
+    assert.equal(await memoryCacheDriver().get("nope"), null);
+  });
+
+  test("keys are independent", async () => {
+    const driver = memoryCacheDriver();
+    await driver.set("a", { completed: true, status: STATUS.CONFIRMED, tag: "a" });
+    await driver.set("b", { completed: true, status: STATUS.CONFIRMED, tag: "b" });
+
+    assert.equal((await driver.get("a")).tag, "a");
+    assert.equal((await driver.get("b")).tag, "b");
+  });
+
+  test("a rewrite replaces rather than duplicates", async () => {
+    const driver = memoryCacheDriver();
+    await driver.set("k", { completed: true, status: STATUS.CONFIRMED, v: 1 });
+    await driver.set("k", { completed: true, status: STATUS.CONFIRMED, v: 2 });
+
+    assert.equal((await driver.get("k")).v, 2);
+    assert.equal(driver._size(), 1);
+  });
+
+  // Behind createCache, the memory driver is still subject to the write policy — the
+  // driver is storage, the policy is not its business to relax.
+  test("still cannot be made to store a negative", async () => {
+    const driver = memoryCacheDriver();
+    const cache = createCache(driver);
+
+    await cache.set("k", indeterminate);
+    await cache.set("k2", confirmedFalse);
+
+    assert.equal(driver._size(), 0);
+  });
+
+  // Eviction is oldest-first, and "oldest" is Map insertion order. Writing past the 50k
+  // cap here would be slow, so this pins the mechanism the eviction relies on: a rewrite
+  // must move the key to the newest position, or a frequently-refreshed entry would be
+  // evicted as though it were stale.
+  test("a rewrite moves a key to the newest eviction position", async () => {
+    const driver = memoryCacheDriver();
+    await driver.set("old", confirmedTrue);
+    await driver.set("new", confirmedTrue);
+    await driver.set("old", confirmedTrue);
+
+    assert.deepEqual(driver._keys(), ["new", "old"]);
   });
 });
