@@ -159,7 +159,10 @@
   border-bottom: 1px solid var(--tachy-line);
   background: rgba(255, 255, 255, 0.02);
 }
+/* Takes the slack, so the header controls sit hard right without each needing its own
+   `margin-left: auto` — two auto margins would split the gap between them instead. */
 .tachy-panel-id {
+  flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -173,8 +176,31 @@
   font-size: 10.5px;
   color: var(--tachy-muted);
 }
+/* Text, not an icon, and deliberately quiet: clearing is destructive-ish (the thread is
+   not persisted, so it is gone) and should never be the loudest thing in the header. */
+.tachy-clear {
+  flex: none;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--tachy-muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--tachy-line);
+  transition: color 0.16s ease;
+}
+.tachy-clear:hover:not(:disabled) {
+  color: var(--tachy-text);
+}
+.tachy-clear:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 .tachy-x {
-  margin-left: auto;
   flex: none;
   width: 28px;
   height: 28px;
@@ -397,6 +423,7 @@
 }
 .tachy-send:focus-visible,
 .tachy-chip:focus-visible,
+.tachy-clear:focus-visible,
 .tachy-x:focus-visible {
   outline: 2px solid var(--tachy-accent);
   outline-offset: 2px;

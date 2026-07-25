@@ -14,7 +14,7 @@ const CHIPS = {
   predictions: ["How do prediction markets work?", "What's a parimutuel pool?", "Perps vs predictions?"],
 };
 
-export default function TachyPanel({ view, messages, pending, onSend, onClose }) {
+export default function TachyPanel({ view, messages, pending, onSend, onClear, onClose }) {
   const [draft, setDraft] = useState("");
   const inputRef = useRef(null);
   const threadRef = useRef(null);
@@ -61,6 +61,23 @@ export default function TachyPanel({ view, messages, pending, onSend, onClose })
           <span className="tachy-panel-name">Tachy</span>
           <span className="tachy-panel-role">Explains things · not financial advice</span>
         </div>
+        {/* Only offered once there is something to clear, and never mid-request: wiping
+            the thread while a reply is in flight would leave the answer landing in an
+            empty panel with no question above it. */}
+        {messages.length > 0 && (
+          <button
+            type="button"
+            className="tachy-clear"
+            onClick={() => {
+              onClear();
+              inputRef.current?.focus();
+            }}
+            disabled={pending}
+            aria-label="Clear this conversation"
+          >
+            Clear
+          </button>
+        )}
         <button type="button" className="tachy-x" onClick={onClose} aria-label="Close Tachy">
           ×
         </button>

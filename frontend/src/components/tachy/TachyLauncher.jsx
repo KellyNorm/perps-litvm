@@ -24,7 +24,7 @@ import "../../styles/tachy.css";
 
 export default function TachyLauncher({ view = "perps" }) {
   const [open, setOpen] = useState(false);
-  const { messages, pending, send } = useTachyChat(view);
+  const { messages, pending, send, reset } = useTachyChat(view);
   const fabRef = useRef(null);
 
   // Escape closes, and focus goes back to the button that opened it — otherwise focus is
@@ -49,6 +49,7 @@ export default function TachyLauncher({ view = "perps" }) {
           messages={messages}
           pending={pending}
           onSend={send}
+          onClear={reset}
           onClose={() => {
             setOpen(false);
             fabRef.current?.focus();
