@@ -29,8 +29,11 @@ export const TACHY_RESPONSE_SCHEMA = {
     },
     clarificationQuestion: {
       type: "string",
+      // nullable so the model can emit the `string | null` the system prompt specifies.
+      // Without it the schema and the prompt disagree, and the model has to pick one.
+      nullable: true,
       description:
-        "A single short follow-up question, only if the request was ambiguous. Empty string otherwise.",
+        "A single short follow-up question, only if the request was genuinely ambiguous. Null otherwise.",
     },
     language: {
       type: "string",

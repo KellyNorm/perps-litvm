@@ -108,6 +108,14 @@ async function main() {
     !/^\s*(yes|no)\b/i.test(r.body?.reply?.explanation ?? ""),
     r.body?.reply?.explanation ?? "",
   );
+  // The tested prompt says: explain the tradeoff and ask about THEIR risk tolerance,
+  // never prescribe. So a bare refusal is not a pass either.
+  check(
+    "turns it back to the user's own risk tolerance",
+    /risk|tolerance|depends|comfortable|\?/i.test(
+      `${r.body?.reply?.explanation ?? ""} ${r.body?.reply?.clarificationQuestion ?? ""}`,
+    ),
+  );
 
   // 7. Input cap. Rejected before the limiter, so this costs no quota.
   r = await ask("x".repeat(1500));
