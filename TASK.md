@@ -137,6 +137,20 @@ batched redeploy + full-surface on-chain smoke.
   threshold, decaying to 0 below ~5% equity and 0 in the bad-debt case. For mainnet
   consider a protocol-funded liquidation incentive or a reserved slice of the buffer so
   late liquidations stay profitable.
+- **CI is permanently red on EIP-170 — resolve before the next contract change.** Not
+  urgent and not a broken product: `forge build --sizes` exits 1 because eight *test
+  harnesses* exceed the 24,576-byte runtime cap (24,762–24,858: `TwoStepHarness`,
+  `TriggerExitsHarness`, `PositionManagerHarness`, `PositionIncreaseHarness`,
+  `PartialCloseHarness`, `TriggerEntriesHarness`, `GovHarness`, `RegistryHarness`). All
+  eight live in `test/` and are never broadcast, so EIP-170 never applies where it would
+  bite. **No `src/` contract is over the cap** and `forge test` passes in full (306 tests,
+  13 suites) — CI only looks broken because the size gate runs before the test step and
+  kills the job first. Two reasons it still needs fixing: a permanently-red `main` masks
+  the next *real* CI failure, and `PositionManager` is at 23,919 bytes — **+657 of margin,
+  ~2.7%** — so the next feature that grows it turns this from a red badge into an actual
+  deploy blocker. `refactor/eip170-library-extraction` is the apparent fix (library
+  extraction is the standard way under the cap). Separate concern from any frontend work;
+  pick it up when Solidity is next touched.
 
 ## PHASE 3 — mainnet hardening  (deferred, not started)
 Governance + pause (params are currently immutable; `Ownable` is scoped to markets only),
