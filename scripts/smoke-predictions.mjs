@@ -26,7 +26,9 @@ import { ethers } from "ethers";
 const RPC = process.env.LITVM_RPC_URL || "https://liteforge.rpc.caldera.xyz/infra-partner-http";
 const PK = process.env.DEPLOYER_PRIVATE_KEY;
 const MUSD = process.env.MUSD_ADDRESS || "0x4AedaB95d41A31f891EE12d13CD77102705e2dEF";
-const FACTORY = process.env.PREDICTION_FACTORY_ADDRESS || "0x6338985C7f689C3e1959bfe1a8bb36E44849EA40";
+// Defaults to the LIVE 8h factory. NOT `0x6338985C…` — that is the draining 24h factory,
+// superseded 2026-07-22; smoking it would pass against a contract nobody uses.
+const FACTORY = process.env.PREDICTION_FACTORY_ADDRESS || "0x7dd9e01fD4f96F9b1F875351eaccb5cA6C84c512";
 
 // Fast-market windows (seconds). Generous enough that 2 bet txs land before lock and the
 // TWAP clears its coverage gate (span >= 60% of the settle window, >= 3 samples, >= 10s apart).
