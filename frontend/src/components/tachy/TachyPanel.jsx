@@ -18,6 +18,7 @@ export default function TachyPanel({ view, messages, pending, onSend, onClear, o
   const [draft, setDraft] = useState("");
   const inputRef = useRef(null);
   const threadRef = useRef(null);
+  const refocus = useRef(false);
 
   // Focus the input on open. Tachy is opened in order to type; making that the first
   // thing that works saves a click every single time.
@@ -31,6 +32,15 @@ export default function TachyPanel({ view, messages, pending, onSend, onClear, o
     const el = threadRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, pending]);
+
+  // Runs after the clear has rendered, by which point the input is enabled again and the
+  // Clear button that was focused no longer exists. Without this, keyboard users are
+  // dumped on <body> and tab from the top of the document.
+  useEffect(() => {
+    if (!refocus.current) return;
+    refocus.current = false;
+    inputRef.current?.focus();
+  });
 
   const submit = (text) => {
     const value = String(text ?? "").trim();
@@ -61,18 +71,24 @@ export default function TachyPanel({ view, messages, pending, onSend, onClear, o
           <span className="tachy-panel-name">Tachy</span>
           <span className="tachy-panel-role">Explains things · not financial advice</span>
         </div>
-        {/* Only offered once there is something to clear, and never mid-request: wiping
-            the thread while a reply is in flight would leave the answer landing in an
-            empty panel with no question above it. */}
+        {/* Only offered once there is something to clear — but NOT gated on `pending`.
+            Disabling it mid-request made it dead for the 1-3s a real reply takes, and dead
+            forever if a request never resolved (askTachy has no timeout), which is the one
+            case a user most wants a way out of. The answer-landing-in-an-empty-panel worry
+            that motivated the gate is handled in `useTachyChat`: reset bumps a generation
+            and the orphaned reply drops itself. */}
         {messages.length > 0 && (
           <button
             type="button"
             className="tachy-clear"
             onClick={() => {
               onClear();
-              inputRef.current?.focus();
+              // Focus is taken by the effect below, not here: this button unmounts on the
+              // very click (the thread is now empty) and the input is still `disabled` at
+              // this point in a mid-request clear, so focus() would silently do nothing
+              // and land focus on the document body.
+              refocus.current = true;
             }}
-            disabled={pending}
             aria-label="Clear this conversation"
           >
             Clear

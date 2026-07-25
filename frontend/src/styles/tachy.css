@@ -192,12 +192,8 @@
   border: 1px solid var(--tachy-line);
   transition: color 0.16s ease;
 }
-.tachy-clear:hover:not(:disabled) {
+.tachy-clear:hover {
   color: var(--tachy-text);
-}
-.tachy-clear:disabled {
-  opacity: 0.4;
-  cursor: default;
 }
 
 .tachy-x {
