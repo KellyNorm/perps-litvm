@@ -1,6 +1,7 @@
 import { useState } from "react";
 import App from "./App.jsx";
 import PredictionApp from "./components/prediction/PredictionApp.jsx";
+import TachyLauncher from "./components/tachy/TachyLauncher.jsx";
 
 // Mode switch between the live perps app and the prediction view.
 //
@@ -18,6 +19,12 @@ import PredictionApp from "./components/prediction/PredictionApp.jsx";
 // `hidden` (display:none) rather than unmounting also means the perps RPC polls keep
 // running in the background — intentional: coming back shows fresh data, not a
 // spinner. If that background cost ever matters, pause the hooks; do NOT unmount.
+//
+// TACHY sits here for the same reason the switch does: it is app-wide, so it belongs to
+// the wrapper and not to either product. It is a sibling of both trees, never a child —
+// it reads `mode` as a prop and touches neither app's state, DOM, or styles. Mounting it
+// once out here (rather than inside each app) is also what keeps a conversation alive
+// across a mode switch. It has no money path: education chat only.
 
 export default function Shell() {
   const [mode, setMode] = useState("perps");
@@ -50,6 +57,10 @@ export default function Shell() {
           Predictions
         </button>
       </div>
+
+      {/* Floats above both products; `mode` is passed through so the endpoint can
+          ground its answers in whichever app the user is actually looking at. */}
+      <TachyLauncher view={mode} />
     </>
   );
 }

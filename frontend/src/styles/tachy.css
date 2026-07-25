@@ -1,0 +1,438 @@
+/* Tachy — the app-wide assistant.
+ *
+ * SCOPING: every selector is prefixed `.tachy-`. Nothing here targets a bare element,
+ * a `.pm-` class, or a perps class, so this file cannot restyle either product even
+ * though all three stylesheets are loaded at once. Do not add unprefixed selectors.
+ *
+ * Tokens are declared locally rather than read from `--pm-*`: those live on `.pm-root`,
+ * and Tachy is deliberately outside both product trees. Inheriting them would make the
+ * assistant's appearance depend on where it happens to be mounted.
+ *
+ * Z-INDEX 300 — above everything in both apps, including perps' `.overlay` (200). Tachy
+ * is only visible when the user asks for it, so being on top is the correct behaviour;
+ * being underneath an open trade modal would look broken. */
+
+.tachy-root {
+  --tachy-bg: #0d1424;
+  --tachy-card: #131a2e;
+  --tachy-line: rgba(255, 255, 255, 0.1);
+  --tachy-text: #f4f8ff;
+  --tachy-muted: rgba(244, 248, 255, 0.5);
+  --tachy-accent: #29a9ff;
+
+  font-family: "Space Grotesk", system-ui, sans-serif;
+}
+
+/* ------------------------------------------------------------- floating button */
+
+.tachy-fab {
+  position: fixed;
+  z-index: 300;
+  left: 22px;
+  bottom: 22px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 99px;
+  cursor: pointer;
+  background: rgba(8, 11, 20, 0.94);
+  border: 1px solid rgba(41, 169, 255, 0.32);
+  backdrop-filter: blur(10px);
+  box-shadow:
+    0 10px 30px rgba(0, 0, 0, 0.5),
+    0 0 0 1px rgba(41, 169, 255, 0.1);
+  transition:
+    transform 0.16s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+.tachy-fab:hover,
+.tachy-fab.is-open {
+  transform: translateY(-2px);
+  border-color: rgba(41, 169, 255, 0.7);
+  box-shadow:
+    0 14px 34px rgba(0, 0, 0, 0.55),
+    0 0 20px rgba(41, 169, 255, 0.28);
+}
+.tachy-fab:focus-visible {
+  outline: 2px solid var(--tachy-accent);
+  outline-offset: 3px;
+}
+
+/* The label is a hover/focus affordance, not permanent chrome — the mascot alone is the
+   resting state. Width, not display, so it can animate rather than snap. */
+.tachy-fab-hint {
+  max-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #bfe4ff;
+  opacity: 0;
+  transition:
+    max-width 0.22s ease,
+    opacity 0.18s ease,
+    padding 0.22s ease;
+}
+.tachy-fab:hover .tachy-fab-hint,
+.tachy-fab:focus-visible .tachy-fab-hint {
+  max-width: 90px;
+  padding-right: 8px;
+  opacity: 1;
+}
+/* Suppressed while the panel is open: the label is an invitation, and the invitation has
+   already been accepted. */
+.tachy-fab.is-open .tachy-fab-hint {
+  max-width: 0;
+  padding-right: 0;
+  opacity: 0;
+}
+
+/* ------------------------------------------------------------------- the face */
+
+.tachy-avatar {
+  display: inline-flex;
+  flex: none;
+  line-height: 0;
+}
+
+/* EXPRESSION HOOKS. `calm`, `alert` and `sorry` are intentionally identical in v1 — the
+   prop exists so that v2 mood-reactivity is a data change (pass a different string) plus
+   a rule here, rather than a refactor of three components. `thinking` is the exception
+   because the loading state is a shipped requirement, not a placeholder. */
+.tachy-exp-calm,
+.tachy-exp-alert,
+.tachy-exp-sorry {
+  filter: none;
+}
+.tachy-exp-thinking {
+  animation: tachy-pulse 1.4s ease-in-out infinite;
+}
+@keyframes tachy-pulse {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 0 rgba(41, 169, 255, 0));
+  }
+  50% {
+    filter: drop-shadow(0 0 8px rgba(41, 169, 255, 0.65));
+  }
+}
+
+/* ---------------------------------------------------------------------- panel */
+
+.tachy-panel {
+  position: fixed;
+  z-index: 300;
+  left: 22px;
+  bottom: 96px;
+  width: 372px;
+  max-width: calc(100vw - 44px);
+  max-height: min(70vh, 620px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  color: var(--tachy-text);
+  background: var(--tachy-bg);
+  border: 1px solid var(--tachy-line);
+  border-radius: 18px;
+  box-shadow:
+    0 24px 60px rgba(0, 0, 0, 0.62),
+    0 0 0 1px rgba(41, 169, 255, 0.1);
+  animation: tachy-rise 0.18s ease-out;
+}
+@keyframes tachy-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+}
+
+.tachy-panel-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--tachy-line);
+  background: rgba(255, 255, 255, 0.02);
+}
+.tachy-panel-id {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.tachy-panel-name {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+.tachy-panel-role {
+  font-size: 10.5px;
+  color: var(--tachy-muted);
+}
+.tachy-x {
+  margin-left: auto;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  font-size: 18px;
+  line-height: 1;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--tachy-muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--tachy-line);
+}
+.tachy-x:hover {
+  color: var(--tachy-text);
+}
+
+/* --------------------------------------------------------------------- thread */
+
+.tachy-thread {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  scrollbar-width: thin;
+}
+
+.tachy-greeting-line {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+.tachy-greeting-sub {
+  margin: 5px 0 0;
+  font-size: 12px;
+  color: var(--tachy-muted);
+}
+.tachy-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 12px;
+}
+.tachy-chip {
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 7px 12px;
+  border-radius: 99px;
+  cursor: pointer;
+  color: #bfe4ff;
+  background: rgba(41, 169, 255, 0.12);
+  border: 1px solid rgba(41, 169, 255, 0.3);
+  transition:
+    background 0.16s ease,
+    transform 0.16s ease;
+}
+.tachy-chip:hover:not(:disabled) {
+  background: rgba(41, 169, 255, 0.22);
+  transform: translateY(-1px);
+}
+.tachy-chip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.tachy-msg {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+.tachy-msg-user {
+  justify-content: flex-end;
+}
+.tachy-msg-face {
+  margin-top: 2px;
+}
+.tachy-msg-body {
+  min-width: 0;
+}
+
+.tachy-bubble {
+  margin: 0;
+  padding: 9px 12px;
+  border-radius: 13px;
+  font-size: 13px;
+  line-height: 1.5;
+  /* Long unbroken strings — a contract address, a URL, a German compound — must wrap
+     rather than force the panel to scroll sideways. */
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.tachy-msg-user .tachy-bubble {
+  max-width: 82%;
+  color: #061018;
+  font-weight: 600;
+  background: linear-gradient(135deg, #5ec8ff, #2b8feb);
+  border-bottom-right-radius: 5px;
+}
+.tachy-msg-tachy .tachy-bubble {
+  color: var(--tachy-text);
+  background: var(--tachy-card);
+  border: 1px solid var(--tachy-line);
+  border-bottom-left-radius: 5px;
+}
+/* Fallbacks — quota exhausted, provider down, rate limited. Visibly quieter, so the
+   user reads it as "not now" rather than as an answer, but still plain Tachy speech:
+   no error styling, no red, no status code anywhere on screen. */
+.tachy-msg-tachy .tachy-bubble.is-fallback {
+  color: var(--tachy-muted);
+  background: rgba(255, 255, 255, 0.03);
+  border-style: dashed;
+}
+
+/* The model's follow-up question, when it had one. Set apart from the answer because it
+   is addressed to the user rather than describing the world. */
+.tachy-clarify {
+  margin: 6px 0 0 4px;
+  font-size: 12px;
+  font-style: italic;
+  line-height: 1.45;
+  color: #bfe4ff;
+  border-left: 2px solid rgba(41, 169, 255, 0.45);
+  padding-left: 8px;
+}
+
+.tachy-thinking {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 12px;
+}
+.tachy-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--tachy-muted);
+  animation: tachy-blink 1.1s ease-in-out infinite;
+}
+.tachy-dot:nth-child(2) {
+  animation-delay: 0.16s;
+}
+.tachy-dot:nth-child(3) {
+  animation-delay: 0.32s;
+}
+@keyframes tachy-blink {
+  0%,
+  70%,
+  100% {
+    opacity: 0.28;
+  }
+  35% {
+    opacity: 1;
+  }
+}
+
+/* Visible to screen readers only — the animated dots carry no text, so the thinking
+   state would otherwise be silent. */
+.tachy-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------- composer */
+
+.tachy-composer {
+  flex: none;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--tachy-line);
+}
+.tachy-input {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  max-height: 96px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--tachy-text);
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--tachy-line);
+  outline: none;
+}
+.tachy-input:focus {
+  border-color: rgba(41, 169, 255, 0.55);
+}
+.tachy-input::placeholder {
+  color: var(--tachy-muted);
+}
+.tachy-input:disabled {
+  opacity: 0.6;
+}
+.tachy-send {
+  flex: none;
+  width: 38px;
+  height: 38px;
+  font-size: 17px;
+  font-weight: 700;
+  border-radius: 11px;
+  cursor: pointer;
+  color: #061018;
+  background: linear-gradient(135deg, #5ec8ff, #2b8feb);
+  border: none;
+  transition: opacity 0.16s ease;
+}
+.tachy-send:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.tachy-send:focus-visible,
+.tachy-chip:focus-visible,
+.tachy-x:focus-visible {
+  outline: 2px solid var(--tachy-accent);
+  outline-offset: 2px;
+}
+
+/* --------------------------------------------------------------------- mobile */
+
+@media (max-width: 560px) {
+  .tachy-fab {
+    left: 14px;
+    bottom: 14px;
+  }
+  .tachy-panel {
+    left: 10px;
+    right: 10px;
+    bottom: 84px;
+    width: auto;
+    max-width: none;
+    max-height: 66vh;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tachy-panel,
+  .tachy-exp-thinking,
+  .tachy-dot {
+    animation: none;
+  }
+  .tachy-fab,
+  .tachy-fab-hint,
+  .tachy-chip {
+    transition: none;
+  }
+  /* The dots stop moving, so they must stop being mostly transparent — otherwise the
+     only remaining cue that Tachy is working disappears. */
+  .tachy-dot {
+    opacity: 0.7;
+  }
+}
