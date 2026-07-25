@@ -68,6 +68,27 @@ describe("gemini client", () => {
     assert.equal(body.systemInstruction.parts[0].text, "be helpful");
   });
 
+  // Regression guard. Without this, Gemini 3.x spends the maxOutputTokens budget on
+  // thinking (measured 572 thoughts vs 9 answer tokens against a 600 cap) and returns
+  // truncated JSON, which the validator then rejects — surfacing as intermittent
+  // "I didn't quite catch that" for longer or non-English questions.
+  test("keeps thinking minimal so the token budget goes to the answer", async () => {
+    let body;
+    await callGemini({
+      ...BASE,
+      fetchImpl: async (_url, init) => {
+        body = JSON.parse(init.body);
+        return jsonResponse(candidate("{}"));
+      },
+    });
+
+    assert.equal(body.generationConfig.thinkingConfig.thinkingLevel, "minimal");
+    assert.ok(
+      body.generationConfig.maxOutputTokens >= 1000,
+      "budget is shared with thinking, so it needs headroom",
+    );
+  });
+
   test("maps a missing key to NOT_CONFIGURED without calling out", async () => {
     let called = false;
     const out = await callGemini({

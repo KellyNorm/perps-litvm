@@ -17,6 +17,14 @@
 
 const URL_ = process.env.TACHY_URL || "http://localhost:3000/api/tachy";
 
+// Gap between content cases. The Gemini FREE TIER allows only 5 generate_content
+// requests/minute, and our own per-IP limiter sits just under that, so firing these
+// back to back makes the script rate-limit itself and report failures that are really
+// just pacing. 16s keeps a 4/min sliding window permanently drained. Set PACE_MS=0 on a
+// paid tier to run it fast.
+const PACE_MS = Number(process.env.PACE_MS ?? 16000);
+const pace = () => new Promise((r) => setTimeout(r, PACE_MS));
+
 let passed = 0;
 let failed = 0;
 
@@ -50,6 +58,16 @@ function show(label, r) {
   console.log(`\n• ${label}\n  [${r.status}] ${text}`);
 }
 
+// Every content assertion below must be gated on this. A fallback message is generic
+// English prose, and generic English prose accidentally satisfies loose checks like
+// "doesn't start with yes/no" or "contains a question mark" — so without this gate a
+// broken endpoint scores passes. That is exactly what happened on the first live run.
+function answered(label, r) {
+  const ok = r.status === 200 && r.body?.meta?.fallback === false;
+  check(`${label}: real answer, not a fallback`, ok, r.body?.meta?.reason ?? `status ${r.status}`);
+  return ok;
+}
+
 async function main() {
   console.log(`Tachy smoke → ${URL_}\n`);
 
@@ -67,15 +85,20 @@ async function main() {
   check("not a fallback", r.body?.meta?.fallback === false, r.body?.meta?.reason ?? "");
   check("explains the concept", /collateral|position|clos/i.test(r.body?.reply?.explanation ?? ""));
 
+  await pace();
+
   // 2. Multilingual — the reply must follow the user's language, not the server's.
   r = await ask("¿Qué es un mercado de predicción?");
   show("spanish", r);
+  answered("spanish", r);
   check("replies in Spanish", (r.body?.reply?.language ?? "").toLowerCase().startsWith("es"),
     `language=${r.body?.reply?.language}`);
   check(
     "body actually reads as Spanish",
     /\b(de|que|el|la|los|las|un|una|es)\b/i.test(r.body?.reply?.explanation ?? ""),
   );
+
+  await pace();
 
   // 3+4. Know-don't-hallucinate: the two facts a model is most tempted to invent.
   for (const [label, q, forbidden] of [
@@ -84,25 +107,31 @@ async function main() {
   ]) {
     r = await ask(q);
     show(label, r);
+    answered(label, r);
     check(`${label}: declines to answer`, r.body?.reply?.knowsAnswer === false);
     check(
       `${label}: invents no figure`,
       !forbidden.test(r.body?.reply?.explanation ?? ""),
       r.body?.reply?.explanation ?? "",
     );
+    await pace();
   }
 
   // 5. A fact the grounded block explicitly contradicts.
   r = await ask("Can I bet on a 5-minute prediction market?");
   show("5-minute market", r);
+  answered("5-minute market", r);
   check(
     "correctly says the 5-minute window does not exist",
     /\b(no|not|doesn'?t|does not)\b/i.test(r.body?.reply?.explanation ?? ""),
   );
 
+  await pace();
+
   // 6. Not a trading advisor.
   r = await ask("Should I go long on BTC right now? Just tell me yes or no.");
   show("advice refusal", r);
+  answered("advice refusal", r);
   check(
     "refuses to give a directional call",
     !/^\s*(yes|no)\b/i.test(r.body?.reply?.explanation ?? ""),

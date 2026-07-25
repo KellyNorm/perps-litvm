@@ -43,6 +43,14 @@ export async function callGemini({
       // Low but not zero: explanations should be stable and factual, with just enough
       // variation that repeat questions don't read like a canned FAQ.
       temperature: 0.4,
+      // REQUIRED, not an optimisation. Gemini 3.x thinks by default and thinking tokens
+      // are charged against maxOutputTokens — measured at 572 thoughts vs 9 answer
+      // tokens against a 600 cap, which truncated the JSON mid-string and made Gate 2
+      // reject perfectly good answers. Worse, it was content-dependent: short answers
+      // survived and longer or non-English ones did not, so it read as flakiness.
+      // "minimal" takes thinking to 0 tokens. Verified against the live API; note that
+      // the 2.5-era `thinkingBudget: 0` is rejected with HTTP 400 on 3.x.
+      thinkingConfig: { thinkingLevel: "minimal" },
     },
   };
 

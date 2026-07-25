@@ -45,13 +45,25 @@ export function limits() {
     maxBodyBytes: positiveInt(process.env.TACHY_MAX_BODY_BYTES, 16 * 1024),
 
     // Rate limit, per client IP.
-    perMinute: positiveInt(process.env.TACHY_RPM, 8),
+    //
+    // Held UNDER the upstream quota on purpose. The Gemini free tier allows 5
+    // generate_content requests/minute for gemini-3.6-flash, so a per-IP allowance of 8
+    // could not protect it even from one user — we would simply forward the overflow and
+    // burn quota to receive 429s. See the note in .env.example about the global-vs-per-IP
+    // gap, which raising the paid tier is the real fix for.
+    perMinute: positiveInt(process.env.TACHY_RPM, 4),
     perHour: positiveInt(process.env.TACHY_RPH, 60),
   };
 }
 
 // Caps the model's own output so a runaway generation can't blow the timeout or the
-// token budget. The response schema is small; 600 tokens is generous for it.
+// token budget.
+//
+// Sized with headroom rather than tightly: this budget is shared with the model's
+// thinking tokens, and a cap that is merely "enough for the answer" truncates the JSON
+// the moment the model thinks at all (see the thinkingConfig note in gemini.js). With
+// thinking at "minimal" a reply measures ~150 tokens, so this is ~8x headroom and the
+// cap only ever catches genuine runaways.
 export function maxOutputTokens() {
-  return positiveInt(process.env.TACHY_MAX_OUTPUT_TOKENS, 600);
+  return positiveInt(process.env.TACHY_MAX_OUTPUT_TOKENS, 1200);
 }
