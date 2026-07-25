@@ -6,8 +6,13 @@
 
 const env = import.meta.env;
 
+// The fallback is the LIVE 8h factory, deliberately — an env-less build (fresh clone,
+// local dev, a preview without the var) must not silently talk to a dead contract. The
+// previous default `0x6338985C…` is the DRAINING 24h factory: immutable, superseded on
+// 2026-07-22, still answering calls. Pointing at it fails silently rather than loudly,
+// which is the worst failure mode available. Do not restore it.
 export const PREDICTION_FACTORY_ADDRESS = (
-  env.VITE_PREDICTION_FACTORY_ADDRESS || "0x6338985C7f689C3e1959bfe1a8bb36E44849EA40"
+  env.VITE_PREDICTION_FACTORY_ADDRESS || "0x7dd9e01fD4f96F9b1F875351eaccb5cA6C84c512"
 ).trim();
 
 // Multicall3 at its canonical cross-chain address. VERIFIED deployed on chain 4441
