@@ -25,6 +25,19 @@ jobs:
       - name: Show Forge version
         run: forge --version
 
+      # The RedStone oracle tests run with ffi = true and shell out to
+      # test/ffi/redstone-mock-payload.js, which requires @redstone-finance/evm-connector
+      # from the root package.json. Without this the FFI call exits 1 and those suites
+      # fail. Previously invisible: the size gate killed the job before the test step.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.x # root package.json engines: >=20 <23
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install FFI test dependencies
+        run: npm ci
+
       - name: Run Forge fmt
         run: forge fmt --check
 

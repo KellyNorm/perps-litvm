@@ -146,6 +146,11 @@ batched redeploy + full-surface on-chain smoke.
   never apply to them; the gate was failing on code the rule does not govern. No `src/`
   contract was ever over the cap. The build step still compiles tests, so a broken
   harness is still caught, and `forge test` passes in full (306 tests, 13 suites).
+  Fixing the gate immediately unmasked a second failure it had been hiding — exactly the
+  risk of a permanently-red `main`. CI never ran `npm ci` at the repo root, so the
+  RedStone FFI tests (`ffi = true` → `test/ffi/redstone-mock-payload.js`) died on
+  `Cannot find module '@redstone-finance/evm-connector'`. It passed locally only because
+  root `node_modules/` already existed. Node install added to the Foundry job.
 - **`PositionManager` is at 23,919 bytes — +657 of margin, ~2.7% — and that is the real
   constraint.** This is a *separate* issue from the CI red above, and fixing the gate did
   not shrink it by a byte; it made the gate able to catch it. `optimizer_runs = 1` is
