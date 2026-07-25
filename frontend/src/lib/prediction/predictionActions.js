@@ -2,7 +2,7 @@ import { ethers } from "ethers";
 import { musdRead } from "../contracts.js";
 import { ensureAllowance } from "../trade.js";
 import { PREDICTION_FACTORY_ABI } from "./predictionAbi.js";
-import { PREDICTION_FACTORY_ADDRESS } from "./predictionConfig.js";
+import { requirePredictionFactoryAddress } from "./predictionConfig.js";
 
 // Money-path WRITES for the prediction board: place a bet (approve mUSD → bet) and claim
 // a payout/refund. Deliberately separate from the perps write path — it shares only the
@@ -12,9 +12,13 @@ import { PREDICTION_FACTORY_ADDRESS } from "./predictionConfig.js";
 // `musd.safeTransferFrom(msg.sender, address(this), amount)`), so the mUSD allowance is
 // granted to the FACTORY address, not to a separate vault.
 
-/** Signer-bound factory for bet()/claim(). */
+/**
+ * Signer-bound factory for bet()/claim(). Throws (rather than defaulting to any address)
+ * when the factory env var is unset — this grants an mUSD allowance, so a wrong or guessed
+ * custodian address is the one mistake that must never be made quietly.
+ */
 export function predictionWrite(signer) {
-  return new ethers.Contract(PREDICTION_FACTORY_ADDRESS, PREDICTION_FACTORY_ABI, signer);
+  return new ethers.Contract(requirePredictionFactoryAddress(), PREDICTION_FACTORY_ABI, signer);
 }
 
 /**
@@ -28,7 +32,7 @@ export async function placeBet({ signer, account, marketId, side, amountRaw, onA
   const factory = predictionWrite(signer);
   const musd = musdRead().connect(signer);
   // Approve the FACTORY as the mUSD spender — it is the contract that transferFrom's.
-  await ensureAllowance(musd, account, PREDICTION_FACTORY_ADDRESS, amountRaw, onApproving);
+  await ensureAllowance(musd, account, requirePredictionFactoryAddress(), amountRaw, onApproving);
   const tx = await factory.bet(marketId, side, amountRaw);
   return tx.wait();
 }

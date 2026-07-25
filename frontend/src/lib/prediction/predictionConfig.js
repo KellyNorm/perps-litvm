@@ -4,16 +4,49 @@
 // Everything that CAN be read from chain IS read from chain (asset symbols, per-market
 // fee, timeframes). The only hardcoded values are addresses and pure display metadata.
 
-const env = import.meta.env;
+// `?? {}` so this module is importable outside Vite (node --test); under Vite,
+// import.meta.env is always defined.
+const env = import.meta.env ?? {};
 
-// The fallback is the LIVE 8h factory, deliberately — an env-less build (fresh clone,
-// local dev, a preview without the var) must not silently talk to a dead contract. The
-// previous default `0x6338985C…` is the DRAINING 24h factory: immutable, superseded on
-// 2026-07-22, still answering calls. Pointing at it fails silently rather than loudly,
-// which is the worst failure mode available. Do not restore it.
-export const PREDICTION_FACTORY_ADDRESS = (
-  env.VITE_PREDICTION_FACTORY_ADDRESS || "0x7dd9e01fD4f96F9b1F875351eaccb5cA6C84c512"
-).trim();
+// THE FACTORY ADDRESS HAS NO DEFAULT, DELIBERATELY. A hardcoded fallback is only ever
+// correct until the next redeploy, and then it is a live trap: the superseded factory is
+// immutable and keeps answering calls, so a build pointed at a stale address looks
+// perfectly healthy while showing markets nobody trades. That failure is silent, and a
+// silent wrong-contract is the worst mode available on a money path. Missing config must
+// stop the prediction board, not be guessed at.
+//
+// Read it through requirePredictionFactoryAddress() — never re-export the raw string. An
+// unvalidated "" reaching ethers throws deep in the call stack with no mention of which
+// env var is missing, which is the same silent failure wearing a different hat.
+const RAW_FACTORY_ADDRESS = (env.VITE_PREDICTION_FACTORY_ADDRESS || "").trim();
+
+const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+const SET_IT = [
+  "Set VITE_PREDICTION_FACTORY_ADDRESS (see frontend/.env.example) and rebuild —",
+  "VITE_* vars are inlined at BUILD time, so editing .env needs a restart, and a",
+  "deployed build needs the var set in the hosting project, not just locally.",
+].join(" ");
+
+/**
+ * Validates a factory address. Exported for tests; prefer the accessor below.
+ * @throws {Error} naming the env var, when `raw` is absent or not a 20-byte hex address.
+ */
+export function validateFactoryAddress(raw) {
+  const addr = (raw || "").trim();
+  if (!addr) {
+    throw new Error(`Prediction factory address is not configured. ${SET_IT}`);
+  }
+  if (!ADDRESS_RE.test(addr)) {
+    throw new Error(`Prediction factory address ${JSON.stringify(addr)} is not a valid address. ${SET_IT}`);
+  }
+  return addr;
+}
+
+/** The configured factory address, or a throw that says exactly what is missing. */
+export function requirePredictionFactoryAddress() {
+  return validateFactoryAddress(RAW_FACTORY_ADDRESS);
+}
 
 // Multicall3 at its canonical cross-chain address. VERIFIED deployed on chain 4441
 // (codesize 3808, 2026-07-20) — the board read fans out through this, so if it ever
