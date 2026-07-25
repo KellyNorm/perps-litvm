@@ -2,8 +2,9 @@
 //
 // Two independent gates, because either one alone is insufficient:
 //
-//   Gate 1 (TACHY_RESPONSE_SCHEMA) is sent to Gemini as `responseSchema`, which makes
-//   well-formed JSON the default rather than a hope.
+//   Gate 1 is the provider-side generation constraint, which makes well-formed JSON the
+//   default rather than a hope. Its STRENGTH VARIES BY PROVIDER — see the note on
+//   TACHY_JSON_SCHEMA below — which is exactly why it cannot be the only gate.
 //   Gate 2 (parseAndValidate) re-checks everything anyway. A provider-side schema is a
 //   generation constraint, not a security guarantee — it can change, degrade, or be
 //   bypassed by a safety-truncated response, and we still have to hold the shape.
@@ -47,6 +48,58 @@ export const TACHY_RESPONSE_SCHEMA = {
   },
   required: ["explanation", "language", "knowsAnswer"],
 };
+
+// The same contract in strict JSON Schema, for OpenAI-compatible providers (Groq).
+// It is a SEPARATE constant rather than a transform of the one above because the two
+// dialects genuinely disagree: Gemini uses OpenAPI's `nullable: true`, strict JSON
+// Schema wants a `["string","null"]` union; and strict mode additionally demands
+// `additionalProperties: false` with EVERY property listed in `required`. Deriving one
+// from the other would hide those differences behind a converter that has to be right
+// about both — two explicit literals are easier to check against the wire format.
+//
+// Keep the field set in sync with TACHY_RESPONSE_SCHEMA and validateShape(). The
+// v1 safety property holds identically here: no trade, intent, amount or address field.
+export const TACHY_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    explanation: { type: "string" },
+    // Required-but-nullable, because strict mode has no notion of an optional property:
+    // everything must be in `required`, so "absent" has to be expressed as null.
+    clarificationQuestion: { type: ["string", "null"] },
+    language: { type: "string" },
+    knowsAnswer: { type: "boolean" },
+  },
+  required: ["explanation", "clarificationQuestion", "language", "knowsAnswer"],
+  additionalProperties: false,
+};
+
+// A compact restatement of the contract, in prose, for providers that accept only
+// `json_object` (valid JSON, no schema enforcement) — which on Groq is every Llama
+// model. There the shape is a REQUEST, not a constraint, so it has to be stated in the
+// prompt or the model is guessing at field names.
+//
+// Generated from TACHY_JSON_SCHEMA so it cannot drift from the real contract. It is
+// appended by the driver, NOT added to systemPrompt.js: the shared prompt stays
+// model-agnostic, and each driver compensates for its own provider's gaps.
+export function schemaInstruction() {
+  const fields = Object.entries(TACHY_JSON_SCHEMA.properties)
+    .map(([name, def]) => {
+      const type = Array.isArray(def.type) ? def.type.join(" | ") : def.type;
+      return `  "${name}": ${type}`;
+    })
+    .join(",\n");
+
+  return [
+    "RESPONSE FORMAT (hard requirement):",
+    "Reply with a single JSON object and nothing else — no prose before or after it, no",
+    "markdown code fences. Exactly these keys, no others:",
+    "{",
+    fields,
+    "}",
+    'Use null — not the string "null" and not an omitted key — when clarificationQuestion',
+    "does not apply.",
+  ].join("\n");
+}
 
 function cleanString(value, max) {
   if (typeof value !== "string") return null;

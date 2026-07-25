@@ -3,13 +3,16 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "TachyonFi — read-only trading UI for the perps DEX on LitVM (chain 4441).",
+  "description": "TachyonFi \u2014 read-only trading UI for the perps DEX on LitVM (chain 4441).",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --test \"test/**/*.test.js\"",
-    "dev:api": "vercel dev"
+    "dev:api": "vercel dev",
+    "dev:tachy": "node scripts/tachy-serve.mjs",
+    "tachy:smoke": "node scripts/tachy-smoke.mjs",
+    "tachy:audit": "node scripts/tachy-json-audit.mjs"
   },
   "engines": {
     "node": "22.x"

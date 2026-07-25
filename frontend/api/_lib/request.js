@@ -1,7 +1,7 @@
 // Request normalisation and input caps. Split out of the handler so the caps are unit
 // testable without spinning up a server or stubbing Gemini.
 //
-// Everything here runs BEFORE the Gemini call. That ordering is the point: a cap that
+// Everything here runs BEFORE the provider call. That ordering is the point: a cap that
 // runs after the spend protects nothing.
 
 const VALID_VIEWS = new Set(["perps", "predictions"]);
@@ -75,7 +75,7 @@ export function normalizeBody(rawBody, limits) {
     }))
     .slice(-limits.maxHistoryTurns);
 
-  // Gemini expects the conversation to open on a user turn.
+  // Both providers expect the conversation to open on a user turn.
   while (history.length && history[0].role === "tachy") history.shift();
 
   // Total-size cap. History is dropped oldest-first rather than 413'd, because a long
@@ -103,13 +103,16 @@ export function normalizeBody(rawBody, limits) {
   };
 }
 
-// Maps our wire format to Gemini's. Our "tachy" role is Gemini's "model".
-export function buildContents({ message, history }) {
+// Maps our wire format to the PROVIDER-NEUTRAL conversation shape the drivers consume:
+// [{ role: "user" | "model", text }]. Our "tachy" role becomes "model" here; each
+// driver renames it again if its API disagrees (Groq's OpenAI-compatible API calls it
+// "assistant"). Nothing above the driver layer knows any provider's wire format.
+export function buildTurns({ message, history }) {
   return [
     ...history.map((turn) => ({
       role: turn.role === "tachy" ? "model" : "user",
-      parts: [{ text: turn.text }],
+      text: turn.text,
     })),
-    { role: "user", parts: [{ text: message }] },
+    { role: "user", text: message },
   ];
 }

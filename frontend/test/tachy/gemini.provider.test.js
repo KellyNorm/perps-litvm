@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import test, { describe } from "node:test";
 
-import { callGemini } from "../../api/_lib/gemini.js";
+import { callGemini } from "../../api/_lib/providers/gemini.js";
 import { REASON } from "../../api/_lib/fallbacks.js";
 
 const BASE = {
   apiKey: "test-key",
   model: "gemini-3.6-flash",
   systemInstruction: "be helpful",
-  contents: [{ role: "user", parts: [{ text: "hi" }] }],
+  turns: [{ role: "user", text: "hi" }],
   timeoutMs: 1000,
 };
 
@@ -25,7 +25,7 @@ function candidate(text, finishReason = "STOP") {
   return { candidates: [{ finishReason, content: { parts: [{ text }] } }] };
 }
 
-describe("gemini client", () => {
+describe("gemini driver", () => {
   test("returns the model text on success", async () => {
     const out = await callGemini({
       ...BASE,

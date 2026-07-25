@@ -1,4 +1,4 @@
-// Gemini client. Raw `fetch` rather than the @google/genai SDK: this is one POST with a
+// Gemini driver. Raw `fetch` rather than the @google/genai SDK: this is one POST with a
 // JSON body, and a serverless function pays for every dependency in cold-start time.
 // Node 22 (see package.json engines, and Vercel's runtime) has fetch and
 // AbortSignal.timeout natively, so this module has zero dependencies.
@@ -8,19 +8,46 @@
 //   body: { contents[], systemInstruction, generationConfig }
 //   text: candidates[0].content.parts[].text
 //
-// The contract with callers: this NEVER throws and NEVER returns provider error text.
-// It returns { ok: true, text } or { ok: false, reason } where reason is a REASON code.
-// Diagnostics go to the server log, not to the response.
+// Implements the driver contract in ./index.js: generate() never throws and never
+// returns provider error text.
 
-import { GEMINI_ENDPOINT, maxOutputTokens } from "./config.js";
-import { REASON } from "./fallbacks.js";
-import { TACHY_RESPONSE_SCHEMA } from "./schema.js";
+import { maxOutputTokens } from "../config.js";
+import { REASON } from "../fallbacks.js";
+import { TACHY_RESPONSE_SCHEMA } from "../schema.js";
+
+export const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
+
+// Pinned to a stable Flash id rather than the `gemini-flash-latest` alias: that alias
+// tracks preview and experimental releases, and an assistant whose behaviour can shift
+// under a live app without a deploy is a debugging trap. Override via TACHY_MODEL to
+// move deliberately.
+const DEFAULT_MODEL = "gemini-3.6-flash";
+
+// The Gemini FREE TIER allows 5 generate_content requests/minute for gemini-3.6-flash
+// (measured 2026-07-25), and that is a GLOBAL cap on the key while this limiter is
+// per-IP. 4 sits just under it for a single user; no per-IP number can fix a global cap.
+const DEFAULT_RPM = 4;
+const DEFAULT_RPH = 60;
+
+export const geminiProvider = {
+  id: "gemini",
+  keyEnv: "GEMINI_API_KEY",
+  defaultModel: DEFAULT_MODEL,
+  defaultRpm: DEFAULT_RPM,
+  defaultRph: DEFAULT_RPH,
+
+  apiKey() {
+    return (process.env.GEMINI_API_KEY || "").trim();
+  },
+
+  generate: callGemini,
+};
 
 export async function callGemini({
   apiKey,
   model,
   systemInstruction,
-  contents,
+  turns,
   timeoutMs,
   fetchImpl = globalThis.fetch,
 }) {
@@ -32,7 +59,7 @@ export async function callGemini({
   }
 
   const body = {
-    contents,
+    contents: toContents(turns),
     systemInstruction: { parts: [{ text: systemInstruction }] },
     generationConfig: {
       // Gate 1 of the validation layer: constrain generation to our schema so
@@ -118,6 +145,15 @@ export async function callGemini({
   }
 
   return { ok: true, text };
+}
+
+// Neutral turns -> Gemini's `contents`. Gemini's assistant role is already "model", so
+// this is purely a reshape into parts[].
+function toContents(turns) {
+  return (turns ?? []).map((turn) => ({
+    role: turn.role,
+    parts: [{ text: turn.text }],
+  }));
 }
 
 async function safeText(res) {

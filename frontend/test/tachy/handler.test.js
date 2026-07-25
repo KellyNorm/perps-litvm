@@ -4,6 +4,13 @@ import test, { after, before, describe } from "node:test";
 import { REASON } from "../../api/_lib/fallbacks.js";
 
 // Env must be set before the handler module is evaluated, hence the dynamic import.
+//
+// TACHY_PROVIDER is pinned rather than left to the default: this file stubs GEMINI's
+// wire format specifically, so it has to name the provider it is testing. Leaving it
+// implicit meant these tests silently followed whatever the default happened to be —
+// which broke the moment the soft-launch default moved to Groq. The Groq path has its
+// own file, handler.groq.test.js.
+process.env.TACHY_PROVIDER = "gemini";
 process.env.GEMINI_API_KEY = "test-key";
 process.env.TACHY_RPM = "5";
 process.env.TACHY_RPH = "100";

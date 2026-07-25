@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test, { describe } from "node:test";
 
-import { buildContents, clientKey, normalizeBody } from "../../api/_lib/request.js";
+import { buildTurns, clientKey, normalizeBody } from "../../api/_lib/request.js";
 
 const CAPS = {
   maxMessageChars: 100,
@@ -137,9 +137,9 @@ describe("client key", () => {
   });
 });
 
-describe("contents mapping", () => {
+describe("turn mapping", () => {
   test("maps tachy turns to the model role and appends the new message", () => {
-    const contents = buildContents({
+    const turns = buildTurns({
       message: "and shorts?",
       history: [
         { role: "user", text: "what is a long?" },
@@ -148,9 +148,19 @@ describe("contents mapping", () => {
     });
 
     assert.deepEqual(
-      contents.map((c) => c.role),
+      turns.map((t) => t.role),
       ["user", "model", "user"],
     );
-    assert.equal(contents.at(-1).parts[0].text, "and shorts?");
+    assert.equal(turns.at(-1).text, "and shorts?");
+  });
+
+  // The shape here is the provider boundary: it must stay vendor-neutral, or the next
+  // driver has to unpick one vendor's format to build its own.
+  test("emits a provider-neutral shape, not a vendor wire format", () => {
+    const turns = buildTurns({ message: "hi", history: [] });
+
+    assert.deepEqual(turns, [{ role: "user", text: "hi" }]);
+    assert.ok(!("parts" in turns[0]), "no Gemini parts[]");
+    assert.ok(!("content" in turns[0]), "no OpenAI content");
   });
 });
