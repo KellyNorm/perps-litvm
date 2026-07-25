@@ -176,6 +176,7 @@ section.block{padding:120px 0}
 .pred h2{font-family:var(--disp);font-weight:700;font-size:clamp(28px,4vw,44px);letter-spacing:-.02em;margin:20px 0 16px;line-height:1.05}
 .pred p{color:#C7BEDD;font-size:16px;line-height:1.65;max-width:46ch}
 .pred-chips{margin-top:26px;display:flex;gap:10px;flex-wrap:wrap}
+.pred-cta{margin-top:26px}
 .chip{font-family:var(--mono);font-size:12.5px;padding:8px 13px;border-radius:9px;background:rgba(255,255,255,.03);border:1px solid rgba(210,76,255,.18);color:#D9CCEC}
 .pred-art{position:relative;display:grid;place-items:center;min-height:280px}
 .mascot{width:230px;filter:drop-shadow(0 24px 50px rgba(41,169,255,.35));animation:float 6s ease-in-out infinite}
@@ -400,6 +401,7 @@ a.frow:hover{color:var(--text)}
   <div class="nav-links">
     <a href="#features">Features</a>
     <a href="#how">How it works</a>
+    <a href="#predictions">Predictions</a>
     <a href="#faq">FAQ</a>
   </div>
   <div class="nav-right">
@@ -581,14 +583,19 @@ a.frow:hover{color:var(--text)}
 <section class="block wrap" id="predictions">
   <div class="pred rv">
     <div class="pred-copy">
-      <span class="badge pred-badge">Coming Soon</span>
+      <span class="badge pred-badge"><span class="dot"></span>Now Live</span>
       <h2>Prediction markets,<br>the fast &amp; simple way in</h2>
-      <p>No leverage, no liquidations — just pick a side. "Will BTC be up or down?" Stake, and watch it play out over short, snappy windows. Auto-generated around the clock, beginner-friendly, and housed in the same app as perps.</p>
+      <p>No leverage, no liquidations — just pick a side. "Will BTC be up or down?" Stake mUSD and watch it play out over short, snappy windows. Live now across 11 assets, auto-generated around the clock, beginner-friendly, and housed in the same app as perps.</p>
       <div class="pred-chips">
-        <span class="chip">Minutes-to-an-hour windows</span>
+        <span class="chip">15-min to 8-hour windows</span>
         <span class="chip">Up / down, that's it</span>
         <span class="chip">No leverage</span>
         <span class="chip">Same app as Perps</span>
+      </div>
+      <div class="pred-cta">
+        <a class="btn" href="https://app.tachyonfi.xyz" target="_blank" rel="noopener">Open Predictions
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </a>
       </div>
     </div>
     <div class="pred-art">
@@ -599,7 +606,7 @@ a.frow:hover{color:var(--text)}
         <div class="pc-row"><span class="pill-up">UP ▲</span><span style="color:var(--dim)">vs</span><span class="pill-dn">DOWN ▼</span></div>
       </div>
       <div class="pred-card pc-bot">
-        <div class="pc-q">ETH · next 5 min</div>
+        <div class="pc-q">ETH · next 1 hour</div>
         <div class="pc-row"><span class="pill-up">62%</span><span style="color:var(--dim)">/</span><span class="pill-dn">38%</span></div>
       </div>
     </div>
@@ -617,7 +624,7 @@ a.frow:hover{color:var(--text)}
     <div class="q"><button class="q-head">Is this real money?<span class="q-ico"></span></button><div class="q-body"><p>No. TachyonFi runs on LitVM testnet. You trade with test mUSD claimed from the faucet — nothing here has real value.</p></div></div>
     <div class="q"><button class="q-head">How do I start?<span class="q-ico"></span></button><div class="q-body"><p>Connect your wallet, switch to LitVM (the app prompts you), claim test mUSD from the faucet, then open a position.</p></div></div>
     <div class="q"><button class="q-head">What can I trade?<span class="q-ico"></span></button><div class="q-body"><p>BTC and ETH perpetuals — long or short, with leverage. More markets are coming, with LTC next.</p></div></div>
-    <div class="q"><button class="q-head">What's coming next?<span class="q-ico"></span></button><div class="q-body"><p>Prediction markets — fast, simple crypto up/down price markets, right inside the same app — plus more assets.</p></div></div>
+    <div class="q"><button class="q-head">What's coming next?<span class="q-ico"></span></button><div class="q-body"><p>More markets and assets, position editing, and limit &amp; stop orders. Prediction markets are already live in the same app.</p></div></div>
     <div class="q"><button class="q-head">How are trades executed?<span class="q-ico"></span></button><div class="q-body"><p>A two-step request/execute flow. An automated keeper fills your order at fresh oracle prices, with front-running protection, 24/7.</p></div></div>
     <div class="q"><button class="q-head">How are prices set?<span class="q-ico"></span></button><div class="q-body"><p>A RedStone oracle feeds prices, backed by an on-chain circuit-breaker that halts new risk if prices diverge abnormally.</p></div></div>
     <div class="q"><button class="q-head">Is it audited?<span class="q-ico"></span></button><div class="q-body"><p>Not yet. This is an early testnet release for testing and feedback — it is not production-ready.</p></div></div>
@@ -639,7 +646,7 @@ a.frow:hover{color:var(--text)}
           <h5>Product</h5>
           <a class="frow" href="https://app.tachyonfi.xyz" target="_blank" rel="noopener"><span>Trade Now</span><span class="tag tag-go">Open ↗</span></a>
           <div class="frow"><span>Perps</span><span class="tag tag-live"><i></i>Live</span></div>
-          <div class="frow"><span>Predictions</span><span class="tag tag-soon">Soon</span></div>
+          <div class="frow"><span>Predictions</span><span class="tag tag-live"><i></i>Live</span></div>
         </div>
         <div class="foot-col">
           <h5>Resources</h5>

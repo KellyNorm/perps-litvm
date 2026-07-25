@@ -2,7 +2,8 @@
 // stand-in is replaced with the real logo PNG (same pattern as Nav/Hero); its
 // footer sizing lives in logo.css. Keeps both status columns (Product /
 // Resources) and the "Testnet · Unaudited" disclaimer. "Trade Now" and the X
-// link are plain external links; Predictions and Docs stay "Soon" (no links).
+// link are plain external links; Perps and Predictions are both Live (predictions
+// shipped 2026-07-25); Docs stays "Soon" (no link).
 export default function Footer() {
   return (
     <footer>
@@ -35,7 +36,9 @@ export default function Footer() {
               </div>
               <div className="frow">
                 <span>Predictions</span>
-                <span className="tag tag-soon">Soon</span>
+                <span className="tag tag-live">
+                  <i></i>Live
+                </span>
               </div>
             </div>
             <div className="foot-col">

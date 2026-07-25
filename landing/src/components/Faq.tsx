@@ -112,8 +112,8 @@ export default function Faq() {
           </button>
           <div className="q-body">
             <p>
-              Prediction markets — fast, simple crypto up/down price markets, right inside the same
-              app — plus more assets.
+              More markets and assets, position editing, and limit &amp; stop orders. Prediction
+              markets are already live in the same app.
             </p>
           </div>
         </div>

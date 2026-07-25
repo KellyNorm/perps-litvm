@@ -37,9 +37,14 @@ Fonts: Space Grotesk (display) · Inter (body) · JetBrains Mono (all numbers/la
   rel="noopener">`. It is a **link on click — never an auto-redirect / no JS navigation.**
 - The **only** external social link is X at `https://x.com/_tachyonfi` (appears exactly twice:
   hero "Follow on X" and footer). No other social links.
-- **Predictions** and **Docs** stay "Coming Soon" / "Soon". They are **not live** — never link
-  them anywhere, never add a button to Predictions (no dead ends).
-- "Predictions" must **not** appear in the top nav.
+- **Predictions went LIVE on 2026-07-25.** The section carries a "Now Live" badge, an
+  **Open Predictions** `.btn` to `https://app.tachyonfi.xyz` (same link treatment as
+  "Trade Now"), a `#predictions` top-nav link, and a green **Live** tag in the footer.
+  Its visual treatment (violet panel, mascot, floating pred-cards) is otherwise unchanged.
+  Predictions copy facts are verified on-chain against factory
+  `0x7dd9e01fD4f96F9b1F875351eaccb5cA6C84c512` (chain 4441): 11 enabled assets, timeframes
+  15-min / 30-min / 1-hour / 8-hour. **There is no 5-min timeframe** — do not reintroduce it.
+- **Docs** stays "Soon". It is **not live** — never link it anywhere (no dead ends).
 
 ## Honesty (non-negotiable)
 This is an **unaudited testnet product in active development**. Never imply audited, safe,
