@@ -20,6 +20,15 @@
 
 const STATE_TABLE = "indexer_state";
 const DAILY_TABLE = "quest_daily";
+const CURSOR_TABLE = "quest_cursor";
+const COMPLETION_TABLE = "quest_completion";
+
+/**
+ * One-time quests have no day bucket. MUST equal ONE_TIME_BUCKET in
+ * api/_lib/quest/supabaseCache.js — the read path looks completions up under this exact
+ * value, so a mismatch would make every settled completion invisible. Parity-tested.
+ */
+export const ONE_TIME_BUCKET = "-";
 
 /**
  * Generous compared to the read path's 2.5s. That number is a hot-path budget inside a
@@ -154,6 +163,114 @@ export function createSupabaseWriter({ url, serviceKey, fetch: doFetch = globalT
 
       const created = await insert.json();
       return Array.isArray(created) && created.length > 0 ? "created" : "superseded";
+    },
+
+    // ========================================================================
+    // THE SETTLER'S READS AND WRITES
+    // ========================================================================
+
+    /**
+     * A bounded page of cursor rows to consider settling.
+     *
+     * Ordered by `updated_at` ascending so the page ROTATES — the least recently worked
+     * rows surface first, and no row can be permanently invisible behind a full page of
+     * others. The final choice among them is made in memory (see settler.mjs), because the
+     * useful ordering is by REMAINING work, which is `scanned_to - floor_block` and cannot
+     * be expressed as a PostgREST column filter.
+     *
+     * The page bound is real and is logged when it truncates: a silent cap would read as
+     * "considered everything" when it did not.
+     */
+    async pickCursorCandidates(chainId, limit) {
+      const res = await request(
+        `${CURSOR_TABLE}?select=wallet,quest,source_key,floor_block,scanned_from,scanned_to,updated_at` +
+          `&chain_id=eq.${chainId}&order=updated_at.asc&limit=${limit}`,
+      );
+      const rows = await res.json();
+      if (!Array.isArray(rows)) throw new Error("quest_cursor read returned a non-array");
+
+      return rows.map((r) => ({
+        wallet: r.wallet,
+        quest: r.quest,
+        sourceKey: r.source_key,
+        floorBlock: Number(r.floor_block),
+        scannedFrom: Number(r.scanned_from),
+        scannedTo: Number(r.scanned_to),
+        updatedAt: r.updated_at,
+      }));
+    },
+
+    /** Is this (wallet, quest) already proven complete? Then there is nothing to settle. */
+    async hasCompletion(chainId, wallet, quest) {
+      const res = await request(
+        `${COMPLETION_TABLE}?select=wallet&chain_id=eq.${chainId}` +
+          `&wallet=eq.${encodeURIComponent(wallet)}&quest=eq.${encodeURIComponent(quest)}` +
+          `&bucket=eq.${encodeURIComponent(ONE_TIME_BUCKET)}&limit=1`,
+      );
+      const rows = await res.json();
+      return Array.isArray(rows) && rows.length > 0;
+    },
+
+    /**
+     * Extend one source's coverage DOWNWARD. The settler's only cursor write.
+     *
+     * THREE GUARANTEES, and they are the reason this is its own function rather than a
+     * general update:
+     *
+     *   1. THE BODY CONTAINS NO `scanned_from`. The top of the interval is the read path's
+     *      to move, because only it knows the current head. Advancing the top over an
+     *      unclosed gap is one of the two ways to punch a hole in coverage, and this writer
+     *      cannot express it.
+     *   2. `scanned_to=gte.N` MEANS THIS CAN ONLY EVER MOVE COVERAGE DOWN. If a concurrent
+     *      verify already walked deeper, its (lower) value does not match and this is a
+     *      no-op — rather than dragging the frontier back up and silently discarding
+     *      coverage the read path is relying on.
+     *   3. `floor_block=lte.N` keeps the table's `scanned_to >= floor_block` CHECK
+     *      satisfied, so a floor/address mix-up fails the write instead of writing an
+     *      interval that claims to have read below the contract's first block.
+     *
+     * There is no verdict here and no column that could hold one — quest_cursor has neither
+     * by design. This writes COVERAGE, which is a fact about work done.
+     */
+    async extendCursorDown({ chainId, wallet, quest, sourceKey, scannedTo }, { now = () => new Date() } = {}) {
+      const res = await request(
+        `${CURSOR_TABLE}?chain_id=eq.${chainId}` +
+          `&wallet=eq.${encodeURIComponent(wallet)}&quest=eq.${encodeURIComponent(quest)}` +
+          `&source_key=eq.${encodeURIComponent(sourceKey)}` +
+          `&scanned_to=gte.${scannedTo}&floor_block=lte.${scannedTo}`,
+        {
+          method: "PATCH",
+          headers: { ...headers, prefer: "return=representation" },
+          // scanned_from is deliberately ABSENT. See guarantee 1.
+          body: JSON.stringify({ scanned_to: scannedTo, updated_at: now().toISOString() }),
+        },
+      );
+
+      const updated = await res.json();
+      return Array.isArray(updated) && updated.length > 0 ? "extended" : "superseded";
+    },
+
+    /**
+     * Record a proven completion. Called ONLY when a matching log was actually found.
+     *
+     * The table has no `completed` and no `status` column — a row's EXISTENCE is the
+     * completion (0001_quest_completion.sql). So there is no way to express a stored false
+     * here even by mistake: the only thing this function can do is assert a positive, and
+     * the settler only calls it on a hit.
+     */
+    async writeCompletion({ chainId, wallet, quest, checkedThroughBlock }) {
+      await request(`${COMPLETION_TABLE}?on_conflict=chain_id,wallet,quest,bucket`, {
+        method: "POST",
+        headers: { ...headers, prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify({
+          chain_id: chainId,
+          wallet,
+          quest,
+          bucket: ONE_TIME_BUCKET,
+          checked_through_block: checkedThroughBlock ?? null,
+          source: "settler",
+        }),
+      });
     },
   };
 }

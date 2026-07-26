@@ -71,7 +71,11 @@ export async function runScheduler({
       // the steady state (a few thousand blocks across four sources) and only approaches
       // this while catching up.
       const result = await tick({ deadline: started + Math.max(0, intervalMs - marginMs) });
-      healthy = !result || result.failed === 0;
+      // BOTH conditions. `failed === 0` says nothing went wrong; `caughtUp` says the index
+      // actually reached the safe head. A source grinding through a range-capped backlog
+      // after an outage satisfies the first and not the second, and that is exactly when
+      // the settler must stay out of the way.
+      healthy = !result || (result.failed === 0 && result.caughtUp !== false);
       onTick(result);
     } catch (err) {
       healthy = false;

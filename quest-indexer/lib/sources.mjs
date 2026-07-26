@@ -55,6 +55,7 @@ export const SOURCES = [
     key: "positionManager",
     label: "PositionManager",
     addressVar: "QUEST_POSITION_MANAGER_ADDRESS",
+    deployBlockVar: "QUEST_POSITION_MANAGER_DEPLOY_BLOCK",
     // `owner` is the trader. Indexed first.
     event: "event PositionOpened(address indexed owner,bytes32 indexed market,bool isLong,uint256 collateral,uint256 sizeUsd,uint256 entryPrice)",
     eventName: "PositionOpened",
@@ -64,6 +65,7 @@ export const SOURCES = [
     key: "liquidityPool",
     label: "LiquidityPool",
     addressVar: "QUEST_LIQUIDITY_POOL_ADDRESS",
+    deployBlockVar: "QUEST_LIQUIDITY_POOL_DEPLOY_BLOCK",
     // ERC-4626 Deposit. `sender` PAID the assets; `owner` merely received the shares.
     // We credit the payer, matching provideLiquidityTier2 in the read path — depositing on
     // someone else's behalf is the honest reading of "provide liquidity". Both are indexed,
@@ -76,6 +78,7 @@ export const SOURCES = [
     key: "predictionFactory",
     label: "prediction factory (8h, live)",
     addressVar: "QUEST_PREDICTION_FACTORY_ADDRESS",
+    deployBlockVar: "QUEST_PREDICTION_FACTORY_DEPLOY_BLOCK",
     event: "event BetPlaced(uint256 indexed marketId,address indexed better,uint8 side,uint256 amount)",
     eventName: "BetPlaced",
     // TOPIC 2, not 1 — marketId is indexed first. See the note above.
@@ -85,6 +88,7 @@ export const SOURCES = [
     key: "predictionFactoryOld",
     label: "prediction factory (24h, draining)",
     addressVar: "QUEST_PREDICTION_FACTORY_OLD_ADDRESS",
+    deployBlockVar: "QUEST_PREDICTION_FACTORY_OLD_DEPLOY_BLOCK",
     // Superseded on 2026-07-22 but still indexed: a bet placed there is real activity, and
     // the contract is immutable. A wallet whose only action today was on the old factory
     // must not be reported inactive.
@@ -96,6 +100,42 @@ export const SOURCES = [
 
 /** The env vars the read path must agree with. Consumed by the parity test. */
 export const SOURCE_ADDRESS_VARS = SOURCES.map((s) => s.addressVar);
+
+/**
+ * SCAN FLOORS — the block each contract was deployed in, used ONLY by the backward settler.
+ * The forward indexer never needs them (it starts at head and moves up).
+ *
+ * These MUST equal the read path's DEFAULT_DEPLOY_BLOCKS in api/_lib/quest/chain.js. A
+ * settler walking to a different floor than the read path expects would write a
+ * `scanned_to` the read path either rejects (floor mismatch — wasted work) or, worse,
+ * accepts as "reached the floor" when it has not. A parity test pins both the names and
+ * these values.
+ */
+export const DEFAULT_DEPLOY_BLOCKS = {
+  QUEST_POSITION_MANAGER_DEPLOY_BLOCK: 23_302_630,
+  QUEST_LIQUIDITY_POOL_DEPLOY_BLOCK: 23_302_630,
+  QUEST_PREDICTION_FACTORY_DEPLOY_BLOCK: 32_222_320,
+  QUEST_PREDICTION_FACTORY_OLD_DEPLOY_BLOCK: 30_665_562,
+};
+
+export const SOURCE_DEPLOY_BLOCK_VARS = SOURCES.map((s) => s.deployBlockVar);
+
+/**
+ * The floor this source's coverage is measured against.
+ *
+ * Throws on a set-but-unparseable value rather than falling back to the default: a typo'd
+ * deploy block would silently change what "reached the floor" means, and the read path
+ * would reject every row the settler wrote against it.
+ */
+export function sourceFloor(descriptor, env = process.env) {
+  const raw = env[descriptor.deployBlockVar];
+  const n = Number.parseInt(raw ?? "", 10);
+  if (Number.isFinite(n) && n >= 0) return n;
+  if (raw != null && String(raw).trim() !== "") {
+    throw new ConfigError(`${descriptor.deployBlockVar} is set but is not a block number: ${JSON.stringify(raw)}`);
+  }
+  return DEFAULT_DEPLOY_BLOCKS[descriptor.deployBlockVar];
+}
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 

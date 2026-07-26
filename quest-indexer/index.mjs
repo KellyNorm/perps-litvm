@@ -18,6 +18,7 @@
 
 import { chainId, getBlock, getCode, getLogs, headBlock } from "./lib/chain.mjs";
 import { runIndexer, confirmations, maxRangeBlocks } from "./lib/indexer.mjs";
+import { runSettler } from "./lib/settler.mjs";
 import { DEFAULT_INTERVAL_MS, runScheduler } from "./lib/scheduler.mjs";
 import { verifySourceContracts } from "./lib/preflight.mjs";
 import { SOURCES, sourceAddress } from "./lib/sources.mjs";
@@ -46,10 +47,14 @@ async function main() {
   await verifySourceContracts({ sources: SOURCES, getCode, log: (m) => console.log(m) });
 
   const intervalMs = positiveInt(process.env.QUEST_INDEXER_INTERVAL_MS, DEFAULT_INTERVAL_MS);
+  // Kill switch. Turning the settler off costs only settlement speed — deep quests go back
+  // to needing user polls — and can never affect correctness.
+  const settlerEnabled = (process.env.QUEST_SETTLER_ENABLED ?? "true").trim() !== "false";
 
   console.log(
     `[indexer] starting — chain ${chain}, ${SOURCES.length} sources, every ${intervalMs}ms, ` +
-      `trailing head by ${confirmations()} blocks, ≤${maxRangeBlocks()} blocks/source/run`,
+      `trailing head by ${confirmations()} blocks, ≤${maxRangeBlocks()} blocks/source/run, ` +
+      `settler ${settlerEnabled ? "on" : "off"}`,
   );
 
   let stopping = false;
@@ -80,9 +85,24 @@ async function main() {
       return report;
     },
 
-    // Job B lands here in sequencing step 5: a bounded settler slice sized to `budgetMs`,
-    // run only when the index is healthy. Until then the remainder is slept away.
-    fill: null,
+    // JOB B. The scheduler only calls this when the forward index is both error-free and
+    // caught up to the safe head — see lib/scheduler.mjs. A settler that falls behind costs
+    // slower deep-history settlement; a forward index that falls behind is the only thing
+    // that can make the endpoint lie, so it always wins.
+    fill: settlerEnabled
+      ? async ({ budgetMs }) => {
+          try {
+            const out = await runSettler({ writer, chainId: chain, budgetMs, getLogs });
+            if (out.worked || out.found || out.extended) {
+              console.log(`[settler] ${JSON.stringify(out)}`);
+            }
+          } catch (err) {
+            // Contained: the settler is opportunistic and must never take down the loop
+            // that keeps daily_active honest.
+            console.error("[settler] slice failed, continuing:", err?.message);
+          }
+        }
+      : null,
   });
 
   console.log("[indexer] stopped cleanly");
