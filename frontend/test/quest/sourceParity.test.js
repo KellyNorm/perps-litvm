@@ -21,7 +21,10 @@ import assert from "node:assert/strict";
 import test, { describe } from "node:test";
 
 import { DAILY_SOURCES, DAILY_SOURCE_ADDRESS_VARS } from "../../api/_lib/quest/dailySources.js";
-import { SOURCES, SOURCE_ADDRESS_VARS } from "../../../quest-indexer/lib/sources.mjs";
+// definitions.mjs, NOT sources.mjs: the latter imports ethers, which the frontend's test
+// job does not install. Reaching for it here would make this suite un-runnable without the
+// indexer's node_modules — the exact coupling two separate deployables should not have.
+import { SOURCES, SOURCE_ADDRESS_VARS } from "../../../quest-indexer/lib/definitions.mjs";
 
 describe("indexer and reader agree on the sources", () => {
   // Configuration is shared through the ENVIRONMENT rather than through code: both sides
