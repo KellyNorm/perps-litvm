@@ -245,6 +245,53 @@ describe("forward index has priority", () => {
     assert.equal(filled, 0);
   });
 
+  // "No source errored" is weaker than "the index is current". A source grinding through a
+  // range-capped backlog after an outage errors on nothing while still being far behind —
+  // and that is exactly when the settler must stay out of the way.
+  test("the fill is skipped while the index is error-free but still CATCHING UP", async () => {
+    const h = harness();
+    const stop = stopAfter(2);
+    let filled = 0;
+
+    await runScheduler({
+      tick: async () => {
+        stop.bump();
+        return { failed: 0, caughtUp: false };
+      },
+      fill: async () => {
+        filled++;
+      },
+      shouldStop: stop.shouldStop,
+      now: h.now,
+      sleep: h.sleep,
+    });
+
+    assert.equal(filled, 0, "a backlog is not health");
+    assert.equal(h.slept.length, 1);
+  });
+
+  test("a tick that reports no caughtUp field at all is treated as healthy", async () => {
+    // Backwards-compatible: a tick returning only {failed} still gets its fill.
+    const h = harness();
+    const stop = stopAfter(2);
+    let filled = 0;
+
+    await runScheduler({
+      tick: async () => {
+        stop.bump();
+        return { failed: 0 };
+      },
+      fill: async () => {
+        filled++;
+      },
+      shouldStop: stop.shouldStop,
+      now: h.now,
+      sleep: h.sleep,
+    });
+
+    assert.equal(filled, 1);
+  });
+
   test("the fill runs when every source indexed cleanly", async () => {
     const h = harness();
     // Two ticks, not one: the loop checks for shutdown BEFORE the fill (asserted separately
@@ -255,7 +302,7 @@ describe("forward index has priority", () => {
     await runScheduler({
       tick: async () => {
         stop.bump();
-        return { failed: 0 };
+        return { failed: 0, caughtUp: true };
       },
       fill: async () => {
         filled++;

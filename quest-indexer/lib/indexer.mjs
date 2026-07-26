@@ -212,5 +212,14 @@ export async function runIndexer({
     }
   }
 
-  return { sources: report, wrote, failed };
+  // CAUGHT UP means every source is either idle or indexed right up to the safe head this
+  // run — i.e. the index is current by construction, without having to re-read
+  // indexer_state to find out. The scheduler uses it as the precondition for letting the
+  // settler run: "the last tick did not error" is weaker, because a range-capped source
+  // catching up after an outage errors on nothing while still being far behind.
+  const safeHead = head - conf;
+  const caughtUp =
+    failed === 0 && report.every((r) => r.idle || r.skipped == null) && report.every((r) => r.idle || r.to >= safeHead);
+
+  return { sources: report, wrote, failed, caughtUp };
 }

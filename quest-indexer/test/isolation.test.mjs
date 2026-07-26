@@ -98,6 +98,11 @@ describe("read-only: this service holds no key and touches no money path", () =>
       "QUEST_INDEXER_CONFIRMATIONS",
       "QUEST_INDEXER_MAX_RANGE",
       "QUEST_INDEXER_INTERVAL_MS",
+      "QUEST_SETTLER_ENABLED",
+      "QUEST_POSITION_MANAGER_DEPLOY_BLOCK",
+      "QUEST_LIQUIDITY_POOL_DEPLOY_BLOCK",
+      "QUEST_PREDICTION_FACTORY_DEPLOY_BLOCK",
+      "QUEST_PREDICTION_FACTORY_OLD_DEPLOY_BLOCK",
     ]);
 
     for (const file of files) {
