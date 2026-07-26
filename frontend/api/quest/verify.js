@@ -22,10 +22,15 @@
 //
 // Request:  { "address": "0x…", "quest": "first_trade" }
 // Response: { address, quest, completed, status, source, checkedThroughBlock, asOf }
+//           plus `reason` whenever the answer is not settled, and `coverage` whenever a
+//           Tier 2 scan has walked anything — see withCoverage() for why a depth belongs in
+//           the envelope rather than only in the database.
 
 import { createLimiter, memoryDriver } from "../_lib/rateLimit.js";
 import { cacheKey, createCache, memoryCacheDriver, nullCacheDriver, utcDay } from "../_lib/quest/cache.js";
+import { createCursorStore, memoryCursorDriver, nullCursorDriver } from "../_lib/quest/cursor.js";
 import { supabaseCacheDriver } from "../_lib/quest/supabaseCache.js";
+import { supabaseCursorDriver } from "../_lib/quest/supabaseCursor.js";
 import { ConfigError, chainId } from "../_lib/quest/chain.js";
 import { QUEST_IDS, QUEST_KIND, SOURCE, STATUS, getQuest } from "../_lib/quest/quests.js";
 import { clientKey } from "../_lib/request.js";
@@ -101,9 +106,51 @@ function selectDriver(mode) {
   return memoryCacheDriver();
 }
 
-/** Test seam: drop the cached driver so the next request rebuilds it from current env. */
+// The COVERAGE cursor store — separate from the verdict cache above, and separate on
+// purpose: that one holds answers, this one holds which block ranges have been walked. See
+// the header of _lib/quest/cursor.js for why conflating them would be a correctness bug
+// rather than a tidiness one.
+//
+// QUEST_CURSOR selects the driver and defaults to whatever QUEST_CACHE selected, because in
+// practice they share a project and a key and nobody wants to set two vars to the same
+// value. Setting it explicitly is the kill switch: QUEST_CURSOR=none disables resume and
+// every poll walks from head again — slower, and incapable of settling a deep wallet, but
+// never wrong. Useful when a wallet's stored coverage is suspect.
+let cursors;
+function getCursors() {
+  if (!cursors) {
+    const mode = (process.env.QUEST_CURSOR || process.env.QUEST_CACHE || "memory").trim();
+    cursors = createCursorStore(selectCursorDriver(mode));
+  }
+  return cursors;
+}
+
+function selectCursorDriver(mode) {
+  if (mode === "none") return nullCursorDriver();
+
+  if (mode === "supabase") {
+    const driver = supabaseCursorDriver();
+    if (driver) return driver;
+
+    console.error(
+      "[quest] QUEST_CURSOR=supabase but SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not both " +
+        "set — falling back to in-memory coverage. Verification is unaffected; deep-history " +
+        "wallets will stay indeterminate because coverage no longer survives a cold start.",
+    );
+    return memoryCursorDriver();
+  }
+
+  return memoryCursorDriver();
+}
+
+/**
+ * Test seam: drop both cached stores so the next request rebuilds them from current env.
+ * Both, not just the cache — they are configured by different vars and a test that changes
+ * one would otherwise keep a store built from the previous environment.
+ */
 export function _resetCache() {
   cache = null;
+  cursors = null;
 }
 
 /**
@@ -274,7 +321,18 @@ export async function verifyQuest(definition, address) {
   }
 
   // Reuses Tier 1's head, so both tiers together cost one eth_blockNumber.
-  const scan = await definition.tier2(address, { head: tier1.checkedThroughBlock });
+  //
+  // The cursor store makes this scan RESUMABLE: it picks up the coverage earlier polls
+  // accumulated for this (chain, wallet, quest) and extends it at both ends. That is what
+  // lets `scan.complete` below eventually become true for a wallet whose history is far
+  // deeper than one invocation's budget — the answer converges over polls instead of
+  // returning indeterminate forever.
+  const scan = await definition.tier2(address, {
+    head: tier1.checkedThroughBlock,
+    chainId: chainId(),
+    quest: definition.id,
+    cursors: getCursors(),
+  });
 
   if (scan.found) {
     return {
@@ -285,13 +343,20 @@ export async function verifyQuest(definition, address) {
     };
   }
 
-  // The one path to a confirmed false: every source walked to a validated floor, no holes.
+  // The one path to a confirmed false: every source covered from a validated floor up to
+  // head, no holes. `complete` is DERIVED from the accumulated coverage on every call and
+  // is never read out of storage — see coverageProvesAbsence() in scan.js. Nothing anywhere
+  // persists a negative; what persists is which blocks were read.
   if (scan.complete) {
     return {
       completed: false,
       status: STATUS.CONFIRMED,
       source: SOURCE.TIER2,
       checkedThroughBlock: tier1.checkedThroughBlock,
+      // Included on the proven false too, where every entry reads remaining: 0. That is the
+      // claim being made, in the same shape a caller has been watching descend — so a
+      // confirmed false can be audited rather than taken on trust.
+      ...withCoverage(scan),
     };
   }
 
@@ -301,6 +366,42 @@ export async function verifyQuest(definition, address) {
     source: SOURCE.TIER2,
     checkedThroughBlock: tier1.checkedThroughBlock,
     reason: scan.reason ?? "scan_incomplete",
+    ...withCoverage(scan),
+  };
+}
+
+/**
+ * Report how far the accumulated walk has got, per source.
+ *
+ * WHY THIS IS IN THE ENVELOPE. A deep-history indeterminate and a permanently stuck one are
+ * the same three fields otherwise, and they need opposite responses: the first is "poll me
+ * again", the second is "something is broken" — a cursor table that was never migrated, a
+ * store outage, a floor that will not validate. Without a depth, the only way to tell them
+ * apart is direct database access, which the caller does not have and should not need.
+ *
+ * `remaining` is the useful number and is derived rather than stored, like everything else
+ * here: it is exactly what is left to walk before this source could support a negative.
+ * `scannedFrom` is what distinguishes "still descending" (it equals checkedThroughBlock)
+ * from "the top gap did not close" (it lags) — two very different reasons to be waiting.
+ *
+ * Addresses are reported in full, not truncated: they are public contract addresses the
+ * frontend already uses, and they are the key of the quest_cursor row this line describes,
+ * so a truncated form could not be correlated with anything.
+ *
+ * Omitted entirely — never an empty array — when there is nothing to report: a found event
+ * writes no coverage, and a cache hit did no scanning at all.
+ */
+function withCoverage(scan) {
+  if (!Array.isArray(scan.coverage) || scan.coverage.length === 0) return {};
+
+  return {
+    coverage: scan.coverage.map((c) => ({
+      source: c.sourceKey,
+      scannedFrom: c.scannedFrom,
+      scannedTo: c.scannedTo,
+      floor: c.floorBlock,
+      remaining: c.scannedTo - c.floorBlock,
+    })),
   };
 }
 
@@ -351,8 +452,9 @@ async function composeQuest(definition, address) {
 /**
  * Single success/verdict exit, so every answer has the documented shape:
  *   { address, quest, completed, status, source, checkedThroughBlock, asOf }
- * plus `reason` whenever the answer is not a settled one — a short code naming WHY, which
- * is what makes an indeterminate actionable instead of mysterious.
+ * plus `reason` whenever the answer is not a settled one — a short code naming WHY — and
+ * `coverage` whenever a scan walked anything, naming HOW FAR. Together they are what make
+ * an indeterminate actionable instead of mysterious.
  */
 function send(res, status, verdict) {
   res.setHeader("content-type", "application/json; charset=utf-8");

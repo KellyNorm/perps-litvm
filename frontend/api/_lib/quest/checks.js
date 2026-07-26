@@ -15,12 +15,18 @@
 // why nothing here may ever return a bare boolean.
 
 // CONTRACT FOR EVERY TIER 2 CHECK:
-//   takes (address, { head }) and returns scanForEvent's result unchanged.
+//   takes (address, opts) and returns the scan result unchanged.
 //   found                   → proof. Permanent.
-//   !found && complete      → a PROVEN negative: every source walked to a validated floor.
+//   !found && complete      → a PROVEN negative: every source covered from a validated
+//                             floor up to head — possibly ACROSS SEVERAL POLLS.
 //   exhausted               → we ran out of budget or lost a chunk. Indeterminate.
 // Tier 2 reuses the head block Tier 1 already fetched, so the two tiers together cost one
 // eth_blockNumber, not two.
+//
+// `opts` is forwarded to scanWithResume() verbatim — {head, cursors, chainId, wallet,
+// quest}. A tier2 therefore does not know or care whether coverage is being accumulated;
+// it declares its sources and the resume layer decides what still needs walking. Callers
+// that pass only {head} get a one-shot scan, exactly as before.
 
 import {
   batchRead,
@@ -33,7 +39,7 @@ import {
   predictionFactoryOldRead,
   predictionFactoryRead,
 } from "./chain.js";
-import { scanForEvent } from "./scan.js";
+import { scanWithResume } from "./cursor.js";
 
 // The markets PositionManager actually supports for perps. bytes32("BTC") / bytes32("ETH")
 // are MARKET_BTC / MARKET_ETH on-chain. SOL/LTC appear in the frontend's CANDIDATE_MARKETS
@@ -80,9 +86,9 @@ export async function firstTradeTier1(address) {
 }
 
 /** first_trade, Tier 2: has this wallet EVER opened a position? `owner` is indexed. */
-export async function firstTradeTier2(address, { head }) {
+export async function firstTradeTier2(address, opts) {
   const pm = positionManagerRead();
-  return scanForEvent(
+  return scanWithResume(
     [
       {
         contract: pm,
@@ -92,7 +98,7 @@ export async function firstTradeTier2(address, { head }) {
         label: "PositionManager",
       },
     ],
-    { head },
+    { ...opts, wallet: address },
   );
 }
 
@@ -156,12 +162,17 @@ export async function firstPredictionTier1(address) {
  * The live factory is scanned first because recent activity is likelier; if the budget
  * runs out before the old one is reached, the result is `exhausted` (indeterminate), never
  * a false.
+ *
+ * The two factories have DIFFERENT FLOORS (32,222,320 and 30,665,562) and their coverage
+ * accumulates independently — one cursor row each, keyed by address. So the routine mid-
+ * convergence state "live factory fully walked, old factory barely started" is represented
+ * exactly, and this quest returns a proven false only once BOTH have reached their floors.
  */
-export async function firstPredictionTier2(address, { head }) {
+export async function firstPredictionTier2(address, opts) {
   const factory = predictionFactoryRead();
   const oldFactory = predictionFactoryOldRead();
 
-  return scanForEvent(
+  return scanWithResume(
     [
       {
         contract: factory,
@@ -178,7 +189,7 @@ export async function firstPredictionTier2(address, { head }) {
         label: "prediction factory (24h, draining)",
       },
     ],
-    { head },
+    { ...opts, wallet: address },
   );
 }
 
@@ -208,9 +219,9 @@ export async function provideLiquidityTier1(address) {
  * honest reading of "provide liquidity". Both are indexed, so switching is a one-line
  * change if that call ever goes the other way.
  */
-export async function provideLiquidityTier2(address, { head }) {
+export async function provideLiquidityTier2(address, opts) {
   const pool = liquidityPoolRead();
-  return scanForEvent(
+  return scanWithResume(
     [
       {
         contract: pool,
@@ -220,6 +231,6 @@ export async function provideLiquidityTier2(address, { head }) {
         label: "LiquidityPool",
       },
     ],
-    { head },
+    { ...opts, wallet: address },
   );
 }
