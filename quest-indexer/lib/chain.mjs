@@ -89,3 +89,14 @@ export async function getLogs(filter) {
 export async function getBlock(blockNumber) {
   return withRetry(() => readProvider().getBlock(blockNumber));
 }
+
+/**
+ * Runtime bytecode at an address — the startup preflight's only question.
+ *
+ * Retried harder than the other reads: this runs once at boot, so a few extra seconds of
+ * backoff is cheap, and a failure here refuses to start the service. Burning a Railway
+ * restart on a momentary blip would be a poor trade.
+ */
+export async function getCode(address) {
+  return withRetry(() => readProvider().getCode(address), { attempts: 5, baseMs: 500 });
+}

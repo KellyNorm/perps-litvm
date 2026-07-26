@@ -16,9 +16,10 @@
 // forever indexing nothing is worse than one that is visibly dead: the watermark it never
 // advances eventually reads as stale, which is safe, but nothing says why.
 
-import { chainId, getBlock, getLogs, headBlock } from "./lib/chain.mjs";
+import { chainId, getBlock, getCode, getLogs, headBlock } from "./lib/chain.mjs";
 import { runIndexer, confirmations, maxRangeBlocks } from "./lib/indexer.mjs";
 import { DEFAULT_INTERVAL_MS, runScheduler } from "./lib/scheduler.mjs";
+import { verifySourceContracts } from "./lib/preflight.mjs";
 import { SOURCES, sourceAddress } from "./lib/sources.mjs";
 import { createSupabaseWriter } from "./lib/supabase.mjs";
 
@@ -36,6 +37,13 @@ async function main() {
   // would silently index nothing.
   const writer = createSupabaseWriter();
   for (const source of SOURCES) sourceAddress(source);
+
+  // The last thing that can still be wrong after config parses: a well-formed address
+  // pointing at nothing. Indexing it would return no logs forever while the watermark
+  // advanced normally — a fresh-looking, permanently empty index handing out confident
+  // falses. One eth_getCode per source settles it, and refusing to start is the safe
+  // outcome: a dead indexer reads as stale, which reads as indeterminate.
+  await verifySourceContracts({ sources: SOURCES, getCode, log: (m) => console.log(m) });
 
   const intervalMs = positiveInt(process.env.QUEST_INDEXER_INTERVAL_MS, DEFAULT_INTERVAL_MS);
 
