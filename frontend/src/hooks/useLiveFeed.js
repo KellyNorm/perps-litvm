@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { fetchLiveTickers } from "../lib/exchanges.js";
 
 const POLL_MS = 1_000; // fast tick so price / chart / PnL feel live (single tunable constant)
@@ -8,11 +8,11 @@ const POLL_MS = 1_000; // fast tick so price / chart / PnL feel live (single tun
 // ticks, then either completes or self-aborts and the next tick retries.
 const POLL_TIMEOUT_MS = 4_000;
 
-// Fast live price feed from the public exchanges (Kraken → Bybit → Coinbase). This is
-// the DISPLAY feed: it drives the shown price, the chart's current price, and position
-// PnL so they tick smoothly (~1s) instead of freezing on the slow RedStone demo
-// oracle. It is INDICATIVE — trades still execute & realize against the on-chain
-// RedStone mark; this never touches the trading path.
+// Fast live price feed from the public exchanges (median of Kraken / Bybit / Coinbase,
+// USD-quote preferred). This is the DISPLAY feed: it drives the shown price, the chart's
+// current price, and position PnL so they tick smoothly (~1s) instead of freezing on the
+// slow RedStone demo oracle. It is INDICATIVE — trades still execute & realize against the
+// on-chain RedStone mark; this never touches the trading path.
 //
 // Returns { live, source }: live is { symbol: { price, source, tsMs } } and updates in
 // place per symbol (a momentary source blip keeps the last good price). `source` is the
@@ -20,7 +20,6 @@ const POLL_TIMEOUT_MS = 4_000;
 export function useLiveFeed(symbols) {
   const [live, setLive] = useState({});
   const [source, setSource] = useState(null);
-  const sourceRef = useRef(null);
 
   const key = symbols && symbols.length ? symbols.join(",") : "";
 
@@ -47,12 +46,9 @@ export function useLiveFeed(symbols) {
       activeCtrl = ctrl;
       const watchdog = setTimeout(() => ctrl.abort(), POLL_TIMEOUT_MS);
       try {
-        const { prices, source: src } = await fetchLiveTickers(feeds, sourceRef.current, ctrl.signal);
+        const { prices, source: src } = await fetchLiveTickers(feeds, ctrl.signal);
         if (cancelled) return;
-        if (src) {
-          sourceRef.current = src;
-          setSource(src);
-        }
+        if (src) setSource(src);
         const now = Date.now();
         setLive((prev) => {
           let changed = false;

@@ -6,8 +6,9 @@
 // server.proxy in dev, a Vercel function in prod) so the actual fetch happens server-side.
 // This is required because some users' networks DNS-block these exchange APIs at the ISP
 // level — fetching from the browser fails with ERR_NAME_NOT_RESOLVED, but the server is
-// not blocked. We try the proxied sources in order and use the first that responds:
-// Kraken → Bybit → Coinbase. Each maps our market symbol to its own spot pair.
+// not blocked. Sources: Kraken, Bybit, Coinbase — each maps our market symbol to its own
+// spot pair. Candles use the first source that responds; the live ticker queries all of
+// them in parallel and takes the median (see fetchLiveTickers).
 
 // Our market symbol -> each source's spot pair. Only mapped symbols get a feed;
 // anything else falls back to the live RedStone mark line.
@@ -154,12 +155,16 @@ export async function fetchCandles(symbol, tf, { signal, perTryMs = 3500 } = {})
 
 // --- Source adapters: live ticker ------------------------------------------
 // Each returns { symbol: price } for whatever it could fetch. Kraken batches all pairs
-// in one call; Bybit/Coinbase fan out per symbol.
+// in one call; Bybit/Coinbase fan out per symbol. `quote` is the source's quote currency:
+// Kraken (XBTUSD) and Coinbase (BTC-USD) quote in USD; Bybit (BTCUSDT) quotes in USDT,
+// which can drift a few bp from the USD price people compare against — so USDT sources are
+// dropped from the median whenever a USD source responds (see fetchLiveTickers).
 const LIVE_TIMEOUT = 2500;
 
 const LIVE_SOURCES = [
   {
     id: "Kraken",
+    quote: "USD",
     async tickers(symbols, signal) {
       const pairs = symbols.map((s) => KRAKEN[s]).filter(Boolean).join(",");
       if (!pairs) return {};
@@ -180,6 +185,7 @@ const LIVE_SOURCES = [
   },
   {
     id: "Bybit",
+    quote: "USDT",
     async tickers(symbols, signal) {
       const pairs = await Promise.all(
         symbols.map(async (s) => {
@@ -204,6 +210,7 @@ const LIVE_SOURCES = [
   },
   {
     id: "Coinbase",
+    quote: "USD",
     async tickers(symbols, signal) {
       const pairs = await Promise.all(
         symbols.map(async (s) => {
@@ -228,21 +235,51 @@ const LIVE_SOURCES = [
   },
 ];
 
-// Poll the live ticker. Tries the previously-working source first (sticky, to avoid
-// jumping between exchanges mid-stream), then the rest in order. Returns
-// { prices: { symbol: price }, source } — source is null if none responded.
-export async function fetchLiveTickers(symbols, preferred, signal) {
-  const order = preferred
-    ? [...LIVE_SOURCES.filter((s) => s.id === preferred), ...LIVE_SOURCES.filter((s) => s.id !== preferred)]
-    : LIVE_SOURCES;
-  for (const src of order) {
-    if (signal?.aborted) break;
-    try {
-      const prices = await src.tickers(symbols, signal);
-      if (symbols.some((s) => isFinite(prices[s]))) return { prices, source: src.id };
-    } catch {
-      // try the next source
-    }
+// Median of a non-empty list of numbers (average of the two middle values when even).
+function median(nums) {
+  const sorted = [...nums].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+// Poll the live ticker. Queries EVERY source in parallel (rather than first-responder-wins)
+// and uses the MEDIAN of the prices that return within the deadline, so the shown number
+// tracks the aggregated price people compare against instead of one exchange's quote. USD
+// sources are preferred: when any USD source responds for a symbol, USDT sources are
+// excluded from that symbol's median. Per-source timeout (LIVE_TIMEOUT) and the overall
+// deadline (`signal`) both still apply. Returns { prices: { symbol: price }, source } —
+// source is a "+"-joined label of the exchanges that fed the median, or null if none
+// responded (the caller then holds the last good price / falls back to the mark line).
+export async function fetchLiveTickers(symbols, signal) {
+  // Fan out to all sources at once; each resolves to its { symbol: price } map, or {} on
+  // failure/timeout so one dead source never sinks the rest.
+  const responses = await Promise.all(
+    LIVE_SOURCES.map(async (src) => {
+      try {
+        return { id: src.id, quote: src.quote, prices: await src.tickers(symbols, signal) };
+      } catch {
+        return { id: src.id, quote: src.quote, prices: {} };
+      }
+    }),
+  );
+
+  const prices = {};
+  const usedIds = new Set();
+  for (const s of symbols) {
+    // Every source that returned a usable price for this symbol, tagged by quote currency.
+    const quotes = responses
+      .map((r) => ({ id: r.id, quote: r.quote, price: r.prices[s] }))
+      .filter((q) => isFinite(q.price) && q.price > 0);
+    if (!quotes.length) continue;
+    // Prefer USD: drop USDT sources whenever at least one USD source responded.
+    const usd = quotes.filter((q) => q.quote === "USD");
+    const pool = usd.length ? usd : quotes;
+    prices[s] = median(pool.map((q) => q.price));
+    for (const q of pool) usedIds.add(q.id);
   }
-  return { prices: {}, source: null };
+
+  if (!usedIds.size) return { prices: {}, source: null };
+  // Stable, canonical-order label of the exchanges that actually fed the median.
+  const source = LIVE_SOURCES.filter((src) => usedIds.has(src.id)).map((src) => src.id).join("+");
+  return { prices, source };
 }
