@@ -151,15 +151,30 @@ batched redeploy + full-surface on-chain smoke.
   RedStone FFI tests (`ffi = true` → `test/ffi/redstone-mock-payload.js`) died on
   `Cannot find module '@redstone-finance/evm-connector'`. It passed locally only because
   root `node_modules/` already existed. Node install added to the Foundry job.
-- **`PositionManager` is at 23,919 bytes — +657 of margin, ~2.7% — and that is the real
-  constraint.** This is a *separate* issue from the CI red above, and fixing the gate did
-  not shrink it by a byte; it made the gate able to catch it. `optimizer_runs = 1` is
-  already spent on size. The next feature that grows `PositionManager` by ~657 bytes turns
-  this into a genuine deploy blocker on chain 4441. `refactor/eip170-library-extraction`
-  is the standard remedy (move logic into `library` contracts, which link as `DELEGATECALL`
-  and do not count toward the caller's runtime size). This touches the money path, so per
-  CLAUDE.md it needs a written plan and a go-ahead before implementation — do it when
-  Solidity is next touched, and check the margin before adding to that contract.
+- **`PositionManager` is 657 bytes (~2.7%) under the EIP-170 cap — BLOCKING for the next
+  change to that contract.** 23,919 of 24,576 bytes. This is a *separate* issue from the
+  CI red above: fixing the gate did not shrink the contract by a byte, it only made the
+  gate able to catch it. `optimizer_runs = 1` is already spent on size, so there is no
+  cheap lever left — the usual first remedy is already exhausted.
+
+  **Risk:** any future feature that adds ~657 bytes to `PositionManager` makes it
+  undeployable, which blocks a redeploy on chain 4441 — a shipped-product problem, not a
+  CI problem. Note the asymmetry: the failure shows up at *deploy* time, after the work
+  is already written.
+
+  **Fix:** `refactor/eip170-library-extraction` — move logic into `library` contracts,
+  which link as `DELEGATECALL` and do not count toward the caller's runtime size. The
+  standard remedy for this exact situation.
+
+  **Status: PARKED — not being built now.** Non-urgent while `PositionManager` is
+  untouched. But it **MUST be resolved before the next `PositionManager` change**, not
+  after: treat "am I adding to `PositionManager`?" as the trigger, and check the margin
+  (`forge build --sizes`) *before* writing the feature, not when the deploy fails.
+
+  **Gate on starting it:** this is money-path code (positions, collateral, P&L), so per
+  CLAUDE.md discipline rule 3 and the money-path rules it needs a **written plan and an
+  explicit go-ahead before any implementation**. Do not begin the refactor off the back
+  of this note alone.
 
 ## PHASE 3 — mainnet hardening  (deferred, not started)
 Governance + pause (params are currently immutable; `Ownable` is scoped to markets only),
