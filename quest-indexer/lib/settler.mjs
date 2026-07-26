@@ -41,32 +41,14 @@
 // deep quests take longer to settle. So Job A gets absolute priority and this job gets
 // whatever time is left, and none at all while Job A is unwell.
 
+import { SETTLEABLE_QUESTS } from "./definitions.mjs";
 import { SOURCES, sourceAddress, sourceFloor, walletFilter } from "./sources.mjs";
 import { CHUNK_BLOCKS, walkDown } from "./walk.mjs";
 
-/**
- * Which sources each settleable quest walks.
- *
- * MIRRORS the Tier 2 definitions in api/_lib/quest/checks.js. Only ONE-TIME quests appear:
- * daily_active is answered by the index plus a live tail scan and writes no cursor rows at
- * all, so it can never show up here.
- *
- * This is the one part of the settler's agreement with the read path that a test cannot
- * fully machine-check — checks.js builds its sources inside functions rather than declaring
- * them. The parity test asserts every id here is a real quest with a tier2, and every
- * source key is one the shared descriptor list knows about; the pairing itself is three
- * lines and is reviewed by eye.
- */
-export const SETTLEABLE_QUESTS = {
-  first_trade: ["positionManager"],
-  first_prediction: ["predictionFactory", "predictionFactoryOld"],
-  provide_liquidity: ["liquidityPool"],
-};
+export { SETTLEABLE_QUESTS };
 
 /** How many cursor rows to consider per run. Bounded, and logged when it truncates. */
 export const CANDIDATE_PAGE = 200;
-
-const descriptorByKey = new Map(SOURCES.map((s) => [s.key, s]));
 
 /**
  * Group a page of cursor rows into units of work.

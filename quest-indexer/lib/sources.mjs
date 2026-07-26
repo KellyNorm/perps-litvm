@@ -50,75 +50,19 @@ import { ethers } from "ethers";
  * wrong yields a market id parsed as an address — garbage rows for wallets that do not
  * exist, and no rows for the wallets that do. It has its own test.
  */
-export const SOURCES = [
-  {
-    key: "positionManager",
-    label: "PositionManager",
-    addressVar: "QUEST_POSITION_MANAGER_ADDRESS",
-    deployBlockVar: "QUEST_POSITION_MANAGER_DEPLOY_BLOCK",
-    // `owner` is the trader. Indexed first.
-    event: "event PositionOpened(address indexed owner,bytes32 indexed market,bool isLong,uint256 collateral,uint256 sizeUsd,uint256 entryPrice)",
-    eventName: "PositionOpened",
-    walletTopic: 1,
-  },
-  {
-    key: "liquidityPool",
-    label: "LiquidityPool",
-    addressVar: "QUEST_LIQUIDITY_POOL_ADDRESS",
-    deployBlockVar: "QUEST_LIQUIDITY_POOL_DEPLOY_BLOCK",
-    // ERC-4626 Deposit. `sender` PAID the assets; `owner` merely received the shares.
-    // We credit the payer, matching provideLiquidityTier2 in the read path — depositing on
-    // someone else's behalf is the honest reading of "provide liquidity". Both are indexed,
-    // so switching is a one-line change to walletTopic if that call ever goes the other way.
-    event: "event Deposit(address indexed sender,address indexed owner,uint256 assets,uint256 shares)",
-    eventName: "Deposit",
-    walletTopic: 1,
-  },
-  {
-    key: "predictionFactory",
-    label: "prediction factory (8h, live)",
-    addressVar: "QUEST_PREDICTION_FACTORY_ADDRESS",
-    deployBlockVar: "QUEST_PREDICTION_FACTORY_DEPLOY_BLOCK",
-    event: "event BetPlaced(uint256 indexed marketId,address indexed better,uint8 side,uint256 amount)",
-    eventName: "BetPlaced",
-    // TOPIC 2, not 1 — marketId is indexed first. See the note above.
-    walletTopic: 2,
-  },
-  {
-    key: "predictionFactoryOld",
-    label: "prediction factory (24h, draining)",
-    addressVar: "QUEST_PREDICTION_FACTORY_OLD_ADDRESS",
-    deployBlockVar: "QUEST_PREDICTION_FACTORY_OLD_DEPLOY_BLOCK",
-    // Superseded on 2026-07-22 but still indexed: a bet placed there is real activity, and
-    // the contract is immutable. A wallet whose only action today was on the old factory
-    // must not be reported inactive.
-    event: "event BetPlaced(uint256 indexed marketId,address indexed better,uint8 side,uint256 amount)",
-    eventName: "BetPlaced",
-    walletTopic: 2,
-  },
-];
 
-/** The env vars the read path must agree with. Consumed by the parity test. */
-export const SOURCE_ADDRESS_VARS = SOURCES.map((s) => s.addressVar);
+import {
+  DEFAULT_DEPLOY_BLOCKS,
+  SOURCES,
+  SOURCE_ADDRESS_VARS,
+  SOURCE_DEPLOY_BLOCK_VARS,
+} from "./definitions.mjs";
 
-/**
- * SCAN FLOORS — the block each contract was deployed in, used ONLY by the backward settler.
- * The forward indexer never needs them (it starts at head and moves up).
- *
- * These MUST equal the read path's DEFAULT_DEPLOY_BLOCKS in api/_lib/quest/chain.js. A
- * settler walking to a different floor than the read path expects would write a
- * `scanned_to` the read path either rejects (floor mismatch — wasted work) or, worse,
- * accepts as "reached the floor" when it has not. A parity test pins both the names and
- * these values.
- */
-export const DEFAULT_DEPLOY_BLOCKS = {
-  QUEST_POSITION_MANAGER_DEPLOY_BLOCK: 23_302_630,
-  QUEST_LIQUIDITY_POOL_DEPLOY_BLOCK: 23_302_630,
-  QUEST_PREDICTION_FACTORY_DEPLOY_BLOCK: 32_222_320,
-  QUEST_PREDICTION_FACTORY_OLD_DEPLOY_BLOCK: 30_665_562,
-};
+// Re-exported so callers have one import site for "the sources and how to use them"; the
+// data itself lives in definitions.mjs precisely so the parity tests can reach it without
+// dragging ethers across the deployable boundary.
+export { DEFAULT_DEPLOY_BLOCKS, SOURCES, SOURCE_ADDRESS_VARS, SOURCE_DEPLOY_BLOCK_VARS };
 
-export const SOURCE_DEPLOY_BLOCK_VARS = SOURCES.map((s) => s.deployBlockVar);
 
 /**
  * The floor this source's coverage is measured against.

@@ -19,8 +19,15 @@ import { ONE_TIME_BUCKET as READ_PATH_BUCKET } from "../../api/_lib/quest/supaba
 import { QUESTS, QUEST_KIND } from "../../api/_lib/quest/quests.js";
 import { CHUNK_BLOCKS as SETTLER_CHUNK } from "../../../quest-indexer/lib/walk.mjs";
 import { ONE_TIME_BUCKET as SETTLER_BUCKET } from "../../../quest-indexer/lib/supabase.mjs";
-import { SETTLEABLE_QUESTS } from "../../../quest-indexer/lib/settler.mjs";
-import { DEFAULT_DEPLOY_BLOCKS, SOURCES, SOURCE_DEPLOY_BLOCK_VARS } from "../../../quest-indexer/lib/sources.mjs";
+// definitions.mjs, NOT sources.mjs: the latter imports ethers, which is not installed in
+// the frontend's test job. Keeping the shared data in a dependency-free module is what lets
+// the two suites stay independently runnable — see that file's header.
+import {
+  DEFAULT_DEPLOY_BLOCKS,
+  SETTLEABLE_QUESTS,
+  SOURCES,
+  SOURCE_DEPLOY_BLOCK_VARS,
+} from "../../../quest-indexer/lib/definitions.mjs";
 
 // The read path's floors are a module-private const in chain.js, so they are re-stated here
 // from that file. If chain.js changes one, this test fails and names it — which is the
