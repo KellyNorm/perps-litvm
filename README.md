@@ -86,12 +86,17 @@ This is a monorepo. Each part deploys independently.
 | `script/` | Foundry deployment / operations scripts. |
 | `lib/` | Foundry dependencies (git submodules). |
 | `keeper/` | Off-chain keeper service that fills orders 24/7. |
+| `quest-indexer/` | Quest participation indexer + background settler. Read-only, holds no key. |
 | `frontend/` | The trading dApp (React + Vite) → `app.tachyonfi.xyz`. |
 | `landing/` | Static marketing site (React + Vite) → `tachyonfi.xyz`. |
+| `supabase/` | SQL migrations for the quest tables. Applied by hand — nothing in CI applies them. |
 | `docs/` | Design notes, oracle calibration, deployment records. |
 | `foundry.toml` | Foundry configuration. |
 
-> The `frontend/`, `landing/`, and `keeper/` folders are self-contained and do not depend on one another.
+> The `frontend/`, `landing/`, `keeper/`, and `quest-indexer/` folders are self-contained and do not depend on one another. CI enforces the last one: `quest-indexer/test/isolation.test.mjs` fails if it grows an import across a deployable boundary.
+
+**Running services and how to diagnose them: [`docs/services.md`](docs/services.md)** — what each
+deployable does, what it needs, and the checklist for "is the quest index healthy?".
 
 ## Network
 
