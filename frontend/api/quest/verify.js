@@ -25,6 +25,7 @@
 
 import { createLimiter, memoryDriver } from "../_lib/rateLimit.js";
 import { cacheKey, createCache, memoryCacheDriver, nullCacheDriver, utcDay } from "../_lib/quest/cache.js";
+import { supabaseCacheDriver } from "../_lib/quest/supabaseCache.js";
 import { ConfigError, chainId } from "../_lib/quest/chain.js";
 import { QUEST_IDS, QUEST_KIND, SOURCE, STATUS, getQuest } from "../_lib/quest/quests.js";
 import { clientKey } from "../_lib/request.js";
@@ -63,17 +64,41 @@ function getLimiter() {
 // Likewise module-scoped: a warm instance reuses whatever the cache remembers, which is
 // the only reason an in-memory driver caches anything at all.
 //
-// QUEST_CACHE selects the driver: "memory" (default) or "none". "none" is for debugging a
-// wallet whose cached completion you want to bypass — and it is safe to leave on, because
-// the cache only ever holds proven completions, so disabling it costs latency and nothing
-// else. A durable Supabase driver joins the switch in phase 2.
+// QUEST_CACHE selects the driver:
+//   "memory"   (default) in-process, per-instance, lost on cold start
+//   "supabase"           durable, shared across instances and deploys
+//   "none"               always miss — for debugging a wallet whose cached completion you
+//                        want to bypass. Safe to leave on: the cache only ever holds
+//                        proven completions, so disabling it costs latency and nothing else.
+//
+// "supabase" DEGRADES TO MEMORY rather than failing, and says so loudly. A missing or
+// typo'd SUPABASE_* var is a configuration mistake, and the honest response to it is a
+// slower-but-correct endpoint plus an error in the log — not a 503 on every verification,
+// which is what throwing from this request-path constructor would produce. The failure
+// mode is lost durability, never a wrong answer.
 let cache;
 function getCache() {
   if (!cache) {
-    const driver = (process.env.QUEST_CACHE || "memory").trim() === "none" ? nullCacheDriver() : memoryCacheDriver();
-    cache = createCache(driver);
+    cache = createCache(selectDriver((process.env.QUEST_CACHE || "memory").trim()));
   }
   return cache;
+}
+
+function selectDriver(mode) {
+  if (mode === "none") return nullCacheDriver();
+
+  if (mode === "supabase") {
+    const driver = supabaseCacheDriver();
+    if (driver) return driver;
+
+    console.error(
+      "[quest] QUEST_CACHE=supabase but SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not both " +
+        "set — falling back to the in-memory cache. Verification is unaffected; durability is lost.",
+    );
+    return memoryCacheDriver();
+  }
+
+  return memoryCacheDriver();
 }
 
 /** Test seam: drop the cached driver so the next request rebuilds it from current env. */
