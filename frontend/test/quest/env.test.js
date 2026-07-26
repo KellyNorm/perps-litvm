@@ -34,6 +34,18 @@ function walk(dir) {
   return out;
 }
 
+/** Every file, whatever the extension — src/ is .js and .jsx, and a leaked secret does
+ *  not care which. Deliberately not filtered by extension: the point is coverage. */
+function walkAll(dir) {
+  const out = [];
+  for (const entry of readdirSync(dir)) {
+    const full = path.join(dir, entry);
+    if (statSync(full).isDirectory()) out.push(...walkAll(full));
+    else out.push(full);
+  }
+  return out;
+}
+
 describe("secrets never carry a VITE_ prefix", () => {
   test("no SUPABASE_* variable is VITE_-prefixed in .env.example", () => {
     const offenders = declaredVars(envExample).filter((name) => /^VITE_.*SUPABASE/.test(name));
@@ -51,6 +63,20 @@ describe("secrets never carry a VITE_ prefix", () => {
     const declared = declaredVars(envExample);
     assert.ok(declared.includes("SUPABASE_SERVICE_ROLE_KEY"));
     assert.ok(declared.includes("SUPABASE_URL"));
+  });
+
+  // The prefix rule above only governs what .env.example DECLARES. This governs where the
+  // name is READ: src/ is the Vite tree, and Vite resolves process.env/import.meta.env
+  // references there at build time. A SUPABASE_ mention that drifts into src/ is a
+  // full-table credential published to every visitor — a file in the wrong directory
+  // rather than a wrong function, which is why this is a grep over the tree.
+  test("src/ never references SUPABASE_ anything", () => {
+    const clientFiles = walkAll(path.join(frontendRoot, "src"));
+    const offenders = clientFiles
+      .filter((f) => readFileSync(f, "utf8").includes("SUPABASE_"))
+      .map((f) => path.relative(frontendRoot, f));
+
+    assert.deepEqual(offenders, [], "the service-role key bypasses RLS and must stay server-side");
   });
 });
 
