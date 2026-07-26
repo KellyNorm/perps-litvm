@@ -95,6 +95,9 @@ describe("read-only: this service holds no key and touches no money path", () =>
       "QUEST_LIQUIDITY_POOL_ADDRESS",
       "QUEST_PREDICTION_FACTORY_ADDRESS",
       "QUEST_PREDICTION_FACTORY_OLD_ADDRESS",
+      "QUEST_INDEXER_CONFIRMATIONS",
+      "QUEST_INDEXER_MAX_RANGE",
+      "QUEST_INDEXER_INTERVAL_MS",
     ]);
 
     for (const file of files) {
