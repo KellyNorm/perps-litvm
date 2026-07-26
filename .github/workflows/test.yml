@@ -25,11 +25,33 @@ jobs:
       - name: Show Forge version
         run: forge --version
 
+      # The RedStone oracle tests run with ffi = true and shell out to
+      # test/ffi/redstone-mock-payload.js, which requires @redstone-finance/evm-connector
+      # from the root package.json. Without this the FFI call exits 1 and those suites
+      # fail. Previously invisible: the size gate killed the job before the test step.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.x # root package.json engines: >=20 <23
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install FFI test dependencies
+        run: npm ci
+
       - name: Run Forge fmt
         run: forge fmt --check
 
       - name: Run Forge build
-        run: forge build --sizes
+        run: forge build
+
+      # EIP-170 caps *deployed* runtime bytecode. Test harnesses in test/*.t.sol are
+      # never broadcast, so including them made the gate fail on contracts the limit
+      # cannot apply to. Scoped to deployable code, it now fails only when something
+      # we actually ship crosses 24,576 bytes — which matters, because PositionManager
+      # sits at 23,919 (+657, ~2.7% headroom). The build step above still compiles the
+      # tests, so a broken harness is still caught.
+      - name: Check deployed contract sizes (EIP-170)
+        run: forge build --sizes --skip test --skip script
 
       - name: Run Forge tests
         run: forge test -vvv
