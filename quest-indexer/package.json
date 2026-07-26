@@ -1,0 +1,17 @@
+{
+  "name": "perps-litvm-quest-indexer",
+  "version": "1.0.0",
+  "description": "Standalone quest indexer for the perps stack on LitVM (chain 4441). Forward-indexes participation events into quest_daily and backward-settles deep quest_cursor coverage. READ-ONLY on chain, writes only to Supabase — it holds no key and touches no money path.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node index.mjs",
+    "test": "node --test \"test/**/*.test.mjs\""
+  },
+  "dependencies": {
+    "ethers": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=20 <23"
+  }
+}

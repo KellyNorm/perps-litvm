@@ -56,6 +56,36 @@ jobs:
       - name: Run Forge tests
         run: forge test -vvv
 
+  # Separate job for the same reason the frontend one is separate, and for a second reason
+  # specific to this service: quest-indexer/ is a deployable that must stay independent of
+  # keeper/ and frontend/, and its own test job is part of how that stays true. Its
+  # isolation suite fails if the service ever grows a signer or an import across the
+  # deployable boundary.
+  quest-indexer:
+    name: Quest indexer tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: quest-indexer
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.x # matches quest-indexer/package.json engines
+          cache: npm
+          cache-dependency-path: quest-indexer/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
   # Separate job on purpose: the Foundry job is red on a known EIP-170 contract-size
   # gap (see #4), and a suite folded into it would be invisible behind that red. This
   # reports its own status so a JS regression is distinguishable from the known gap.
