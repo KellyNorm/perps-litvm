@@ -524,3 +524,107 @@ describe("the registry", () => {
     assert.equal(QUESTS.both_products.kind, QUEST_KIND.COMPOSITE);
   });
 });
+
+// ============================================================================
+// TIER 2 RESUME — the endpoint's half of the convergence story.
+// ============================================================================
+describe("tier 2 resume wiring", () => {
+  const exhausted = () => ({
+    found: false,
+    complete: false,
+    exhausted: true,
+    coverage: [],
+    reason: "budget_exhausted",
+  });
+  const proven = () => ({ found: false, complete: true, exhausted: false, coverage: [], reason: null });
+
+  test("tier2 is handed the coverage store alongside the head it already fetched", async () => {
+    let seen;
+    const id = registerQuest("cursor_probe", {
+      tier1: async () => tier1(false),
+      tier2: async (_address, opts) => {
+        seen = opts;
+        return exhausted();
+      },
+    });
+
+    await verifyQuest(QUESTS[id], ADDRESS);
+
+    // Everything the cursor row is keyed by must reach the scan, or coverage would be
+    // filed under the wrong key and silently never resumed.
+    assert.equal(seen.head, 33_000_000, "still reuses Tier 1's head — one eth_blockNumber");
+    assert.equal(seen.quest, id);
+    assert.equal(typeof seen.chainId, "number");
+    assert.equal(typeof seen.cursors.load, "function");
+    assert.equal(typeof seen.cursors.save, "function");
+  });
+
+  // The whole point of step 3, seen from outside: the same wallet asking the same question
+  // gets a different, better answer as coverage accumulates.
+  test("a deep wallet answers indeterminate until coverage settles, then confirmed", async () => {
+    let polls = 0;
+    const id = registerQuest("converging", {
+      tier1: async () => tier1(false),
+      tier2: async () => (++polls < 3 ? exhausted() : proven()),
+    });
+
+    const answers = [];
+    for (let i = 0; i < 3; i++) {
+      const res = mockRes();
+      await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+      answers.push([res.body.status, res.body.completed, res.body.reason ?? null]);
+    }
+
+    assert.deepEqual(answers, [
+      [STATUS.INDETERMINATE, false, "budget_exhausted"],
+      [STATUS.INDETERMINATE, false, "budget_exhausted"],
+      [STATUS.CONFIRMED, false, null],
+    ]);
+    // If an indeterminate were ever cached, polls would stop at 1 and the wallet would be
+    // stuck on "we don't know" forever — the exact failure this endpoint exists to avoid.
+    assert.equal(polls, 3, "an indeterminate must never be cached; every poll re-verifies");
+  });
+
+  test("even a PROVEN false is re-verified rather than hardened", async () => {
+    let polls = 0;
+    const id = registerQuest("proven_false", {
+      tier1: async () => tier1(false),
+      tier2: async () => {
+        polls++;
+        return proven();
+      },
+    });
+
+    for (let i = 0; i < 2; i++) {
+      const res = mockRes();
+      await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+      assert.equal(res.body.status, STATUS.CONFIRMED);
+      assert.equal(res.body.completed, false);
+    }
+
+    // A false is only true until the user does the thing — which, on a quest board, is what
+    // they are about to do. Coverage is durable; the verdict derived from it is not.
+    assert.equal(polls, 2, "a confirmed false must not be cached");
+  });
+
+  test("a scan that finds the event still short-circuits to a cached completion", async () => {
+    let polls = 0;
+    const id = registerQuest("found_then_cached", {
+      tier1: async () => tier1(false),
+      tier2: async () => {
+        polls++;
+        return { found: true, complete: true, exhausted: false, coverage: [], reason: null };
+      },
+    });
+
+    const first = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), first);
+    const second = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), second);
+
+    assert.equal(first.body.completed, true);
+    assert.equal(first.body.source, SOURCE.TIER2);
+    assert.equal(second.body.source, SOURCE.CACHE, "a proven completion is the one thing kept");
+    assert.equal(polls, 1, "and it is never re-scanned");
+  });
+});

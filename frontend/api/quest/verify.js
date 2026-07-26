@@ -25,7 +25,9 @@
 
 import { createLimiter, memoryDriver } from "../_lib/rateLimit.js";
 import { cacheKey, createCache, memoryCacheDriver, nullCacheDriver, utcDay } from "../_lib/quest/cache.js";
+import { createCursorStore, memoryCursorDriver, nullCursorDriver } from "../_lib/quest/cursor.js";
 import { supabaseCacheDriver } from "../_lib/quest/supabaseCache.js";
+import { supabaseCursorDriver } from "../_lib/quest/supabaseCursor.js";
 import { ConfigError, chainId } from "../_lib/quest/chain.js";
 import { QUEST_IDS, QUEST_KIND, SOURCE, STATUS, getQuest } from "../_lib/quest/quests.js";
 import { clientKey } from "../_lib/request.js";
@@ -101,9 +103,51 @@ function selectDriver(mode) {
   return memoryCacheDriver();
 }
 
-/** Test seam: drop the cached driver so the next request rebuilds it from current env. */
+// The COVERAGE cursor store — separate from the verdict cache above, and separate on
+// purpose: that one holds answers, this one holds which block ranges have been walked. See
+// the header of _lib/quest/cursor.js for why conflating them would be a correctness bug
+// rather than a tidiness one.
+//
+// QUEST_CURSOR selects the driver and defaults to whatever QUEST_CACHE selected, because in
+// practice they share a project and a key and nobody wants to set two vars to the same
+// value. Setting it explicitly is the kill switch: QUEST_CURSOR=none disables resume and
+// every poll walks from head again — slower, and incapable of settling a deep wallet, but
+// never wrong. Useful when a wallet's stored coverage is suspect.
+let cursors;
+function getCursors() {
+  if (!cursors) {
+    const mode = (process.env.QUEST_CURSOR || process.env.QUEST_CACHE || "memory").trim();
+    cursors = createCursorStore(selectCursorDriver(mode));
+  }
+  return cursors;
+}
+
+function selectCursorDriver(mode) {
+  if (mode === "none") return nullCursorDriver();
+
+  if (mode === "supabase") {
+    const driver = supabaseCursorDriver();
+    if (driver) return driver;
+
+    console.error(
+      "[quest] QUEST_CURSOR=supabase but SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not both " +
+        "set — falling back to in-memory coverage. Verification is unaffected; deep-history " +
+        "wallets will stay indeterminate because coverage no longer survives a cold start.",
+    );
+    return memoryCursorDriver();
+  }
+
+  return memoryCursorDriver();
+}
+
+/**
+ * Test seam: drop both cached stores so the next request rebuilds them from current env.
+ * Both, not just the cache — they are configured by different vars and a test that changes
+ * one would otherwise keep a store built from the previous environment.
+ */
 export function _resetCache() {
   cache = null;
+  cursors = null;
 }
 
 /**
@@ -274,7 +318,18 @@ export async function verifyQuest(definition, address) {
   }
 
   // Reuses Tier 1's head, so both tiers together cost one eth_blockNumber.
-  const scan = await definition.tier2(address, { head: tier1.checkedThroughBlock });
+  //
+  // The cursor store makes this scan RESUMABLE: it picks up the coverage earlier polls
+  // accumulated for this (chain, wallet, quest) and extends it at both ends. That is what
+  // lets `scan.complete` below eventually become true for a wallet whose history is far
+  // deeper than one invocation's budget — the answer converges over polls instead of
+  // returning indeterminate forever.
+  const scan = await definition.tier2(address, {
+    head: tier1.checkedThroughBlock,
+    chainId: chainId(),
+    quest: definition.id,
+    cursors: getCursors(),
+  });
 
   if (scan.found) {
     return {
@@ -285,7 +340,10 @@ export async function verifyQuest(definition, address) {
     };
   }
 
-  // The one path to a confirmed false: every source walked to a validated floor, no holes.
+  // The one path to a confirmed false: every source covered from a validated floor up to
+  // head, no holes. `complete` is DERIVED from the accumulated coverage on every call and
+  // is never read out of storage — see coverageProvesAbsence() in scan.js. Nothing anywhere
+  // persists a negative; what persists is which blocks were read.
   if (scan.complete) {
     return {
       completed: false,

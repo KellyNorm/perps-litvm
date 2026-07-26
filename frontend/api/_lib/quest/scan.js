@@ -36,13 +36,37 @@
 // TIME_BUDGET_MS binds long before MAX_CHUNKS: one invocation covers ~50k blocks (~15s),
 // about 4.5 hours of chain history at ~0.32s/block. MAX_CHUNKS is a backstop.
 //
-// NOTE ON REACH — READ BEFORE RELYING ON A NEGATIVE. The perps contracts sit ~10M blocks
-// below head; a full walk there is ~3,000 seconds of getLogs, two orders of magnitude past
-// the 30s function limit. Any wallet whose activity is older than a few hours therefore
-// comes back INDETERMINATE, not confirmed-false. That is correct — the cache never hardens
-// it and the caller retries — but it means a single invocation CANNOT prove a negative for
-// historical activity. Closing that gap needs a resumable cursor across invocations backed
-// by durable storage, not a bigger budget.
+// NOTE ON REACH. The perps contracts sit ~10M blocks below head; a full walk there is
+// ~3,000 seconds of getLogs, two orders of magnitude past the 30s function limit. ONE
+// invocation therefore cannot prove a negative for historical activity — which is why this
+// scanner is RESUMABLE. `priorCoverage` carries in the block ranges earlier polls already
+// walked; each poll extends them; the verdict is derived from the accumulated total. A deep
+// wallet converges indeterminate → confirmed over several polls instead of never.
+//
+// ============================================================================
+// COVERAGE IS THE STATE. THE VERDICT IS DERIVED, NEVER CARRIED.
+// ============================================================================
+// Nothing in or out of this module stores an answer. `priorCoverage` is a set of intervals
+// meaning "these blocks were read and held no matching event" — a fact about work done —
+// and `complete` is recomputed from those intervals on EVERY call by
+// coverageProvesAbsence(). A missing, malformed, stale-floored or short-of-floor interval
+// simply fails that test and the answer degrades to indeterminate. There is no
+// representation for "this wallet did nothing", so no bug can persist one.
+//
+// TWO ENDS ADVANCE PER POLL, in this order and under ONE shared budget:
+//
+//   PHASE A — close the top gap. head moved since the last poll, so [scanned_from+1 .. head]
+//             is unread. Closing it first keeps the coverage a contiguous interval anchored
+//             at the CURRENT head, which is what makes a derived false honest as of `head`.
+//             All sources close their (small) gaps before any source descends, so a deep
+//             source cannot starve a shallow one's gap forever.
+//   PHASE B — descend from scanned_to-1 toward the floor, spending whatever budget is left.
+//
+// CONTIGUITY IS THE WRITER'S JOB (see 0002_quest_cursor.sql). Two rules enforce it here:
+//   * a gap that does not fully close does NOT advance scanned_from — the partial work is
+//     discarded rather than recorded over a hole;
+//   * a lost chunk during descent FREEZES that source's frontier — the walk continues (a
+//     positive below a hole is still proof) but nothing below the hole is ever recorded.
 
 import { hasCodeAt } from "./chain.js";
 import { withRetry } from "../chain/withRetry.js";
@@ -65,21 +89,88 @@ export const MAX_CHUNKS = 12;
 export const TIME_BUDGET_MS = 10_000;
 
 /**
- * Walk one or more (contract, filter) sources backward from `head`.
+ * Stable identity for a source's coverage row. It is the CONTRACT ADDRESS, which is what
+ * makes a redeploy self-invalidating: the new address finds no row and starts a fresh walk
+ * instead of inheriting coverage of a different contract (0002_quest_cursor.sql).
+ */
+export function sourceKeyOf(source) {
+  const raw = source?.sourceKey ?? source?.address ?? source?.contract?.address ?? "";
+  return typeof raw === "string" ? raw.trim().toLowerCase() : "";
+}
+
+/**
+ * Is this stored interval usable as coverage for this source?
  *
- * Sources are walked in the order given, each descending from head to its own floor, and
- * they SHARE one budget. Order them most-likely-first: if the budget runs out before a
- * later source is reached, the result is `exhausted`, not a false.
+ * FLOOR COUPLING lives here. A floor is bound to an address (chain.js), and coverage
+ * computed against a different floor cannot be trusted: a floor moved DOWN means there is
+ * unwalked history below what we covered; a floor moved UP means the walk may have been
+ * reading a different contract. Either way the honest move is to discard and re-walk —
+ * which costs a few polls of latency and can never cost a wrong answer.
+ *
+ * Shape is re-checked too, even though the table CHECKs it. This is the last gate before
+ * an interval is allowed to count toward a proven negative, and it is cheap.
+ */
+export function isUsablePrior(prior, source) {
+  if (!prior) return false;
+  if (prior.floorBlock !== source.floor) return false; // floor moved → coverage is void
+  if (!Number.isInteger(prior.scannedFrom) || !Number.isInteger(prior.scannedTo)) return false;
+  if (prior.scannedTo < prior.floorBlock) return false; // below the floor is not coverage
+  if (prior.scannedTo > prior.scannedFrom) return false; // not an interval
+  return true;
+}
+
+/**
+ * THE DERIVATION. Coverage in, verdict out — the only place a `false` is ever produced.
+ *
+ * Absence is proven only when EVERY source is covered from its floor up to the CURRENT
+ * head, with no source missing and none short:
+ *
+ *   scannedTo === floor   equality, not <=. scanForEvent clamps every chunk with
+ *                         max(floor, …) so a walk cannot go below its floor, and the table
+ *                         CHECK refuses to store an interval that claims it did. "Reached
+ *                         the floor" is therefore exactly equality; `<=` would let a
+ *                         corrupt row buy a proven negative it did not earn.
+ *   scannedFrom >= head   the top of the interval must reach the block this answer is
+ *                         reported `checkedThroughBlock`. Coverage that stops below head
+ *                         says nothing about the blocks in between — where the event could
+ *                         well be — so it derives to indeterminate, and the next poll's
+ *                         Phase A closes the gap.
+ *
+ * No sources means nothing was proven, not "proven vacuously".
+ */
+export function coverageProvesAbsence(sources, coverage, head) {
+  if (!Array.isArray(sources) || sources.length === 0) return false;
+
+  return sources.every((source) => {
+    const cov = coverage?.[sourceKeyOf(source)];
+    if (!cov) return false;
+    if (!Number.isInteger(cov.scannedFrom) || !Number.isInteger(cov.scannedTo)) return false;
+    return cov.scannedTo === source.floor && cov.scannedFrom >= head;
+  });
+}
+
+/**
+ * Walk one or more (contract, filter) sources backward from `head`, resuming from whatever
+ * earlier polls already covered.
+ *
+ * Sources SHARE one budget. Order them most-likely-first: if the budget runs out before a
+ * later source is reached, the result is `exhausted`, not a false. Progress made by ANY
+ * source is still returned in `coverage`, so a starved source is only slower, never lost.
  *
  * @param {Array<{contract, filter, floor: number, address?: string, label?: string}>} sources
  * @param {object} opts
  * @param {number} opts.head            block to start from (inclusive)
+ * @param {Record<string, {floorBlock, scannedFrom, scannedTo}>} [opts.priorCoverage]
+ *        coverage from earlier polls, keyed by sourceKeyOf(). Absent/stale entries are
+ *        simply ignored — the walk restarts from head, which is slow, never wrong.
  * @param {number} [opts.chunkBlocks]
  * @param {number} [opts.maxChunks]
  * @param {number} [opts.timeBudgetMs]
  * @param {() => number} [opts.now]     injectable clock, for deterministic budget tests
  * @param {(source) => Promise<boolean>} [opts.verifyFloor] see FLOOR VALIDATION below
- * @returns {Promise<{found, complete, exhausted, chunksUsed, scannedFrom, scannedDownTo, reason}>}
+ * @returns {Promise<{found, complete, exhausted, chunksUsed, scannedFrom, scannedDownTo,
+ *                    coverage: Array<{sourceKey, floorBlock, scannedFrom, scannedTo, dirty}>,
+ *                    reason}>}
  */
 export async function scanForEvent(sources, opts) {
   const {
@@ -89,6 +180,7 @@ export async function scanForEvent(sources, opts) {
     timeBudgetMs = TIME_BUDGET_MS,
     now = () => Date.now(),
     verifyFloor = defaultVerifyFloor,
+    priorCoverage = null,
   } = opts;
 
   const startedAt = now();
@@ -99,49 +191,140 @@ export async function scanForEvent(sources, opts) {
 
   const budgetSpent = () => chunksUsed >= maxChunks || now() - startedAt >= timeBudgetMs;
 
-  for (const source of sources) {
-    let hi = head;
+  // Working coverage, seeded from the durable rows. `from`/`to` null means "no usable
+  // coverage for this source" — the state a fresh wallet, a redeployed address and a
+  // failed cursor read all share, and all three correctly walk from head.
+  const states = sources.map((source) => {
+    const key = sourceKeyOf(source);
+    const prior = priorCoverage?.[key];
+    const usable = isUsablePrior(prior, source);
+    return {
+      source,
+      key,
+      from: usable ? prior.scannedFrom : null,
+      to: usable ? prior.scannedTo : null,
+      // Set by a lost chunk: the frontier must never advance past a hole.
+      frozen: false,
+      // Did this poll change anything worth persisting?
+      dirty: false,
+    };
+  });
 
-    while (hi >= source.floor) {
-      if (budgetSpent()) {
-        ranOutOfBudget = true;
-        break;
-      }
+  /**
+   * Walk [floorOfWalk .. hi] descending in chunks, reporting each outcome to `onChunk`.
+   * Returns "found" | "done" | "error" | "budget".
+   */
+  async function walkDown(source, hi, floorOfWalk, onChunk) {
+    let cursor = hi;
+    let outcome = "done";
 
-      const lo = Math.max(source.floor, hi - chunkBlocks + 1);
+    while (cursor >= floorOfWalk) {
+      if (budgetSpent()) return "budget";
+
+      const lo = Math.max(floorOfWalk, cursor - chunkBlocks + 1);
       chunksUsed++;
 
       try {
-        const logs = await withRetry(() => source.contract.queryFilter(source.filter, lo, hi));
+        const logs = await withRetry(() => source.contract.queryFilter(source.filter, lo, cursor));
         scannedDownTo = Math.min(scannedDownTo, lo);
 
         // RULE 1: proof. Stop everything.
-        if (logs.length > 0) {
-          return result({
-            found: true,
-            complete: true,
-            exhausted: false,
-            chunksUsed,
-            scannedFrom: head,
-            scannedDownTo: lo,
-            reason: null,
-          });
-        }
+        if (logs.length > 0) return "found";
+        onChunk(lo);
       } catch (err) {
         // withRetry already absorbed the transient case, so this chunk is genuinely lost.
-        // A lost chunk is a hole in the coverage: whatever else happens, this scan can no
-        // longer prove a negative.
+        // A lost chunk is a hole: this scan can no longer prove a negative, and nothing
+        // below the hole may be recorded as coverage.
         hadChunkError = true;
-        console.error(`[quest] scan chunk ${lo}-${hi} failed${label(source)}:`, err?.message);
+        outcome = "error";
+        console.error(`[quest] scan chunk ${lo}-${cursor} failed${label(source)}:`, err?.message);
+        onChunk(null);
       }
 
-      hi = lo - 1;
+      cursor = lo - 1;
     }
 
-    if (ranOutOfBudget) break;
+    return outcome;
   }
 
-  if (ranOutOfBudget || hadChunkError) {
+  const foundResult = () =>
+    result({
+      found: true,
+      complete: true,
+      exhausted: false,
+      chunksUsed,
+      scannedFrom: head,
+      scannedDownTo,
+      // Deliberately empty. A proven completion is recorded in quest_completion and the
+      // cursor for this wallet/quest is never consulted again — persisting the partial
+      // interval that happened to be walked on the way would be write traffic for a row
+      // nothing will ever read.
+      coverage: [],
+      reason: null,
+    });
+
+  // PHASE A — close the top gap on every source before any source descends.
+  for (const st of states) {
+    if (st.from === null) continue; // no prior coverage; Phase B starts at head anyway
+    if (st.from >= head) continue; // already current
+
+    const out = await walkDown(st.source, head, st.from + 1, () => {});
+    if (out === "found") return foundResult();
+    if (out === "budget") {
+      ranOutOfBudget = true;
+      break;
+    }
+    // Only a FULLY closed gap advances the top. A partial close is discarded: recording it
+    // would put a hole inside an interval that later reads count as contiguous.
+    if (out === "done") {
+      st.from = head;
+      st.dirty = true;
+    }
+  }
+
+  // PHASE B — descend toward the floor with what is left of the budget.
+  if (!ranOutOfBudget) {
+    for (const st of states) {
+      const start = st.to === null ? head : st.to - 1;
+      if (start < st.source.floor) continue; // already at the floor; nothing left to walk
+
+      const out = await walkDown(st.source, start, st.source.floor, (lo) => {
+        if (lo === null) {
+          st.frozen = true;
+          return;
+        }
+        if (st.frozen) return; // below a hole — read, but not contiguous, so not coverage
+        // First coverage for this source: the interval is anchored at this poll's head.
+        if (st.from === null) st.from = head;
+        st.to = lo;
+        st.dirty = true;
+      });
+
+      if (out === "found") return foundResult();
+      if (out === "budget") {
+        ranOutOfBudget = true;
+        break;
+      }
+    }
+  }
+
+  const coverage = states
+    .filter((st) => st.key && st.from !== null && st.to !== null)
+    .map((st) => ({
+      sourceKey: st.key,
+      floorBlock: st.source.floor,
+      scannedFrom: st.from,
+      scannedTo: st.to,
+      dirty: st.dirty,
+    }));
+
+  const byKey = Object.fromEntries(coverage.map((c) => [c.sourceKey, c]));
+  const proves = coverageProvesAbsence(sources, byKey, head);
+
+  // hadChunkError vetoes even coverage that looks complete. The frozen frontier already
+  // makes that combination unreachable; the veto stays because "a hole existed somewhere
+  // in this poll" is exactly the condition under which we would rather be slow than wrong.
+  if (!proves || hadChunkError) {
     return result({
       found: false,
       complete: false,
@@ -149,7 +332,11 @@ export async function scanForEvent(sources, opts) {
       chunksUsed,
       scannedFrom: head,
       scannedDownTo: Math.min(scannedDownTo, head + 1),
-      reason: ranOutOfBudget ? "budget_exhausted" : "chunk_error",
+      coverage,
+      // A lost chunk outranks a spent budget when both happened. Running out of budget is
+      // the normal, expected outcome of a deep walk and says nothing is wrong; a lost chunk
+      // is a real fault, and it is the one worth surfacing to whoever reads the reason.
+      reason: hadChunkError ? "chunk_error" : ranOutOfBudget ? "budget_exhausted" : "coverage_incomplete",
     });
   }
 
@@ -159,6 +346,11 @@ export async function scanForEvent(sources, opts) {
   // manufacture a confident false. One eth_getCode per source, on the negative path only,
   // closes that: if the contract already existed below the floor, the floor is wrong and
   // the answer degrades to indeterminate.
+  //
+  // THIS RUNS ON EVERY DERIVATION, not only on the poll that reaches the floor. A poll that
+  // walks no chunks at all because prior coverage already spans floor→head still pays for
+  // it — the coverage is durable and long-lived, and the floor it was computed against must
+  // be re-proved each time it is cashed in for a negative.
   for (const source of sources) {
     let floorOk;
     try {
@@ -180,12 +372,13 @@ export async function scanForEvent(sources, opts) {
         chunksUsed,
         scannedFrom: head,
         scannedDownTo,
+        coverage,
         reason: "floor_unverified",
       });
     }
   }
 
-  // RULE 2 satisfied: every source walked to a validated floor, no holes. A real negative.
+  // RULE 2 satisfied: every source covered from a validated floor up to head, no holes.
   return result({
     found: false,
     complete: true,
@@ -193,6 +386,7 @@ export async function scanForEvent(sources, opts) {
     chunksUsed,
     scannedFrom: head,
     scannedDownTo,
+    coverage,
     reason: null,
   });
 }
