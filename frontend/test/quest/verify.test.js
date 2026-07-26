@@ -628,3 +628,137 @@ describe("tier 2 resume wiring", () => {
     assert.equal(polls, 1, "and it is never re-scanned");
   });
 });
+
+// ============================================================================
+// SCAN DEPTH IN THE ENVELOPE. A deep indeterminate and a stuck one are otherwise
+// indistinguishable from outside, and they call for opposite responses.
+// ============================================================================
+describe("coverage reporting", () => {
+  const scan = (over = {}) => ({
+    found: false,
+    complete: false,
+    exhausted: true,
+    reason: "budget_exhausted",
+    coverage: [
+      { sourceKey: "0xaaa", floorBlock: 23_302_630, scannedFrom: 33_000_000, scannedTo: 33_000_000 - 200_000, dirty: true },
+    ],
+    ...over,
+  });
+
+  test("an indeterminate reports how far each source has been walked", async () => {
+    const id = registerQuest("depth", { tier1: async () => tier1(false), tier2: async () => scan() });
+
+    const res = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+
+    assert.equal(res.body.status, STATUS.INDETERMINATE);
+    assert.deepEqual(res.body.coverage, [
+      {
+        source: "0xaaa",
+        scannedFrom: 33_000_000,
+        scannedTo: 32_800_000,
+        floor: 23_302_630,
+        // The actionable number: how much is left before this source could support a false.
+        remaining: 32_800_000 - 23_302_630,
+      },
+    ]);
+  });
+
+  // Watching this shrink across polls IS the convergence, seen from outside.
+  test("remaining shrinks as coverage accumulates", async () => {
+    let depth = 33_000_000;
+    const id = registerQuest("shrinking", {
+      tier1: async () => tier1(false),
+      tier2: async () => {
+        depth -= 200_000;
+        return scan({ coverage: [{ sourceKey: "0xaaa", floorBlock: 23_302_630, scannedFrom: 33_000_000, scannedTo: depth, dirty: true }] });
+      },
+    });
+
+    const seen = [];
+    for (let i = 0; i < 3; i++) {
+      const res = mockRes();
+      await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+      seen.push(res.body.coverage[0].remaining);
+    }
+
+    assert.ok(seen[0] > seen[1] && seen[1] > seen[2], `expected a descending walk, got ${seen}`);
+  });
+
+  test("a proven false reports remaining: 0 — the claim, in auditable form", async () => {
+    const id = registerQuest("proven", {
+      tier1: async () => tier1(false),
+      tier2: async () =>
+        scan({
+          complete: true,
+          exhausted: false,
+          reason: null,
+          coverage: [{ sourceKey: "0xaaa", floorBlock: 23_302_630, scannedFrom: 33_000_000, scannedTo: 23_302_630, dirty: true }],
+        }),
+    });
+
+    const res = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+
+    assert.equal(res.body.status, STATUS.CONFIRMED);
+    assert.equal(res.body.completed, false);
+    assert.equal(res.body.coverage[0].remaining, 0);
+  });
+
+  // scannedFrom lagging checkedThroughBlock is the signature of a top gap that did not
+  // close — a different problem from "still descending", and invisible without this field.
+  test("a lagging scannedFrom is visible against checkedThroughBlock", async () => {
+    const id = registerQuest("stale_top", {
+      tier1: async () => tier1(false),
+      tier2: async () =>
+        scan({ coverage: [{ sourceKey: "0xaaa", floorBlock: 0, scannedFrom: 32_900_000, scannedTo: 32_800_000, dirty: false }] }),
+    });
+
+    const res = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+
+    assert.equal(res.body.checkedThroughBlock, 33_000_000);
+    assert.ok(res.body.coverage[0].scannedFrom < res.body.checkedThroughBlock);
+  });
+
+  test("a found event reports no coverage — there is nothing left to walk", async () => {
+    const id = registerQuest("found", {
+      tier1: async () => tier1(false),
+      tier2: async () => scan({ found: true, complete: true, exhausted: false, reason: null, coverage: [] }),
+    });
+
+    const res = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+
+    assert.equal(res.body.completed, true);
+    assert.ok(!("coverage" in res.body), "the field is omitted, not an empty array");
+  });
+
+  test("a cache hit reports no coverage — nothing was scanned", async () => {
+    const id = registerQuest("cached", {
+      tier1: async () => tier1(true),
+      tier2: async () => scan(),
+    });
+
+    const first = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), first);
+    const second = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), second);
+
+    assert.equal(second.body.source, SOURCE.CACHE);
+    assert.ok(!("coverage" in second.body));
+  });
+
+  test("a scan that walked nothing omits the field rather than reporting an empty walk", async () => {
+    const id = registerQuest("nothing", {
+      tier1: async () => tier1(false),
+      tier2: async () => scan({ coverage: [] }),
+    });
+
+    const res = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+
+    assert.equal(res.body.status, STATUS.INDETERMINATE);
+    assert.ok(!("coverage" in res.body));
+  });
+});

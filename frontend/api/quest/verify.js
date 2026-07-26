@@ -22,6 +22,9 @@
 //
 // Request:  { "address": "0x…", "quest": "first_trade" }
 // Response: { address, quest, completed, status, source, checkedThroughBlock, asOf }
+//           plus `reason` whenever the answer is not settled, and `coverage` whenever a
+//           Tier 2 scan has walked anything — see withCoverage() for why a depth belongs in
+//           the envelope rather than only in the database.
 
 import { createLimiter, memoryDriver } from "../_lib/rateLimit.js";
 import { cacheKey, createCache, memoryCacheDriver, nullCacheDriver, utcDay } from "../_lib/quest/cache.js";
@@ -350,6 +353,10 @@ export async function verifyQuest(definition, address) {
       status: STATUS.CONFIRMED,
       source: SOURCE.TIER2,
       checkedThroughBlock: tier1.checkedThroughBlock,
+      // Included on the proven false too, where every entry reads remaining: 0. That is the
+      // claim being made, in the same shape a caller has been watching descend — so a
+      // confirmed false can be audited rather than taken on trust.
+      ...withCoverage(scan),
     };
   }
 
@@ -359,6 +366,42 @@ export async function verifyQuest(definition, address) {
     source: SOURCE.TIER2,
     checkedThroughBlock: tier1.checkedThroughBlock,
     reason: scan.reason ?? "scan_incomplete",
+    ...withCoverage(scan),
+  };
+}
+
+/**
+ * Report how far the accumulated walk has got, per source.
+ *
+ * WHY THIS IS IN THE ENVELOPE. A deep-history indeterminate and a permanently stuck one are
+ * the same three fields otherwise, and they need opposite responses: the first is "poll me
+ * again", the second is "something is broken" — a cursor table that was never migrated, a
+ * store outage, a floor that will not validate. Without a depth, the only way to tell them
+ * apart is direct database access, which the caller does not have and should not need.
+ *
+ * `remaining` is the useful number and is derived rather than stored, like everything else
+ * here: it is exactly what is left to walk before this source could support a negative.
+ * `scannedFrom` is what distinguishes "still descending" (it equals checkedThroughBlock)
+ * from "the top gap did not close" (it lags) — two very different reasons to be waiting.
+ *
+ * Addresses are reported in full, not truncated: they are public contract addresses the
+ * frontend already uses, and they are the key of the quest_cursor row this line describes,
+ * so a truncated form could not be correlated with anything.
+ *
+ * Omitted entirely — never an empty array — when there is nothing to report: a found event
+ * writes no coverage, and a cache hit did no scanning at all.
+ */
+function withCoverage(scan) {
+  if (!Array.isArray(scan.coverage) || scan.coverage.length === 0) return {};
+
+  return {
+    coverage: scan.coverage.map((c) => ({
+      source: c.sourceKey,
+      scannedFrom: c.scannedFrom,
+      scannedTo: c.scannedTo,
+      floor: c.floorBlock,
+      remaining: c.scannedTo - c.floorBlock,
+    })),
   };
 }
 
@@ -409,8 +452,9 @@ async function composeQuest(definition, address) {
 /**
  * Single success/verdict exit, so every answer has the documented shape:
  *   { address, quest, completed, status, source, checkedThroughBlock, asOf }
- * plus `reason` whenever the answer is not a settled one — a short code naming WHY, which
- * is what makes an indeterminate actionable instead of mysterious.
+ * plus `reason` whenever the answer is not a settled one — a short code naming WHY — and
+ * `coverage` whenever a scan walked anything, naming HOW FAR. Together they are what make
+ * an indeterminate actionable instead of mysterious.
  */
 function send(res, status, verdict) {
   res.setHeader("content-type", "application/json; charset=utf-8");
