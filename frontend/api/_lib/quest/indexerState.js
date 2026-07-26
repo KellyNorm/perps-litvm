@@ -79,7 +79,62 @@ export function maxLagBlocks({ lagMs = maxLagMs(), blockMs = blockTimeMs() } = {
   return Math.max(1, Math.ceil(lagMs / blockMs));
 }
 
+// ============================================================================
+// THE MIDNIGHT PROBLEM
+// ============================================================================
+// The writer and the reader disagree about what day it is, by construction:
+//
+//   the indexer stamps a row from its BLOCK's timestamp   (correct — a catch-up run must
+//                                                          not file yesterday under today)
+//   this endpoint asks for utcDay(), the WALL CLOCK day   (correct — it is answering "was
+//                                                          this wallet active today")
+//
+// Those agree to within the block-time-vs-wall-clock skew, which is nothing at 14:00 and
+// everything at 00:00:03. A wallet that acts at 00:00:01 wall clock, in a block stamped
+// 23:59:59, gets a row under yesterday while today's lookup finds nothing — a confident
+// false for someone who just did the thing. The tail scan makes the mirror image possible
+// too: a hit in the un-indexed tail just after midnight may be YESTERDAY's activity read as
+// today's, which would be a wrong TRUE.
+//
+// Both close with one rule: for a short window after 00:00 UTC, daily_active declines to
+// answer at all. It costs ~1% of the day and removes the entire class.
+export const DEFAULT_DAY_BOUNDARY_GRACE_MS = 15 * 60 * 1000;
+
+/** The public reason code for the grace window — distinct from indexer_stale, and not a bug. */
+export const DAY_BOUNDARY = "day_boundary";
+
+export function dayBoundaryGraceMs() {
+  const raw = process.env.QUEST_DAILY_BOUNDARY_GRACE_MS;
+  const n = Number.parseInt(raw ?? "", 10);
+  // 0 is a legitimate value here (disable the window), unlike the thresholds above, so this
+  // does not use positiveInt.
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_DAY_BOUNDARY_GRACE_MS;
+}
+
+/** Are we inside the post-midnight window where the two notions of "today" can disagree? */
+export function withinDayBoundaryGrace(now = new Date(), graceMs = dayBoundaryGraceMs()) {
+  const midnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return now.getTime() - midnight < graceMs;
+}
+
 const stale = (detail) => ({ fresh: false, reason: INDEXER_STALE, detail, indexedThrough: null });
+
+/**
+ * Stand-in for an unconfigured Supabase. There is no in-memory analogue of a forward
+ * indexer — the index is a durable artefact written by another service — so the honest
+ * behaviour without one is "we have no index", which must read as STALE rather than as an
+ * empty index. Throwing is how that happens: readFreshness catches it as condition 3.
+ */
+export function nullIndexerStateDriver() {
+  return {
+    async load() {
+      throw new Error("indexer state is not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)");
+    },
+    async hasDailyRow() {
+      throw new Error("indexer state is not configured");
+    },
+  };
+}
 
 /**
  * Wrap a driver with the freshness policy and with failure isolation.
@@ -91,6 +146,18 @@ const stale = (detail) => ({ fresh: false, reason: INDEXER_STALE, detail, indexe
  */
 export function createIndexerState(driver) {
   return {
+    /**
+     * Row existence for (wallet, day) — the actual index read.
+     *
+     * DELIBERATELY NOT WRAPPED IN A TRY. An unreadable quest_daily must never be reported
+     * as an absent row, and the caller is the layer that knows an absent row means "not
+     * active". Swallowing here would hand it a false negative dressed as data. The freshness
+     * gate above must have passed before this is ever called.
+     */
+    async hasDailyRow(args) {
+      return driver.hasDailyRow(args);
+    },
+
     /**
      * Is the index provably current enough to read absence from?
      *
