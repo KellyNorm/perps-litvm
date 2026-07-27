@@ -22,15 +22,20 @@
 //
 // Request:  { "address": "0x…", "quest": "first_trade" }
 // Response: { address, quest, completed, status, source, checkedThroughBlock, asOf }
-//           plus `reason` whenever the answer is not settled, and `coverage` whenever a
-//           Tier 2 scan has walked anything — see withCoverage() for why a depth belongs in
-//           the envelope rather than only in the database.
+//           plus `reason` whenever the answer is not settled, `coverage` whenever a Tier 2
+//           scan has walked anything — see withCoverage() for why a depth belongs in the
+//           envelope rather than only in the database — and `index` on a negative the index
+//           proved without walking, carrying the same claim in the same auditable spirit.
 
 import { createLimiter, memoryDriver } from "../_lib/rateLimit.js";
 import { cacheKey, createCache, memoryCacheDriver, nullCacheDriver, utcDay } from "../_lib/quest/cache.js";
 import { createCursorStore, memoryCursorDriver, nullCursorDriver } from "../_lib/quest/cursor.js";
+import { createIndexerState, nullIndexerStateDriver } from "../_lib/quest/indexerState.js";
+import { supabaseIndexerStateDriver } from "../_lib/quest/supabaseIndexerState.js";
 import { supabaseCacheDriver } from "../_lib/quest/supabaseCache.js";
 import { supabaseCursorDriver } from "../_lib/quest/supabaseCursor.js";
+import { supabaseIndexProofDriver } from "../_lib/quest/supabaseIndexProof.js";
+import { PROOF, createIndexProof } from "../_lib/quest/indexProof.js";
 import { ConfigError, chainId } from "../_lib/quest/chain.js";
 import { QUEST_IDS, QUEST_KIND, SOURCE, STATUS, getQuest } from "../_lib/quest/quests.js";
 import { clientKey } from "../_lib/request.js";
@@ -143,14 +148,73 @@ function selectCursorDriver(mode) {
   return memoryCursorDriver();
 }
 
+// The participation index behind daily_active. Unlike the cache and the cursor, this one
+// has NO in-memory mode and no default driver: the index is written by a separate Railway
+// service into Supabase, so "not configured" genuinely means "there is no index" — which
+// must read as stale, not as an empty index. nullIndexerStateDriver() throws, and the
+// freshness policy turns that into stale via its read-failure condition.
+//
+// It is deliberately NOT gated on QUEST_CACHE/QUEST_CURSOR: those select where verdicts and
+// coverage live, which is an unrelated question. daily_active needs the index or it needs
+// to say so.
+let indexerState;
+function getIndexerState() {
+  if (!indexerState) {
+    indexerState = createIndexerState(supabaseIndexerStateDriver() ?? nullIndexerStateDriver());
+  }
+  return indexerState;
+}
+
+// The INDEX PROOF — the zero-chunk answer for a quest whose sources have been swept to the
+// floor. Third store, third variable, same pattern, and it is OFF unless it is explicitly
+// pointed at Supabase, because there is nothing else it could read: the proof is a join
+// across quest_backfill, quest_completion and indexer_state.
+//
+// QUEST_INDEX_PROOF defaults to whatever QUEST_CACHE selected, like QUEST_CURSOR, so a
+// correctly configured deployment gets it without a fourth variable to keep in step.
+// Setting it explicitly is THE ROLLBACK: QUEST_INDEX_PROOF=none disables the fast path and
+// every verification goes back to the resumable scan — slower, and identical in every
+// answer it is allowed to give, because both derive their falses from coverage. That is a
+// one-env-var revert with no redeploy, which is what a new path to a confirmed false should
+// have on its first day in production.
+//
+// `undefined` means "not built yet"; `null` means "built, and disabled".
+let indexProof;
+function getIndexProof() {
+  if (indexProof === undefined) {
+    indexProof = buildIndexProof((process.env.QUEST_INDEX_PROOF || process.env.QUEST_CACHE || "memory").trim());
+  }
+  return indexProof;
+}
+
+function buildIndexProof(mode) {
+  if (mode !== "supabase") return null;
+
+  const backfill = supabaseIndexProofDriver();
+  const stateDriver = supabaseIndexerStateDriver();
+  if (!backfill || !stateDriver) {
+    console.error(
+      "[quest] QUEST_INDEX_PROOF=supabase but SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not both " +
+        "set — the zero-chunk path is disabled and verification falls back to the scan. Answers are " +
+        "unaffected; deep-history wallets are slow again.",
+    );
+    return null;
+  }
+
+  return createIndexProof({ backfill, indexerState: createIndexerState(stateDriver) });
+}
+
 /**
- * Test seam: drop both cached stores so the next request rebuilds them from current env.
- * Both, not just the cache — they are configured by different vars and a test that changes
- * one would otherwise keep a store built from the previous environment.
+ * Test seam: drop all four cached stores so the next request rebuilds them from current
+ * env. All four, not just the cache — they are configured by different vars (and the
+ * participation index by none at all) and a test that changes one would otherwise keep a
+ * store built from the previous environment.
  */
 export function _resetCache() {
   cache = null;
   cursors = null;
+  indexerState = null;
+  indexProof = undefined;
 }
 
 /**
@@ -255,8 +319,12 @@ export async function resolveQuest(definition, address) {
   if (hit) return { ...hit, source: SOURCE.CACHE };
 
   const result = await verifyQuest(definition, address);
-  // Silently ignored unless this is a proven completion — see the policy in cache.js.
-  await getCache().set(key, result);
+
+  // Silently ignored unless this is a proven completion — see the policy in cache.js. The
+  // one exception is an answer the INDEX gave us: the row we would write is the row we just
+  // read, and the write is a merge-duplicates upsert, so it would overwrite the provenance
+  // the indexer recorded (`backfill`/`indexer`) with our own for no gain at all.
+  if (result.source !== SOURCE.INDEX) await getCache().set(key, result);
 
   return result;
 }
@@ -265,10 +333,17 @@ export async function resolveQuest(definition, address) {
  * Run a quest's tiers and turn them into a verdict. Exported so the tier→status mapping —
  * the rule this endpoint exists to get right — is unit-testable without HTTP or a chain.
  *
- * The ONLY route to a confirmed false is a Tier 2 scan that walked every source to a
- * validated floor. Everything short of that is indeterminate: a Tier 1 false cannot tell
- * "never traded" from "traded and closed", and a budget-limited scan cannot tell "never"
- * from "not in the range we managed to read".
+ * THE TWO ROUTES TO A CONFIRMED FALSE, and they make the identical claim from the identical
+ * kind of evidence — coverage of every source from a validated floor up to the block being
+ * reported, with no hole anywhere in it:
+ *
+ *   1. a Tier 2 scan that walked it, per wallet, accumulated over polls (scan.js);
+ *   2. the index proof, which joins coverage the backfill walked once for everybody to
+ *      coverage the forward indexer has walked since (indexProof.js).
+ *
+ * Everything short of one of those is indeterminate: a Tier 1 false cannot tell "never
+ * traded" from "traded and closed", and a budget-limited scan cannot tell "never" from "not
+ * in the range we managed to read".
  */
 export async function verifyQuest(definition, address) {
   // A registered quest we cannot yet answer (daily_active until the indexer exists). It
@@ -287,7 +362,7 @@ export async function verifyQuest(definition, address) {
     return composeQuest(definition, address);
   }
 
-  const tier1 = await definition.tier1(address);
+  const tier1 = await definition.tier1(address, { indexerState: getIndexerState() });
 
   // A positive is proof and stops here — no scan needed.
   if (tier1.completed) {
@@ -307,9 +382,26 @@ export async function verifyQuest(definition, address) {
       status: STATUS.INDETERMINATE,
       source: SOURCE.TIER1,
       checkedThroughBlock: tier1.checkedThroughBlock,
-      reason: "tier1_unreliable",
+      // The tier names WHY when it can. daily_active's index read distinguishes
+      // `indexer_stale` (the index cannot be trusted) from `day_boundary` (the two notions
+      // of "today" may disagree right now) — different problems with different fixes, and
+      // both very different from a dropped chain read. Existing tiers set no `reason`, so
+      // they keep the generic code.
+      reason: tier1.reason ?? "tier1_unreliable",
     };
   }
+
+  // THE ZERO-CHUNK PATH. Before spending ~10s of eth_getLogs, ask whether the index already
+  // knows: the backfill swept every source to its floor once, unfiltered, for every wallet
+  // that has ever existed, and the forward indexer has covered everything since. If those
+  // two coverages join with no hole, this wallet's answer is a lookup rather than a walk —
+  // and it is available on the FIRST poll rather than the two-hundredth.
+  //
+  // It returns null unless it PROVED something, and a null costs one round trip of three
+  // parallel indexed reads before the scan runs exactly as it does today. So the fast path
+  // can be wrong only by being slow.
+  const proven = await resolveFromIndex(definition, address, tier1.checkedThroughBlock);
+  if (proven) return proven;
 
   if (!definition.tier2) {
     return {
@@ -332,6 +424,11 @@ export async function verifyQuest(definition, address) {
     chainId: chainId(),
     quest: definition.id,
     cursors: getCursors(),
+    // daily_active's tail scan needs to know where the index stopped, which only its own
+    // Tier 1 knows. Passing the whole result rather than plucking one field keeps this
+    // generic — the event-scanning tiers destructure only what they use and ignore it.
+    tier1,
+    indexerState: getIndexerState(),
   });
 
   if (scan.found) {
@@ -368,6 +465,65 @@ export async function verifyQuest(definition, address) {
     reason: scan.reason ?? "scan_incomplete",
     ...withCoverage(scan),
   };
+}
+
+/**
+ * Ask the index whether this wallet's answer is already known, without walking anything.
+ *
+ * @returns {Promise<object|null>} a verdict, or null meaning "the index could not prove it
+ *   — carry on to the scan". NULL IS THE ONLY WAY THIS DECLINES: it never returns an
+ *   indeterminate of its own, because the scan below is strictly better informed than a
+ *   guess about why the proof did not hold.
+ *
+ * The proof is skipped entirely for a quest with no `indexSources` (provide_liquidity,
+ * until its backfill reaches the floor) and when the fast path is unconfigured or disabled.
+ * A ConfigError from indexSources() propagates deliberately: it means an address env var is
+ * missing, tier2 would throw the identical error one line later, and a missing address must
+ * surface as `not_configured` rather than as a silently narrower proof.
+ */
+async function resolveFromIndex(definition, address, head) {
+  if (typeof definition.indexSources !== "function") return null;
+
+  const proof = getIndexProof();
+  if (!proof) return null;
+
+  const result = await proof.resolve({
+    chainId: chainId(),
+    wallet: address,
+    quest: definition.id,
+    sources: definition.indexSources(),
+    head,
+  });
+
+  if (result.answer === PROOF.COMPLETED) {
+    return {
+      completed: true,
+      status: STATUS.CONFIRMED,
+      source: SOURCE.INDEX,
+      // The block the completion was recorded against, exactly as the cache reports it.
+      checkedThroughBlock: result.checkedThroughBlock,
+    };
+  }
+
+  if (result.answer === PROOF.ABSENT) {
+    return {
+      completed: false,
+      status: STATUS.CONFIRMED,
+      source: SOURCE.INDEX,
+      // The index's minimum watermark, NOT head. See indexProof.js.
+      checkedThroughBlock: result.checkedThroughBlock,
+      // The claim, in auditable form — the same reasoning as `coverage` on a scanned false:
+      // a confirmed negative should be checkable rather than taken on trust, and here the
+      // thing worth showing is where the two halves of the coverage meet.
+      index: result.index,
+    };
+  }
+
+  // Not an error — "the index cannot answer this one yet" is the expected state for most of
+  // a backfill's life. Logged at info level so a fast path that has quietly stopped firing
+  // is visible in the function log rather than only as a latency regression.
+  console.log(`[quest] index proof declined ${definition.id}: ${result.detail} — falling back to the scan`);
+  return null;
 }
 
 /**

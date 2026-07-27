@@ -74,7 +74,8 @@ export function supabaseIndexerStateDriver(opts = {}) {
     async load(chainId, sourceKeys) {
       const list = sourceKeys.map((k) => `"${String(k).toLowerCase()}"`).join(",");
       const res = await request(
-        `${STATE_TABLE}?select=source_key,last_block,updated_at&chain_id=eq.${chainId}&source_key=in.(${list})`,
+        `${STATE_TABLE}?select=source_key,last_block,updated_at,completion_from` +
+          `&chain_id=eq.${chainId}&source_key=in.(${list})`,
       );
 
       const rows = await res.json();
@@ -85,6 +86,11 @@ export function supabaseIndexerStateDriver(opts = {}) {
         sourceKey: r.source_key,
         lastBlock: Number(r.last_block),
         updatedAt: r.updated_at,
+        // NULL STAYS NULL. It means "the indexer has not yet told us from where completions
+        // have been written", and coercing it to a number here would manufacture the
+        // coverage claim 0005_quest_backfill.sql exists to refuse. The freshness policy does
+        // not read it at all; indexProof.js fails closed on it.
+        completionFrom: r.completion_from == null ? null : Number(r.completion_from),
       }));
     },
 

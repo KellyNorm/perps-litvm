@@ -179,7 +179,7 @@ export async function scanForEvent(sources, opts) {
     maxChunks = MAX_CHUNKS,
     timeBudgetMs = TIME_BUDGET_MS,
     now = () => Date.now(),
-    verifyFloor = defaultVerifyFloor,
+    verifyFloor = verifySourceFloor,
     priorCoverage = null,
   } = opts;
 
@@ -391,8 +391,15 @@ export async function scanForEvent(sources, opts) {
   });
 }
 
-/** Default floor check: the contract must NOT have code in the block before its floor. */
-async function defaultVerifyFloor(source) {
+/**
+ * The floor check: the contract must NOT have code in the block before its floor.
+ *
+ * EXPORTED so indexProof.js can pay for the same one, rather than growing a second opinion
+ * about what makes a floor trustworthy. Both paths turn "found nothing" into "there is
+ * nothing", so both are vulnerable to a floor set too HIGH — and a second implementation of
+ * this check is a second thing that can drift into accepting one.
+ */
+export async function verifySourceFloor(source) {
   const address = source.address ?? source.contract?.address;
   if (!address) return false;
   if (source.floor <= 0) return true; // genesis floor; nothing can exist below it

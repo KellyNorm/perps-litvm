@@ -79,7 +79,82 @@ export function maxLagBlocks({ lagMs = maxLagMs(), blockMs = blockTimeMs() } = {
   return Math.max(1, Math.ceil(lagMs / blockMs));
 }
 
-const stale = (detail) => ({ fresh: false, reason: INDEXER_STALE, detail, indexedThrough: null });
+// ============================================================================
+// THE MIDNIGHT PROBLEM
+// ============================================================================
+// The writer and the reader disagree about what day it is, by construction:
+//
+//   the indexer stamps a row from its BLOCK's timestamp   (correct — a catch-up run must
+//                                                          not file yesterday under today)
+//   this endpoint asks for utcDay(), the WALL CLOCK day   (correct — it is answering "was
+//                                                          this wallet active today")
+//
+// Those agree to within the block-time-vs-wall-clock skew, which is nothing at 14:00 and
+// everything at 00:00:03. A wallet that acts at 00:00:01 wall clock, in a block stamped
+// 23:59:59, gets a row under yesterday while today's lookup finds nothing — a confident
+// false for someone who just did the thing. The tail scan makes the mirror image possible
+// too: a hit in the un-indexed tail just after midnight may be YESTERDAY's activity read as
+// today's, which would be a wrong TRUE.
+//
+// Both close with one rule: for a short window after 00:00 UTC, daily_active declines to
+// answer at all. It costs ~1% of the day and removes the entire class.
+export const DEFAULT_DAY_BOUNDARY_GRACE_MS = 15 * 60 * 1000;
+
+/** The public reason code for the grace window — distinct from indexer_stale, and not a bug. */
+export const DAY_BOUNDARY = "day_boundary";
+
+export function dayBoundaryGraceMs() {
+  const raw = process.env.QUEST_DAILY_BOUNDARY_GRACE_MS;
+  const n = Number.parseInt(raw ?? "", 10);
+  // 0 is a legitimate value here (disable the window), unlike the thresholds above, so this
+  // does not use positiveInt.
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_DAY_BOUNDARY_GRACE_MS;
+}
+
+/** Are we inside the post-midnight window where the two notions of "today" can disagree? */
+export function withinDayBoundaryGrace(now = new Date(), graceMs = dayBoundaryGraceMs()) {
+  const midnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return now.getTime() - midnight < graceMs;
+}
+
+const stale = (detail) => ({ fresh: false, reason: INDEXER_STALE, detail, indexedThrough: null, sources: null });
+
+/**
+ * The handoff watermark, carried through untouched for indexProof.js — NOT a freshness
+ * input, so a null one does not make a source stale (it makes the one-time-quest proof
+ * fail, over there, where that is the right failure).
+ *
+ * NULL IS NOT ZERO. `Number(null)` is 0, and so is `Number("")` — and 0 would read as
+ * "completions have been written since the genesis block", inventing exactly the coverage
+ * 0005_quest_backfill.sql refuses to invent. Both empty forms are rejected explicitly rather
+ * than left to a coercion, and anything else that is not a non-negative integer becomes null
+ * and fails closed downstream.
+ */
+function completionFrom(row) {
+  const raw = row?.completionFrom;
+  if (raw == null) return null;
+  if (typeof raw === "string" && raw.trim() === "") return null;
+
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+/**
+ * Stand-in for an unconfigured Supabase. There is no in-memory analogue of a forward
+ * indexer — the index is a durable artefact written by another service — so the honest
+ * behaviour without one is "we have no index", which must read as STALE rather than as an
+ * empty index. Throwing is how that happens: readFreshness catches it as condition 3.
+ */
+export function nullIndexerStateDriver() {
+  return {
+    async load() {
+      throw new Error("indexer state is not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)");
+    },
+    async hasDailyRow() {
+      throw new Error("indexer state is not configured");
+    },
+  };
+}
 
 /**
  * Wrap a driver with the freshness policy and with failure isolation.
@@ -92,6 +167,18 @@ const stale = (detail) => ({ fresh: false, reason: INDEXER_STALE, detail, indexe
 export function createIndexerState(driver) {
   return {
     /**
+     * Row existence for (wallet, day) — the actual index read.
+     *
+     * DELIBERATELY NOT WRAPPED IN A TRY. An unreadable quest_daily must never be reported
+     * as an absent row, and the caller is the layer that knows an absent row means "not
+     * active". Swallowing here would hand it a false negative dressed as data. The freshness
+     * gate above must have passed before this is ever called.
+     */
+    async hasDailyRow(args) {
+      return driver.hasDailyRow(args);
+    },
+
+    /**
      * Is the index provably current enough to read absence from?
      *
      * @param {object} args
@@ -100,9 +187,12 @@ export function createIndexerState(driver) {
      *   contract addresses — the same set the indexer writes, kept in step by a parity test.
      * @param {number} args.head          current chain head.
      * @param {() => number} [args.now]   injectable clock (ms), for deterministic tests.
-     * @returns {Promise<{fresh, reason, detail, indexedThrough}>} `indexedThrough` is the
-     *   MINIMUM watermark and is what an index-derived answer must report as
-     *   `checkedThroughBlock` — never `head`, which the index has not reached.
+     * @returns {Promise<{fresh, reason, detail, indexedThrough, sources}>} `indexedThrough`
+     *   is the MINIMUM watermark and is what an index-derived answer must report as
+     *   `checkedThroughBlock` — never `head`, which the index has not reached. `sources` is
+     *   the validated per-source rows on the fresh path and null on every stale one: the
+     *   one-time-quest proof needs each row's `completionFrom` (indexProof.js) and must not
+     *   pay for a second read of a table this function has already read and vetted.
      */
     async readFreshness({ chainId, sourceKeys, head, now = () => Date.now() }) {
       if (!Array.isArray(sourceKeys) || sourceKeys.length === 0) {
@@ -129,7 +219,7 @@ export function createIndexerState(driver) {
         const updatedAt = Date.parse(row?.updatedAt ?? "");
         // A row we cannot read is worse than a row that is absent: absence is honest.
         if (!key || !Number.isInteger(lastBlock) || lastBlock < 0 || !Number.isFinite(updatedAt)) continue;
-        byKey.set(key, { lastBlock, updatedAt });
+        byKey.set(key, { sourceKey: key, lastBlock, updatedAt, completionFrom: completionFrom(row) });
       }
 
       // --- 1 & 2. A REQUIRED SOURCE IS MISSING, OR THE COUNT IS SHORT.
@@ -160,7 +250,7 @@ export function createIndexerState(driver) {
       // --- 5. THE JOB IS RUNNING BUT LOSING GROUND.
       if (head - indexedThrough > maxLagBlocks({ lagMs })) return stale("block_lag");
 
-      return { fresh: true, reason: null, detail: null, indexedThrough };
+      return { fresh: true, reason: null, detail: null, indexedThrough, sources: present };
     },
   };
 }
