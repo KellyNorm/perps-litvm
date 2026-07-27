@@ -12,10 +12,16 @@ out/
 /broadcast/**/dry-run/
 
 # Docs (generated output ignored; hand-written design docs tracked by exception)
+# NOTE: a new doc not listed here is SILENTLY DROPPED by `git commit`. That already
+# happened once — 34ad568 committed a README link to docs/services.md while the file
+# itself was ignored, so main links to a doc that is not in the repo. Add the exception
+# in the same commit as the doc.
 docs/*
 !docs/oracle-discovery.md
 !docs/stack-redeploy-runbook.md
 !docs/TESTNET_LAUNCH.md
+!docs/services.md
+!docs/STATUS.md
 
 # Dotenv file
 .env
