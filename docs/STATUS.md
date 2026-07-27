@@ -1,6 +1,7 @@
 # STATUS — the map for whoever picks this up next
 
-Written 2026-07-26. Chain **4441** (LitVM LiteForge) throughout. Everything here is testnet,
+Written 2026-07-26, updated 2026-07-27 (quest API completed — §3). Chain **4441** (LitVM
+LiteForge) throughout. Everything here is testnet,
 unaudited, test mUSD only.
 
 Read this first, then `CLAUDE.md` (constitution), `TASK.md` (roadmap + known gaps), and
@@ -17,7 +18,7 @@ Three products plus one API, all in one repo, all deploying independently.
 | **Perps** | `app.tachyonfi.xyz` | Live. Leveraged BTC/ETH vs a shared mUSD pool, two-step request/execute, keeper-filled. |
 | **Predictions** | `app.tachyonfi.xyz` (same app) | Live. Parimutuel binary up/down, 11 assets, 15m/30m/1h/8h frames. |
 | **Tachy** (AI assistant) | `POST /api/tachy` + mascot UI | Live. v1 — education only, places no trades. |
-| **Quest API** | `POST /api/quest/verify` | Live. 4 of 5 quests answerable; `daily_active` still gated (§3). |
+| **Quest API** | `POST /api/quest/verify` | Live. **All 5 quests answerable** as of 2026-07-27 (§3). |
 
 ### Contracts (chain 4441)
 
@@ -77,7 +78,7 @@ gh api repos/KellyNorm/perps-litvm/commits/main/status \
 ### Supabase
 
 One project, **in the user's own org — not the org reachable through the Claude Supabase MCP
-connection.** Nothing automated may provision or migrate it. Four tables, migrations checked
+connection.** Nothing automated may provision or migrate it. Five tables, migrations checked
 in under `supabase/migrations/` and **applied by hand, in numeric order** (`supabase/README.md`):
 
 | Migration | Table | Purpose |
@@ -86,6 +87,7 @@ in under `supabase/migrations/` and **applied by hand, in numeric order** (`supa
 | `0002_quest_cursor.sql` | `quest_cursor` | resumable deep-history scan coverage |
 | `0003_quest_daily.sql` | `quest_daily` | `daily_active` participation index |
 | `0004_indexer_state.sql` | `indexer_state` | indexer watermark + freshness proof |
+| `0005_quest_backfill.sql` | `quest_backfill` | the one-time sweep's coverage, **plus** `indexer_state.completion_from` — the handoff watermark the zero-chunk negative joins against |
 
 RLS on for every table with **no policies**; `anon`/`authenticated` revoked. The service-role
 key is server-side only and must never carry a `VITE_` prefix — two tests in
@@ -169,48 +171,82 @@ is cacheable forever), `indeterminate` (could not prove it; **never cached**, ca
   and advancing `indexer_state`; plus the **backward settler**, which uses leftover time to
   walk `quest_cursor` downward so deep one-time quests settle in the background instead of
   needing ~200 user polls each (convergence measured at ~48k blocks/poll on prod).
+- **The one-time-quest backfill** (#16, 2026-07-27) — one UNFILTERED sweep per source from
+  head to its deploy block, writing a `quest_completion` row for every wallet it finds and
+  recording the blocks it read in `quest_backfill`. 426 chunks once for everybody, versus
+  1,060 chunks per wallet forever. Runs in the scheduler's leftover time, behind the forward
+  index's absolute priority. Also added `indexer_state.completion_from`, set once, never
+  moved — the block from which forward completions have been written.
+- **The zero-chunk read path** (#17, 2026-07-27) — for a quest whose sources have all been
+  swept to the floor, a negative is a lookup rather than a walk. See "the two routes to a
+  confirmed false" below. `first_trade` and `first_prediction` are on it; `provide_liquidity`
+  is not, and that is the one remaining quest-API task (§4).
+- **`daily_active`** (#18, 2026-07-27) — the six-way freshness gate plus a live tail scan;
+  merged once the index had a full UTC day behind it. See below.
+
+### The two routes to a confirmed false
+
+Both make the same claim from the same kind of evidence — coverage of every source from a
+**validated floor** up to the block being reported, with no hole anywhere in it. Nothing
+stores a verdict; both derivations re-run on every request.
+
+1. **The Tier 2 scan** (`scan.js`) — walks it per wallet, accumulating coverage in
+   `quest_cursor` across polls. Always available; slow on deep history.
+2. **The index proof** (`indexProof.js`) — joins the backfill's coverage to the forward
+   index's. Seven conditions, all re-derived per request: a `quest_backfill` row for every
+   required source; `floor_block` = the configured floor; `covered_to` **=** `floor_block`
+   (equality — "reached the floor"); `covered_from >= completion_from - 1` (the two halves
+   touch); `completion_from` not null; the six-way freshness gate; and the floor verified
+   on-chain with one `eth_getCode`. Any one failing returns `unproven` and falls back to the
+   scan, so the fast path can be wrong only by being slow. Reports
+   `checkedThroughBlock = min(last_block)`, never head, and carries an `index` object showing
+   where the two coverages meet so a negative is auditable.
+
+Measured on prod 2026-07-27: `first_trade` for a never-active wallet returned a confirmed
+false in **1.45s on the first call**, over a proven span of 10,751,715 blocks. The same answer
+by scanning is ~1,075 chunks ≈ 54 minutes of `eth_getLogs`, which is why it previously took
+~200 polls to converge.
+
+`QUEST_INDEX_PROOF` selects the driver and **defaults to whatever `QUEST_CACHE` is**, so a
+deployment already running the durable cache picks it up with no new variable.
+`QUEST_INDEX_PROOF=none` is the rollback — effective on the next cold start, no redeploy, and
+it leaves the durable cache untouched.
 
 Quest registry (`frontend/api/_lib/quest/quests.js`): `first_trade`, `first_prediction`,
 `provide_liquidity` (one-time), `both_products` (composite, no chain calls of its own),
 `daily_active` (daily).
 
-### `daily_active` — built, HELD, and it is the only remaining step
+### `daily_active` — MERGED and live (2026-07-27)
 
-The read path is complete on **`feat/quest-daily-active-readpath`** (2 commits, +963 lines,
-0 behind `main`): the six-way fail-closed freshness gate (`indexerState.js`), the
-`DAILY_SOURCES` list, the un-indexed tail scan, the post-midnight grace window, and 536 lines
-of tests. **It is deliberately not merged.**
+Held deliberately until the index had a **full UTC day** behind it, and merged once it did.
+The reason for the hold, kept here because it is the shape of the bug the whole design guards
+against: the indexer starts at the safe head rather than the deploy block (a backfill would be
+~10M blocks to answer a question about *today*), so the day it first ran is only *partially*
+covered — and a wallet active at 09:00 on a day the index started at 14:00 would have got a
+confident `false`.
 
-Why: the indexer starts at the safe head, not from the deploy block — a backfill would be ~10M
-blocks to answer a question about today. So the day the indexer first ran is only *partially*
-covered, and a wallet active at 09:00 on a day the index started at 14:00 would get a confident
-`false`. The read path must not go live until the index has a **full UTC day** behind it.
+Timeline: indexer landed on `main` 2026-07-26 ~04:04 UTC → 2026-07-26 partially covered, not
+usable → **2026-07-27 the first fully-covered UTC day** → merged 2026-07-27 23:33 UTC (#18)
+after confirming all 4 `indexer_state` rows current and advancing across the midnight boundary.
 
-The indexer landed on `main` at **2026-07-26 ~04:04 UTC**, so:
+What it does: the six-way fail-closed freshness gate (`indexerState.js`) runs **before**
+`quest_daily` is read at all; if it says stale, absence must not be used. Then a row lookup for
+(wallet, today), then a live scan of the un-indexed tail above the watermark.
 
-- 2026-07-26 is partially covered — not usable.
-- The first fully-covered UTC day is **2026-07-27**.
-- Merge is safe **on or after 2026-07-27 00:15 UTC**, *provided* `indexer_state` shows
-  continuous advance across the 00:00 UTC boundary. Verify before merging:
+**The post-midnight grace window.** For ~15 minutes after 00:00 UTC, `daily_active` declines to
+answer — `reason: "day_boundary"`, distinct from `indexer_stale` and **not a fault**. The
+writer and the reader disagree about what day it is by construction: the indexer stamps a row
+from its *block's* timestamp (correct — a catch-up run must not file yesterday under today),
+while the endpoint asks for the *wall-clock* day (correct — it is answering "was this wallet
+active today"). Those agree to within the skew, which is nothing at 14:00 and everything at
+00:00:03. The window costs ~1% of the day and removes the entire class, in both directions
+(a wrong false just after midnight, and a wrong *true* from a tail-scan hit that was actually
+yesterday's activity). Configurable via `QUEST_DAILY_BOUNDARY_GRACE_MS`; `0` disables it.
 
-  ```sql
-  select source_key, last_block, updated_at, now() - updated_at as age
-  from indexer_state where chain_id = 4441;
-  ```
-
-  Expect **4 rows**, all `age` under ~2 minutes, and no gap in the logs spanning midnight. If
-  the service restarted mid-day, the watermark survives (it is durable) — what matters is that
-  no *block range* was skipped, and the resume overlap guarantees that as long as the process
-  came back.
-
-Confirmation it is still held (checked 2026-07-26 05:19 UTC):
-
-```json
-{"completed":false,"status":"indeterminate","reason":"needs_indexer","quest":"daily_active"}
-```
-
-`reason: "needs_indexer"` = registered-but-unavailable, i.e. pre-merge. After the merge the
-reasons you should see instead are `indexer_stale`, `day_boundary`, or none at all.
+**Known gap:** the freshness `detail` — which of the six conditions fired — is set by
+`checks.js` but **dropped by `verify.js`**, which forwards `reason` only. So an
+`indexer_stale` in the envelope does not say *why*, and diagnosis still needs the SQL in §6.
+Listed in §4.
 
 ---
 
@@ -218,7 +254,7 @@ reasons you should see instead are `indexer_stale`, `day_boundary`, or none at a
 
 | # | Item | Blocked on |
 |---|---|---|
-| 1 | **Merge `feat/quest-daily-active-readpath`** | Time only — see §3. Verify `indexer_state`, then merge. This is the whole remaining scope of the quest work. |
+| 1 | **`provide_liquidity` on the zero-chunk path** | The LiquidityPool sweep reaching its floor. This is the **whole remaining scope of the quest work** — the other two one-time quests are already on it (§3). Check with `select source_key, covered_to - floor_block as remaining from quest_backfill where chain_id = 4441;`; `remaining = 0` on `0x4716a0c9…` is the green light. The change is one line in `frontend/api/_lib/quest/quests.js` — `indexSources: provideLiquiditySources` — the function is already exported from `checks.js` and `settlerParity.test.js` already covers it. Safe to add early in the sense that it cannot lie (an unfinished sweep fails `not_at_floor` and falls back to the scan), but it costs three Supabase reads per request to be told so. |
 | 2 | **Partner quest integration** | Not started, and **nothing is captured in this repo** — no partner name, endpoint contract, auth scheme, or quest-id mapping is written down anywhere. The API is built to be called by a partner platform; the integration itself is an undocumented conversation. **Capture the spec before building.** |
 | 3 | **Tachy v2 / v3** | Not started, and likewise **no spec exists in the repo.** The only in-code trace is a forward-looking `V2 PATH` comment in `frontend/src/components/tachy/TachyAvatar.jsx`. The v1 system prompt says trading-by-chat is "coming soon", which implies v2 ≈ transactional Tachy — but that is an inference, not a spec. Write it down somewhere tracked before starting. |
 | 4 | **PositionManager EIP-170 headroom** | **BLOCKING for the next change to that contract.** 23,919 / 24,576 bytes — 657 bytes (~2.7%) of headroom, and `optimizer_runs = 1` is already spent, so the cheap lever is gone. The fix is `refactor/eip170-library-extraction` (move logic into `library` contracts, which `DELEGATECALL` and don't count toward runtime size); branch exists, **PARKED**. The failure shows up at *deploy* time, after the work is written. **Treat "am I adding to PositionManager?" as the trigger — run `forge build --sizes` before writing the feature.** It is money-path code, so per `CLAUDE.md` rule 3 it needs a written plan and an explicit go-ahead before any implementation. |
@@ -226,8 +262,21 @@ reasons you should see instead are `indexer_stale`, `day_boundary`, or none at a
 
 Also worth fixing, lower priority: get `prediction-keeper/` and `src/prediction/*.sol` under
 version control on `main` (§2); and surface the `indexer_stale` `detail` in the response
-envelope — it is computed and logged server-side but dropped, which forces the symptom-to-cause
-table in `docs/services.md`.
+envelope — `checks.js:322` sets it, `verify.js:390` forwards `reason` only and drops it, which
+forces the symptom-to-cause table in `docs/services.md` and the SQL in §6.
+
+**Stale-branch hazard, learned the hard way 2026-07-27.** ~20 unmerged feature branches sit on
+this repo, most cut weeks apart. A branch handed over for merging is likely several PRs behind
+`main`, and *its last green CI ran against a tree that no longer exists*.
+`feat/quest-daily-active-readpath` was fully green, conflicted with `main` in three files, and
+git produced a **duplicate `supabaseIndexerStateDriver` import** in `verify.js` with no
+conflict marker — both sides added it on different lines, a clean textual merge and a
+`SyntaxError` at module load that would have taken down the whole endpoint, `first_trade`
+included, on the first request after deploy. Before merging any branch here: check
+`git log --oneline <branch>..origin/main`, trial-merge in a scratch worktree, run both suites
+(`frontend`, `quest-indexer`) on the merged tree, and validate a conflict resolution by
+diffing the merge against **both** parents — deletions vs each parent should only ever be
+lines the other side replaced with a superset.
 
 ---
 
@@ -302,8 +351,8 @@ Healthy = a JSON envelope with `status` and `checkedThroughBlock`. `indeterminat
 the scan ran out of budget and honestly said so; `coverage[].remaining` tells you how far it
 still has to walk. A 503 `not_configured` means an address env var is unset.
 
-`daily_active` today returns `reason: "needs_indexer"`. After the §3 merge, the reasons to
-expect are:
+`daily_active` is live as of 2026-07-27; `reason: "needs_indexer"` would now mean a rollback
+happened. The reasons to expect are:
 
 | `reason` | Meaning |
 |---|---|
@@ -333,6 +382,22 @@ minute apart.
 - **`last_block` static but `age` small** → running and finding no new blocks. Fine on a quiet
   chain; the guarded write refreshes `updated_at` without moving the watermark, which is why
   `age` alone is not enough.
+
+### The backfill sweep — how far down it has got
+
+Governs whether a quest can use the zero-chunk path (§3), and item 1 in §4:
+
+```sql
+select source_key, floor_block, covered_from, covered_to,
+       covered_to - floor_block as remaining, updated_at
+from quest_backfill where chain_id = 4441 order by remaining;
+```
+
+`remaining = 0` means that source reached its floor — the equality the read path tests. As of
+2026-07-27 PositionManager and both prediction factories are at 0; LiquidityPool is still
+descending. Also check the handoff is claimed, or no negative can be derived at all:
+`select source_key, completion_from from indexer_state where chain_id = 4441;` — a NULL there
+means "not yet proven" and fails closed by design, and is **not** the same as zero.
 
 Railway logs, every tick:
 
