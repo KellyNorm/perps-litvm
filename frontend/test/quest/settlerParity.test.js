@@ -12,7 +12,7 @@
 // suite asserts that no SHIPPED file does the same.
 
 import assert from "node:assert/strict";
-import test, { describe } from "node:test";
+import test, { after, before, describe } from "node:test";
 
 import { CHUNK_BLOCKS as READ_PATH_CHUNK } from "../../api/_lib/quest/scan.js";
 import { ONE_TIME_BUCKET as READ_PATH_BUCKET } from "../../api/_lib/quest/supabaseCache.js";
@@ -111,5 +111,74 @@ describe("the settleable set agrees with the registry", () => {
       2,
       "dropping the draining factory would settle the quest against half its history",
     );
+  });
+});
+
+// ============================================================================
+// THE INDEX PROOF'S SOURCE LIST
+// ============================================================================
+// A quest opted into the zero-chunk negative (indexProof.js) demands a completed backfill
+// for every source in `indexSources()` and then reports a confirmed false. So this list is
+// the one the indexer and the backfill must have actually swept — and the direction it can
+// go wrong is asymmetric and quiet: a list that is too SHORT proves less than it claims and
+// hands out a confident false to a wallet whose only activity was on the source nobody
+// required. Equality is the assertion, not containment.
+//
+// checks.js already makes this hard by construction — the proof and the Tier 2 scan read the
+// SAME declaration — so this test is the guard on the other pairing, the one between that
+// declaration and the indexer's own SETTLEABLE_QUESTS.
+
+describe("the index proof requires exactly the sources the indexer writes", () => {
+  const ADDRESSES = {
+    QUEST_POSITION_MANAGER_ADDRESS: "0x9396D36F713302FF39E0bA5b38012656f8E4eACF",
+    QUEST_LIQUIDITY_POOL_ADDRESS: "0x4716a0c9c504F83918002A3086590f1ed192560B",
+    QUEST_PREDICTION_FACTORY_ADDRESS: "0x7dd9e01fD4f96F9b1F875351eaccb5cA6C84c512",
+    QUEST_PREDICTION_FACTORY_OLD_ADDRESS: "0x6338985C7f689C3e1959bfe1a8bb36E44849EA40",
+  };
+
+  const saved = {};
+  before(() => {
+    for (const [k, v] of Object.entries(ADDRESSES)) {
+      saved[k] = process.env[k];
+      process.env[k] = v;
+    }
+  });
+  after(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  const byKey = Object.fromEntries(SOURCES.map((s) => [s.key, s]));
+
+  test("every opted-in quest names the same contracts and floors the indexer sweeps", () => {
+    const optedIn = Object.values(QUESTS).filter((q) => typeof q.indexSources === "function");
+    assert.ok(optedIn.length > 0, "no quest is on the fast path — did the registry lose indexSources?");
+
+    for (const quest of optedIn) {
+      const indexerSide = (SETTLEABLE_QUESTS[quest.id] ?? []).map((key) => ({
+        address: process.env[byKey[key].addressVar].toLowerCase(),
+        floor: DEFAULT_DEPLOY_BLOCKS[byKey[key].deployBlockVar],
+      }));
+
+      const readPathSide = quest.indexSources().map((s) => ({ address: s.address.toLowerCase(), floor: s.floor }));
+
+      assert.deepEqual(
+        readPathSide.slice().sort((a, b) => a.address.localeCompare(b.address)),
+        indexerSide.slice().sort((a, b) => a.address.localeCompare(b.address)),
+        `${quest.id}: a shorter list here is a confirmed false about a source nobody swept`,
+      );
+    }
+  });
+
+  // provide_liquidity is deliberately NOT opted in while the LiquidityPool sweep is still
+  // descending. Nothing enforces that — the proof fails `not_at_floor` on its own and falls
+  // back to the scan — so this only records that the omission is a decision, not an oversight.
+  test("an opted-in quest is one whose sources are settleable at all", () => {
+    for (const quest of Object.values(QUESTS)) {
+      if (typeof quest.indexSources !== "function") continue;
+      assert.ok(SETTLEABLE_QUESTS[quest.id], `${quest.id} is on the fast path but the indexer writes nothing for it`);
+    }
   });
 });

@@ -18,6 +18,7 @@
 
 import { chainId, getBlock, getCode, getLogs, headBlock } from "./lib/chain.mjs";
 import { runIndexer, confirmations, maxRangeBlocks } from "./lib/indexer.mjs";
+import { backfillChunkBlocks, runBackfill } from "./lib/backfill.mjs";
 import { runSettler } from "./lib/settler.mjs";
 import { DEFAULT_INTERVAL_MS, runScheduler } from "./lib/scheduler.mjs";
 import { verifySourceContracts } from "./lib/preflight.mjs";
@@ -50,12 +51,30 @@ async function main() {
   // Kill switch. Turning the settler off costs only settlement speed — deep quests go back
   // to needing user polls — and can never affect correctness.
   const settlerEnabled = (process.env.QUEST_SETTLER_ENABLED ?? "true").trim() !== "false";
+  // Likewise a speed-only switch, and the reason it is safe is worth stating: the backfill
+  // writes positives and coverage, and the read path refuses to derive a negative until the
+  // coverage reaches the floor. Turning this off leaves one-time quests answering exactly as
+  // they do today — via the settler and user polls — and can never produce a wrong answer.
+  //
+  // NOTE the contrast with the forward COMPLETION write in indexer.mjs, which has no switch
+  // at all: that one is inside the contiguous range [completion_from .. last_block], so
+  // toggling it would punch an undetectable hole. This one is a whole separate interval, so
+  // stopping it simply leaves the interval short.
+  const backfillEnabled = (process.env.QUEST_BACKFILL_ENABLED ?? "true").trim() !== "false";
 
   console.log(
     `[indexer] starting — chain ${chain}, ${SOURCES.length} sources, every ${intervalMs}ms, ` +
       `trailing head by ${confirmations()} blocks, ≤${maxRangeBlocks()} blocks/source/run, ` +
+      `backfill ${backfillEnabled ? `on (${backfillChunkBlocks()} blocks/chunk)` : "off"}, ` +
       `settler ${settlerEnabled ? "on" : "off"}`,
   );
+
+  // Once every source has reached its floor there is nothing left to sweep, and re-planning
+  // it every tick would be one Supabase read a minute forever. Memoised in the PROCESS, not
+  // in the database, so a redeploy re-checks — which is what makes a changed floor (a
+  // contract redeploy, which changes env and therefore restarts this service anyway) start a
+  // fresh pass rather than being masked by the memo.
+  let backfillComplete = false;
 
   let stopping = false;
   const stop = (signal) => {
@@ -85,24 +104,62 @@ async function main() {
       return report;
     },
 
-    // JOB B. The scheduler only calls this when the forward index is both error-free and
-    // caught up to the safe head — see lib/scheduler.mjs. A settler that falls behind costs
-    // slower deep-history settlement; a forward index that falls behind is the only thing
-    // that can make the endpoint lie, so it always wins.
-    fill: settlerEnabled
-      ? async ({ budgetMs }) => {
-          try {
-            const out = await runSettler({ writer, chainId: chain, budgetMs, getLogs });
-            if (out.worked || out.found || out.extended) {
-              console.log(`[settler] ${JSON.stringify(out)}`);
+    // JOBS C AND B, in that order. The scheduler only calls this when the forward index is
+    // both error-free and caught up to the safe head — see lib/scheduler.mjs. Job A can
+    // never be late because of anything in here.
+    //
+    // C BEFORE B, and it takes the WHOLE slice while it has work. The backfill is what makes
+    // the settler redundant: one unfiltered pass settles every wallet at once, where the
+    // settler walks one wallet at a time. Splitting the budget between them would slow the
+    // thing that ends the problem in order to speed up the thing it replaces.
+    fill:
+      backfillEnabled || settlerEnabled
+        ? async ({ budgetMs }) => {
+            const startedAt = Date.now();
+
+            if (backfillEnabled && !backfillComplete) {
+              try {
+                const head = await headBlock();
+                const out = await runBackfill({ writer, sources: SOURCES, chainId: chain, head, budgetMs, getLogs });
+
+                if (out.complete) {
+                  backfillComplete = true;
+                  console.log(
+                    "[backfill] COMPLETE — every source swept to its floor. The read path can " +
+                      "derive a proven negative once the watermarks are verified.",
+                  );
+                } else if (out.chunks > 0) {
+                  console.log(
+                    `[backfill] ${out.chunks} chunks, ${out.completions} completions, reason=${out.reason}`,
+                  );
+                }
+
+                // The slice is spent unless the sweep finished early; fall through to the
+                // settler only with what is genuinely left.
+                if (!out.complete) return;
+              } catch (err) {
+                // Contained, like the settler: this is opportunistic background work and must
+                // never take down the loop that keeps daily_active honest.
+                console.error("[backfill] slice failed, continuing:", err?.message);
+                return;
+              }
             }
-          } catch (err) {
-            // Contained: the settler is opportunistic and must never take down the loop
-            // that keeps daily_active honest.
-            console.error("[settler] slice failed, continuing:", err?.message);
+
+            if (!settlerEnabled) return;
+
+            const remaining = budgetMs - (Date.now() - startedAt);
+            if (remaining <= 0) return;
+
+            try {
+              const out = await runSettler({ writer, chainId: chain, budgetMs: remaining, getLogs });
+              if (out.worked || out.found || out.extended) {
+                console.log(`[settler] ${JSON.stringify(out)}`);
+              }
+            } catch (err) {
+              console.error("[settler] slice failed, continuing:", err?.message);
+            }
           }
-        }
-      : null,
+        : null,
   });
 
   console.log("[indexer] stopped cleanly");

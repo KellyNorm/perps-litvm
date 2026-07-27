@@ -117,7 +117,27 @@ export function withinDayBoundaryGrace(now = new Date(), graceMs = dayBoundaryGr
   return now.getTime() - midnight < graceMs;
 }
 
-const stale = (detail) => ({ fresh: false, reason: INDEXER_STALE, detail, indexedThrough: null });
+const stale = (detail) => ({ fresh: false, reason: INDEXER_STALE, detail, indexedThrough: null, sources: null });
+
+/**
+ * The handoff watermark, carried through untouched for indexProof.js — NOT a freshness
+ * input, so a null one does not make a source stale (it makes the one-time-quest proof
+ * fail, over there, where that is the right failure).
+ *
+ * NULL IS NOT ZERO. `Number(null)` is 0, and so is `Number("")` — and 0 would read as
+ * "completions have been written since the genesis block", inventing exactly the coverage
+ * 0005_quest_backfill.sql refuses to invent. Both empty forms are rejected explicitly rather
+ * than left to a coercion, and anything else that is not a non-negative integer becomes null
+ * and fails closed downstream.
+ */
+function completionFrom(row) {
+  const raw = row?.completionFrom;
+  if (raw == null) return null;
+  if (typeof raw === "string" && raw.trim() === "") return null;
+
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
 
 /**
  * Stand-in for an unconfigured Supabase. There is no in-memory analogue of a forward
@@ -167,9 +187,12 @@ export function createIndexerState(driver) {
      *   contract addresses — the same set the indexer writes, kept in step by a parity test.
      * @param {number} args.head          current chain head.
      * @param {() => number} [args.now]   injectable clock (ms), for deterministic tests.
-     * @returns {Promise<{fresh, reason, detail, indexedThrough}>} `indexedThrough` is the
-     *   MINIMUM watermark and is what an index-derived answer must report as
-     *   `checkedThroughBlock` — never `head`, which the index has not reached.
+     * @returns {Promise<{fresh, reason, detail, indexedThrough, sources}>} `indexedThrough`
+     *   is the MINIMUM watermark and is what an index-derived answer must report as
+     *   `checkedThroughBlock` — never `head`, which the index has not reached. `sources` is
+     *   the validated per-source rows on the fresh path and null on every stale one: the
+     *   one-time-quest proof needs each row's `completionFrom` (indexProof.js) and must not
+     *   pay for a second read of a table this function has already read and vetted.
      */
     async readFreshness({ chainId, sourceKeys, head, now = () => Date.now() }) {
       if (!Array.isArray(sourceKeys) || sourceKeys.length === 0) {
@@ -196,7 +219,7 @@ export function createIndexerState(driver) {
         const updatedAt = Date.parse(row?.updatedAt ?? "");
         // A row we cannot read is worse than a row that is absent: absence is honest.
         if (!key || !Number.isInteger(lastBlock) || lastBlock < 0 || !Number.isFinite(updatedAt)) continue;
-        byKey.set(key, { lastBlock, updatedAt });
+        byKey.set(key, { sourceKey: key, lastBlock, updatedAt, completionFrom: completionFrom(row) });
       }
 
       // --- 1 & 2. A REQUIRED SOURCE IS MISSING, OR THE COUNT IS SHORT.
@@ -227,7 +250,7 @@ export function createIndexerState(driver) {
       // --- 5. THE JOB IS RUNNING BUT LOSING GROUND.
       if (head - indexedThrough > maxLagBlocks({ lagMs })) return stale("block_lag");
 
-      return { fresh: true, reason: null, detail: null, indexedThrough };
+      return { fresh: true, reason: null, detail: null, indexedThrough, sources: present };
     },
   };
 }

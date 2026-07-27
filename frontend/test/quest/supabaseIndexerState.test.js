@@ -61,7 +61,7 @@ describe("load", () => {
 
     assert.equal(fetch.calls.length, 1, "one round trip, not one per source");
     const { url, init } = fetch.calls[0];
-    assert.ok(url.includes("select=source_key,last_block,updated_at"), url);
+    assert.ok(url.includes("select=source_key,last_block,updated_at,completion_from"), url);
     assert.ok(url.includes("chain_id=eq.4441"), url);
     assert.ok(url.includes("source_key=in.("), url);
     assert.ok(url.includes("0xbbbb"), "source keys are lower-cased to match the table CHECK");
@@ -71,12 +71,39 @@ describe("load", () => {
   test("maps snake_case columns onto the policy's shape", async () => {
     const fetch = fakeFetch({
       ok: true,
-      json: async () => [{ source_key: A, last_block: 33_000_000, updated_at: "2026-07-26T00:00:00Z" }],
+      json: async () => [
+        { source_key: A, last_block: 33_000_000, updated_at: "2026-07-26T00:00:00Z", completion_from: "32000000" },
+      ],
     });
 
     assert.deepEqual(await driverWith(fetch).load(4441, [A]), [
-      { sourceKey: A, lastBlock: 33_000_000, updatedAt: "2026-07-26T00:00:00Z" },
+      { sourceKey: A, lastBlock: 33_000_000, updatedAt: "2026-07-26T00:00:00Z", completionFrom: 32_000_000 },
     ]);
+  });
+
+  // completion_from is nullable with no default and is never backfilled, and `Number(null)`
+  // is 0 — which would read as "completions have been written since the genesis block".
+  // Inventing that coverage is the one mistake 0005_quest_backfill.sql is written against.
+  test("a null completion_from stays null rather than becoming block zero", async () => {
+    const fetch = fakeFetch({
+      ok: true,
+      json: async () => [{ source_key: A, last_block: 33_000_000, updated_at: "2026-07-26T00:00:00Z", completion_from: null }],
+    });
+
+    const [row] = await driverWith(fetch).load(4441, [A]);
+    assert.equal(row.completionFrom, null);
+  });
+
+  // The column landed with 0005; a project that has not applied it yet returns rows without
+  // the field, and "absent" must fail closed exactly as "null" does rather than throwing.
+  test("a missing completion_from column is null, not a crash", async () => {
+    const fetch = fakeFetch({
+      ok: true,
+      json: async () => [{ source_key: A, last_block: 33_000_000, updated_at: "2026-07-26T00:00:00Z" }],
+    });
+
+    const [row] = await driverWith(fetch).load(4441, [A]);
+    assert.equal(row.completionFrom, null);
   });
 
   test("parses a string-encoded bigint", async () => {

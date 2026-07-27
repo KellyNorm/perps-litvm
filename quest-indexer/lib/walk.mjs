@@ -64,6 +64,151 @@ export const CHUNK_BLOCKS = 10_000;
  *   `frontier` is the lowest CONTIGUOUSLY covered block, and equals `from + 1` (i.e. no
  *   progress) when nothing succeeded. `stopped` is "found" | "floor" | "budget" | "error".
  */
+/**
+ * Blocks per eth_getLogs call for the BACKFILL, and deliberately NOT `CHUNK_BLOCKS`.
+ *
+ * ============================================================================
+ * WHY THIS IS ALLOWED TO DIFFER, WHEN CHUNK_BLOCKS IS NOT
+ * ============================================================================
+ * CHUNK_BLOCKS is pinned to the read path's value by a parity test, for a real reason: the
+ * settler and the read path write the SAME quest_cursor rows, so coverage one produces has
+ * to be coverage the other will accept and extend.
+ *
+ * The backfill writes `quest_backfill`, which nothing else writes. Its chunk size is
+ * therefore a pure throughput parameter with no agreement to keep, and pinning it to 10k
+ * would be cargo-culting a constraint that does not apply.
+ *
+ * 25,000 IS MEASURED, on this RPC, on 2026-07-27:
+ *
+ *     span   median   errors   blocks/sec
+ *     10k     5.6s      0/5      1,788
+ *     25k     9.9s      0/5      2,530
+ *     50k    29.8s      2/5      1,676
+ *
+ * The ceiling is not a block-range cap — 61k and 90k spans both succeed — it is a ~30s
+ * SERVER-SIDE REQUEST TIMEOUT. 50k sits on top of it and fails ~40% of the time; 25k is the
+ * throughput optimum with no observed failures. Re-measure before changing this, because
+ * the shape of the curve, not the number, is the reason for it.
+ */
+export const BACKFILL_CHUNK_BLOCKS = 25_000;
+
+/**
+ * The floor the adaptive halving stops at. Below this, a chunk that still times out is a
+ * problem no amount of shrinking will fix, and pretending otherwise turns a visible failure
+ * into an invisible crawl.
+ */
+export const BACKFILL_MIN_CHUNK_BLOCKS = 2_500;
+
+/**
+ * The UNFILTERED downward sweep — the backfill's engine.
+ *
+ * ============================================================================
+ * HOW IT DIFFERS FROM walkDown(), AND WHY THAT IS SAFE
+ * ============================================================================
+ * walkDown() asks "did THIS wallet ever act", so a single log is proof and ends the walk.
+ * This asks "which wallets EVER acted", so a log is data and the sweep must continue to the
+ * floor regardless of what it finds. One pass answers for every wallet at once, which is
+ * the entire reason the backfill is cheaper than the per-wallet walk it replaces.
+ *
+ * The contiguity guarantee is IDENTICAL and is what matters:
+ *
+ *   * `frontier` moves only on the line after a chunk that both READ successfully and was
+ *     RECORDED successfully;
+ *   * any failure returns immediately — there is no path that continues past one;
+ *   * the sweep is strictly descending, each chunk starting one block below the last.
+ *
+ * So `frontier` is always the bottom of an unbroken run downward from the start, and a
+ * caller that persists only `frontier` cannot record a hole.
+ *
+ * ============================================================================
+ * ADAPTIVE HALVING — THE ANTI-STALL, NOT A CONGESTION CONTROLLER
+ * ============================================================================
+ * Failures on this RPC are timeout-driven and random rather than span-bounded. A chunk that
+ * times out at 25k will usually succeed on retry, but a dense region could in principle
+ * time out at 25k every time — and since the sweep cannot advance past it, that would stall
+ * the backfill at one block forever. So a failed READ halves the span and retries the same
+ * `hi`, down to BACKFILL_MIN_CHUNK_BLOCKS.
+ *
+ * THE SPAN DOES NOT RECOVER within a slice. Restoring it after a success would oscillate —
+ * fail, halve, succeed, restore, fail — paying a wasted request each cycle. A slice is one
+ * scheduler tick; the next one starts fresh at the configured size, which is recovery
+ * enough and cannot oscillate.
+ *
+ * A RECORDING failure (`onChunk` throwing) does NOT halve and does not retry: a smaller
+ * block range is no answer to a database that rejected the write, and retrying would
+ * re-issue the same write. It stops the sweep, and the durable frontier is whatever was
+ * committed before it.
+ *
+ * @param {object} args
+ * @param {(lo: number, hi: number) => Promise<Array>} args.getLogsFor
+ * @param {(logs: Array, lo: number, hi: number) => Promise<void>} args.onChunk  records the
+ *   chunk durably — completions first, then the frontier. MUST throw rather than swallow:
+ *   a swallowed write failure would let `frontier` advance over blocks nothing recorded.
+ * @param {number} args.from   highest block to read, inclusive.
+ * @param {number} args.floor  lowest block worth reading — the contract's deploy block.
+ * @param {number} args.budgetMs
+ * @returns {Promise<{frontier, chunks, logs, stopped, error?}>}
+ *   `frontier` is the lowest CONTIGUOUSLY covered-and-recorded block, and equals `from + 1`
+ *   when nothing succeeded. `stopped` is "floor" | "budget" | "error".
+ */
+export async function sweepDown({
+  getLogsFor,
+  onChunk,
+  from,
+  floor,
+  budgetMs,
+  now = () => Date.now(),
+  chunkBlocks = BACKFILL_CHUNK_BLOCKS,
+  minChunkBlocks = BACKFILL_MIN_CHUNK_BLOCKS,
+}) {
+  let frontier = from + 1;
+  let chunks = 0;
+  let seen = 0;
+  let hi = from;
+  let span = chunkBlocks;
+
+  const deadline = now() + budgetMs;
+
+  while (hi >= floor) {
+    // Checked BEFORE starting a chunk, never mid-flight: an abandoned chunk is wasted work
+    // and would tempt a caller into recording coverage it did not finish reading.
+    if (now() >= deadline) return { frontier, chunks, logs: seen, stopped: "budget" };
+
+    const lo = Math.max(floor, hi - span + 1);
+
+    let logs;
+    try {
+      logs = await getLogsFor(lo, hi);
+    } catch (err) {
+      // Halve and retry the SAME hi. `continue` deliberately does not touch `frontier` or
+      // `hi`, so a shrinking retry re-reads the identical top of the range.
+      if (span > minChunkBlocks) {
+        span = Math.max(minChunkBlocks, Math.floor(span / 2));
+        continue;
+      }
+      return { frontier, chunks, logs: seen, stopped: "error", error: err };
+    }
+
+    // Record BEFORE advancing. If this throws, the frontier stays where it was and the next
+    // slice re-reads this chunk — idempotent, because completions are on-conflict-do-nothing
+    // and the frontier write is guarded to move only downward.
+    try {
+      await onChunk(logs, lo, hi);
+    } catch (err) {
+      return { frontier, chunks, logs: seen, stopped: "error", error: err };
+    }
+
+    chunks++;
+    seen += logs.length;
+
+    // The only place frontier moves, and only after a chunk that was both read and recorded.
+    frontier = lo;
+    hi = lo - 1;
+  }
+
+  return { frontier, chunks, logs: seen, stopped: "floor" };
+}
+
 export async function walkDown({ getLogsFor, from, floor, budgetMs, now = () => Date.now(), chunkBlocks = CHUNK_BLOCKS }) {
   // Start at "nothing new walked". Every early return below reports this unless a chunk has
   // actually succeeded, so a walk that achieves nothing writes nothing.

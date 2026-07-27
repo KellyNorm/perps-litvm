@@ -10,8 +10,10 @@
 import {
   dailyActiveTier1,
   dailyActiveTier2,
+  firstPredictionSources,
   firstPredictionTier1,
   firstPredictionTier2,
+  firstTradeSources,
   firstTradeTier1,
   firstTradeTier2,
   provideLiquidityTier1,
@@ -35,6 +37,10 @@ export const SOURCE = {
   TIER2: "tier2",
   CACHE: "cache",
   COMPOSED: "composed",
+  // Derived from the backfill's coverage joined to the forward index's, with no getLogs at
+  // all — see indexProof.js. Distinct from CACHE deliberately: a cache hit is a remembered
+  // answer, this is a proof recomputed from coverage on this request.
+  INDEX: "index",
 };
 
 export const QUEST_KIND = {
@@ -47,12 +53,29 @@ export const QUEST_KIND = {
   COMPOSITE: "composite",
 };
 
+// `indexSources` OPTS A QUEST INTO THE ZERO-CHUNK NEGATIVE (indexProof.js): before falling
+// back to the Tier 2 scan, ask whether the backfill's coverage joined to the forward index's
+// already answers this wallet. It is the SAME source list Tier 2 walks, which is why it is
+// the checks.js function rather than a second list here.
+//
+// PRESENT ON A QUEST ONLY ONCE ITS SOURCES HAVE ACTUALLY BEEN SWEPT TO THE FLOOR, which is
+// belt-and-braces rather than the safety mechanism: the proof re-derives all seven
+// conditions on every request and a half-swept source fails `not_at_floor` on its own. What
+// the flag buys is not correctness but cost — a quest that cannot yet be answered this way
+// should not pay three Supabase reads per request to be told so.
+//
+//   first_trade       PositionManager        reached_floor + handoff_set + no_gap, 2026-07-27
+//   first_prediction  both factories         reached_floor + handoff_set + no_gap, 2026-07-27
+//   provide_liquidity LiquidityPool          STILL BACKFILLING — stays on the scan path
+//
+// Adding provide_liquidity is a one-line change once its sweep reaches the floor.
 export const QUESTS = {
   first_trade: {
     id: "first_trade",
     kind: QUEST_KIND.ONE_TIME,
     tier1: firstTradeTier1,
     tier2: firstTradeTier2,
+    indexSources: firstTradeSources,
   },
 
   first_prediction: {
@@ -60,6 +83,7 @@ export const QUESTS = {
     kind: QUEST_KIND.ONE_TIME,
     tier1: firstPredictionTier1,
     tier2: firstPredictionTier2,
+    indexSources: firstPredictionSources,
   },
 
   provide_liquidity: {
@@ -67,6 +91,8 @@ export const QUESTS = {
     kind: QUEST_KIND.ONE_TIME,
     tier1: provideLiquidityTier1,
     tier2: provideLiquidityTier2,
+    // No indexSources: the LiquidityPool sweep has not reached its floor yet, so this quest
+    // stays on the resumable scan until it has.
   },
 
   // Composition only — issues no chain calls of its own. Each part is resolved through the
