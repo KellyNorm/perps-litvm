@@ -762,3 +762,183 @@ describe("coverage reporting", () => {
     assert.ok(!("coverage" in res.body));
   });
 });
+
+// ============================================================================
+// THE ZERO-CHUNK PATH — the second route to a confirmed false.
+// ============================================================================
+// Wired END TO END rather than against a fake proof object: process.env plus a stubbed
+// global fetch drives verify.js → indexProof.js → both PostgREST drivers, so the URLs, the
+// env gating and the tier ordering are all covered here rather than assumed.
+//
+// Every test quest declares `floor: 0`, which is what keeps the suite offline: verifySourceFloor
+// short-circuits at a genesis floor ("nothing can exist below it") instead of reaching for
+// eth_getCode. The floor check itself is covered in indexProof.test.js, where it is injected.
+
+describe("the index proof", () => {
+  const PM = "0x9396d36f713302ff39e0ba5b38012656f8e4eacf";
+  const HEAD = 33_000_000;
+
+  const realFetch = globalThis.fetch;
+  const savedEnv = {};
+
+  before(() => {
+    for (const k of ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "QUEST_INDEX_PROOF", "QUEST_CACHE"]) {
+      savedEnv[k] = process.env[k];
+    }
+    process.env.SUPABASE_URL = "https://proj.supabase.co";
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "service-role-key";
+    process.env.QUEST_INDEX_PROOF = "supabase";
+    // The verdict cache stays in memory, so the only thing reading through the stub below is
+    // the proof itself — a cache hit would answer before the proof ever ran.
+    delete process.env.QUEST_CACHE;
+  });
+
+  after(() => {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  /** A PostgREST stub, routed by table. Records what was asked for. */
+  function serve({ completion = [], backfill = [{ source_key: PM, floor_block: 0, covered_from: 32_500_000, covered_to: 0 }], state = [{ source_key: PM, last_block: 32_999_900, updated_at: new Date().toISOString(), completion_from: 32_000_000 }] } = {}) {
+    const seen = [];
+    globalThis.fetch = async (url) => {
+      seen.push(url);
+      const rows = url.includes("/quest_completion?")
+        ? completion
+        : url.includes("/quest_backfill?")
+          ? backfill
+          : url.includes("/indexer_state?")
+            ? state
+            : null;
+      if (rows === null) return { ok: false, status: 404, json: async () => [] };
+      return { ok: true, status: 200, json: async () => rows };
+    };
+    return seen;
+  }
+
+  const indexed = (over = {}) =>
+    registerQuest("indexed", {
+      tier1: async () => tier1(false, { checkedThroughBlock: HEAD }),
+      indexSources: () => [{ address: PM, floor: 0, label: "PositionManager" }],
+      ...over,
+    });
+
+  test("a swept, fresh, gap-free index answers a confirmed false with no scan at all", async () => {
+    serve();
+    let scanned = false;
+    const id = indexed({
+      tier2: async () => {
+        scanned = true;
+        return scan({ exhausted: true });
+      },
+    });
+
+    const res = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+
+    assert.equal(res.body.status, STATUS.CONFIRMED);
+    assert.equal(res.body.completed, false);
+    assert.equal(res.body.source, SOURCE.INDEX);
+    assert.equal(scanned, false, "the whole point: no getLogs");
+    // The index's watermark, NOT the head Tier 1 saw.
+    assert.equal(res.body.checkedThroughBlock, 32_999_900);
+    assert.deepEqual(res.body.index.sources, [
+      { source: PM, floor: 0, coveredFrom: 32_500_000, completionFrom: 32_000_000, indexedTo: 32_999_900 },
+    ]);
+  });
+
+  test("a completion row is a confirmed true from the index", async () => {
+    serve({ completion: [{ checked_through_block: 31_000_000 }] });
+    const id = indexed({ tier2: async () => scan({ exhausted: true }) });
+
+    const res = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+
+    assert.equal(res.body.status, STATUS.CONFIRMED);
+    assert.equal(res.body.completed, true);
+    assert.equal(res.body.source, SOURCE.INDEX);
+    assert.equal(res.body.checkedThroughBlock, 31_000_000);
+  });
+
+  // The invariant, end to end: an unfinished sweep must not shortcut anything.
+  test("a sweep short of the floor falls through to the scan, and stays indeterminate", async () => {
+    serve({ backfill: [{ source_key: PM, floor_block: 0, covered_from: 32_500_000, covered_to: 1_000 }] });
+    let scanned = false;
+    const id = indexed({
+      tier2: async () => {
+        scanned = true;
+        return scan({ exhausted: true, reason: "budget_exhausted" });
+      },
+    });
+
+    const res = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+
+    assert.equal(scanned, true, "an unproven index must not suppress the scan");
+    assert.equal(res.body.status, STATUS.INDETERMINATE);
+    assert.equal(res.body.reason, "budget_exhausted");
+  });
+
+  test("a stale index falls through to the scan", async () => {
+    serve({ state: [{ source_key: PM, last_block: 32_999_900, updated_at: new Date(Date.now() - 60 * 60_000).toISOString(), completion_from: 32_000_000 }] });
+    const id = indexed({ tier2: async () => scan({ exhausted: true }) });
+
+    const res = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+
+    assert.equal(res.body.status, STATUS.INDETERMINATE);
+    assert.equal(res.body.source, SOURCE.TIER2);
+  });
+
+  // A completion read that FAILED is the one thing that must never read as an absent row.
+  test("an unreadable quest_completion never becomes a confirmed false", async () => {
+    globalThis.fetch = async (url) =>
+      url.includes("/quest_completion?")
+        ? { ok: false, status: 500, json: async () => [] }
+        : { ok: true, status: 200, json: async () => [] };
+
+    const id = indexed({ tier2: async () => scan({ exhausted: true }) });
+
+    const res = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+
+    assert.equal(res.body.status, STATUS.INDETERMINATE);
+    assert.notEqual(res.body.source, SOURCE.INDEX);
+  });
+
+  // provide_liquidity's shape while its backfill is still running.
+  test("a quest with no indexSources never consults the index", async () => {
+    const seen = serve();
+    const id = registerQuest("scanonly", {
+      tier1: async () => tier1(false, { checkedThroughBlock: HEAD }),
+      tier2: async () => scan({ complete: true }),
+    });
+
+    const res = mockRes();
+    await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+
+    assert.equal(res.body.source, SOURCE.TIER2);
+    assert.deepEqual(seen, [], "no Supabase read at all — an unopted quest pays nothing");
+  });
+
+  test("QUEST_INDEX_PROOF=none is the rollback: the scan path comes straight back", async () => {
+    const seen = serve();
+    process.env.QUEST_INDEX_PROOF = "none";
+    _resetCache();
+
+    try {
+      const id = indexed({ tier2: async () => scan({ exhausted: true }) });
+      const res = mockRes();
+      await handler(mockReq({ body: { address: ADDRESS, quest: id } }), res);
+
+      assert.equal(res.body.status, STATUS.INDETERMINATE);
+      assert.deepEqual(seen, []);
+    } finally {
+      process.env.QUEST_INDEX_PROOF = "supabase";
+      _resetCache();
+    }
+  });
+});

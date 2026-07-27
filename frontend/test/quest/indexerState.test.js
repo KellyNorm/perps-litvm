@@ -255,3 +255,56 @@ describe("the invariant", () => {
     }
   });
 });
+
+// ============================================================================
+// THE HANDOFF WATERMARK, CARRIED THROUGH
+// ============================================================================
+// completion_from is not a freshness input — a null one must not make a source stale, it
+// makes the ONE-TIME-quest proof fail, over in indexProof.js, where that is the right
+// failure. What this guard owes that proof is the value, validated, and only on the fresh
+// path: a stale verdict carries no rows at all, so nothing downstream can join against
+// coverage this file has just refused to vouch for.
+
+describe("completion_from passes through to the one-time-quest proof", () => {
+  const withHandoff = (completionFrom) => freshRows().map((r) => ({ ...r, completionFrom }));
+
+  test("a fresh result carries the per-source rows, keyed", async () => {
+    const out = await read(driverOf(withHandoff(32_000_000)));
+
+    assert.equal(out.fresh, true);
+    assert.equal(out.sources.length, SOURCES.length);
+    assert.deepEqual(out.sources.map((s) => s.sourceKey).sort(), SOURCES.slice().sort());
+    assert.equal(out.sources[0].completionFrom, 32_000_000);
+  });
+
+  // NULL IS NOT ZERO. `Number(null)` is 0, which would read as "completions have been
+  // written since the genesis block" — the coverage claim 0005_quest_backfill.sql refuses to
+  // invent. It must survive as null so the proof fails closed on it.
+  test("a null handoff stays null, and does not make the source stale", async () => {
+    const out = await read(driverOf(withHandoff(null)));
+
+    assert.equal(out.fresh, true, "freshness is about last_block and updated_at, not this column");
+    assert.equal(out.sources[0].completionFrom, null);
+  });
+
+  test("an unparseable handoff degrades to null rather than to a number", async () => {
+    for (const bad of ["", "wat", -1, 1.5, {}]) {
+      const out = await read(driverOf(withHandoff(bad)));
+      assert.equal(out.sources[0].completionFrom, null, `${JSON.stringify(bad)} must not become a block`);
+    }
+  });
+
+  test("a string-encoded handoff is parsed, like every other bigint here", async () => {
+    const out = await read(driverOf(withHandoff("32000000")));
+    assert.equal(out.sources[0].completionFrom, 32_000_000);
+  });
+
+  // A stale verdict must not hand out rows: they describe an index that has just been
+  // declared unusable, and the proof's only correct move is to ignore them entirely.
+  test("a stale result carries no rows at all", async () => {
+    const out = await read(driverOf(withHandoff(32_000_000)), { head: HEAD - 1_000_000 });
+
+    assert.equal(out.fresh, false);
+    assert.equal(out.sources, null);
+  });
+});
