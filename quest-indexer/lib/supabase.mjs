@@ -22,6 +22,7 @@ const STATE_TABLE = "indexer_state";
 const DAILY_TABLE = "quest_daily";
 const CURSOR_TABLE = "quest_cursor";
 const COMPLETION_TABLE = "quest_completion";
+const BACKFILL_TABLE = "quest_backfill";
 
 /**
  * One-time quests have no day bucket. MUST equal ONE_TIME_BUCKET in
@@ -83,12 +84,23 @@ export function createSupabaseWriter({ url, serviceKey, fetch: doFetch = globalT
     async loadState(chainId, sourceKeys) {
       const list = sourceKeys.map((k) => `"${k}"`).join(",");
       const res = await request(
-        `${STATE_TABLE}?select=source_key,last_block,updated_at&chain_id=eq.${chainId}&source_key=in.(${list})`,
+        `${STATE_TABLE}?select=source_key,last_block,updated_at,completion_from&chain_id=eq.${chainId}&source_key=in.(${list})`,
       );
       const rows = await res.json();
       if (!Array.isArray(rows)) throw new Error("indexer_state read returned a non-array");
 
-      return new Map(rows.map((r) => [r.source_key, { lastBlock: Number(r.last_block), updatedAt: r.updated_at }]));
+      return new Map(
+        rows.map((r) => [
+          r.source_key,
+          {
+            lastBlock: Number(r.last_block),
+            updatedAt: r.updated_at,
+            // NULL stays null, deliberately — it means "not yet proven", and coercing it to
+            // a number here would manufacture the coverage claim 0005 refuses to invent.
+            completionFrom: r.completion_from == null ? null : Number(r.completion_from),
+          },
+        ]),
+      );
     },
 
     /**
@@ -119,6 +131,77 @@ export function createSupabaseWriter({ url, serviceKey, fetch: doFetch = globalT
       });
 
       return rows.length;
+    },
+
+    /**
+     * Record proven completions in bulk. The forward indexer's and the backfill's ONLY
+     * positive write.
+     *
+     * There is nothing to get wrong about the direction here, and that is structural rather
+     * than careful: quest_completion has no `completed` and no `status` column, so a row's
+     * EXISTENCE is the completion (0001) and "this wallet did NOT do it" has no
+     * representation. The only thing this function can do is assert positives, and it is
+     * called only with wallets that appeared in a log.
+     *
+     * IGNORE-DUPLICATES, not merge. A completion may already exist from a user poll or the
+     * settler, recorded against a block those knew more about than we do; the row's
+     * existence is the fact, so overwriting its `checked_through_block` with ours would be
+     * churn that can only lose information. An empty batch is a successful no-op — a range
+     * with no activity is the common case and must never block the watermark.
+     */
+    async writeCompletions(rows) {
+      if (rows.length === 0) return 0;
+
+      await request(`${COMPLETION_TABLE}?on_conflict=chain_id,wallet,quest,bucket`, {
+        method: "POST",
+        headers: { ...headers, prefer: "resolution=ignore-duplicates,return=minimal" },
+        body: JSON.stringify(
+          rows.map((r) => ({
+            chain_id: r.chainId,
+            wallet: r.wallet,
+            quest: r.quest,
+            bucket: ONE_TIME_BUCKET,
+            checked_through_block: r.checkedThroughBlock ?? null,
+            source: r.source ?? "indexer",
+          })),
+        ),
+      });
+
+      return rows.length;
+    },
+
+    /**
+     * Claim `completion_from` for a source — the first block from which completions have
+     * been written. THE HANDOFF WATERMARK; see 0005_quest_backfill.sql for why it exists.
+     *
+     * SET ONCE, NEVER MOVED, and the `completion_from=is.null` filter is what enforces it.
+     * That guard is the whole function:
+     *
+     *   * A later run finds the column already set, matches no row, and is a silent no-op —
+     *     so the recorded value stays the FIRST one, which is the only one that describes
+     *     contiguous coverage.
+     *   * Two racing runs both see null; whichever lands second matches nothing. Either
+     *     value is safe, because both are ranges whose completions actually landed.
+     *
+     * If the row does not exist yet (a brand-new source, first ever run) this matches
+     * nothing and `advance` creates the row with a null column; the NEXT run claims it, one
+     * range higher. HIGHER IS THE SAFE DIRECTION — the read path checks
+     * `covered_from >= completion_from - 1`, so a higher value demands MORE of the backfill,
+     * never less. That is why this may be lossy but can never be wrong.
+     */
+    async claimCompletionFrom(chainId, sourceKey, block) {
+      const res = await request(
+        `${STATE_TABLE}?chain_id=eq.${chainId}&source_key=eq.${encodeURIComponent(sourceKey)}&completion_from=is.null`,
+        {
+          method: "PATCH",
+          headers: { ...headers, prefer: "return=representation" },
+          // last_block is deliberately ABSENT: this must not be able to move the watermark.
+          body: JSON.stringify({ completion_from: block }),
+        },
+      );
+
+      const updated = await res.json();
+      return Array.isArray(updated) && updated.length > 0 ? "claimed" : "already_set";
     },
 
     /**
@@ -163,6 +246,97 @@ export function createSupabaseWriter({ url, serviceKey, fetch: doFetch = globalT
 
       const created = await insert.json();
       return Array.isArray(created) && created.length > 0 ? "created" : "superseded";
+    },
+
+    // ========================================================================
+    // THE BACKFILL'S READS AND WRITES
+    // ========================================================================
+
+    /**
+     * Current backfill coverage for the given sources. Missing sources are simply absent —
+     * the caller treats that as "never swept" and starts a fresh pass from the head.
+     */
+    async loadBackfill(chainId, sourceKeys) {
+      const list = sourceKeys.map((k) => `"${k}"`).join(",");
+      const res = await request(
+        `${BACKFILL_TABLE}?select=source_key,floor_block,covered_from,covered_to,updated_at` +
+          `&chain_id=eq.${chainId}&source_key=in.(${list})`,
+      );
+      const rows = await res.json();
+      if (!Array.isArray(rows)) throw new Error("quest_backfill read returned a non-array");
+
+      return new Map(
+        rows.map((r) => [
+          r.source_key,
+          {
+            floorBlock: Number(r.floor_block),
+            coveredFrom: Number(r.covered_from),
+            coveredTo: Number(r.covered_to),
+            updatedAt: r.updated_at,
+          },
+        ]),
+      );
+    },
+
+    /**
+     * Open a pass: fix the ceiling and start the coverage empty at it.
+     *
+     * MERGE-DUPLICATES, and called ONLY when the caller has decided there is no usable row —
+     * absent, or computed against a floor that no longer matches. In the second case the old
+     * coverage is void and must be discarded wholesale, which is exactly what merging a
+     * fresh `covered_to = covered_from` does. Calling this on a resumable row would silently
+     * throw away a completed sweep, so the decision lives in the planner and not here.
+     *
+     * `covered_from` is set once, here, and never moves again — it is the handoff point the
+     * read path checks against `completion_from`, and moving it later would claim coverage
+     * of blocks that nothing swept.
+     */
+    async startBackfill({ chainId, sourceKey, floorBlock, coveredFrom }, { now = () => new Date() } = {}) {
+      await request(`${BACKFILL_TABLE}?on_conflict=chain_id,source_key`, {
+        method: "POST",
+        headers: { ...headers, prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify({
+          chain_id: chainId,
+          source_key: sourceKey,
+          floor_block: floorBlock,
+          covered_from: coveredFrom,
+          // Empty coverage: the interval is a single block until the first chunk lands.
+          covered_to: coveredFrom,
+          updated_at: now().toISOString(),
+        }),
+      });
+    },
+
+    /**
+     * Extend a pass's coverage DOWNWARD. The backfill's only coverage write.
+     *
+     * THREE GUARDS, the same shape as extendCursorDown and for the same reasons:
+     *
+     *   1. `covered_to=gte.N` means this can only ever move coverage DOWN. A replayed or
+     *      concurrent slice holding a staler frontier matches no row and is a no-op, rather
+     *      than dragging the frontier back up and discarding swept blocks.
+     *   2. `floor_block=eq.N` pins the row to the floor the caller PLANNED against. If the
+     *      configured floor changed underneath a running slice, the write fails to match
+     *      instead of extending coverage that was computed against a different contract.
+     *   3. There is no `covered_from` in the body. The ceiling belongs to startBackfill and
+     *      is set once; a writer that could raise it could claim unswept blocks.
+     *
+     * No verdict here and no column that could hold one — quest_backfill stores which blocks
+     * were read, and nothing else.
+     */
+    async extendBackfillDown({ chainId, sourceKey, floorBlock, coveredTo }, { now = () => new Date() } = {}) {
+      const res = await request(
+        `${BACKFILL_TABLE}?chain_id=eq.${chainId}&source_key=eq.${encodeURIComponent(sourceKey)}` +
+          `&covered_to=gte.${coveredTo}&floor_block=eq.${floorBlock}`,
+        {
+          method: "PATCH",
+          headers: { ...headers, prefer: "return=representation" },
+          body: JSON.stringify({ covered_to: coveredTo, updated_at: now().toISOString() }),
+        },
+      );
+
+      const updated = await res.json();
+      return Array.isArray(updated) && updated.length > 0 ? "extended" : "superseded";
     },
 
     // ========================================================================
