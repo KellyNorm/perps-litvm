@@ -28,6 +28,19 @@
 // it declares its sources and the resume layer decides what still needs walking. Callers
 // that pass only {head} get a one-shot scan, exactly as before.
 
+// SOURCES ARE DECLARED ONCE PER QUEST, and both consumers read the same declaration:
+//
+//   * the Tier 2 scan, which binds each source's filter to one wallet and walks it;
+//   * the index proof (indexProof.js), which needs only the address and the floor and
+//     requires a completed backfill for EVERY source in the list.
+//
+// That sharing is load-bearing rather than tidy. If the proof's list were maintained
+// separately and lost a source — the draining prediction factory is the obvious candidate,
+// since nothing new is written to it — the proof would demand coverage of one factory and
+// then report a confirmed false about a wallet whose only bet was on the other. A quest's
+// sources are one list, in one place, and `filterFor` is what lets the scan still be
+// per-wallet.
+
 import {
   batchRead,
   deployBlocks,
@@ -40,6 +53,15 @@ import {
   predictionFactoryRead,
 } from "./chain.js";
 import { scanWithResume } from "./cursor.js";
+
+/**
+ * Bind a quest's declared sources to one wallet — the shape scanForEvent wants.
+ * `filterFor` is dropped rather than carried, so nothing downstream can re-bind a source
+ * that has already been bound to somebody.
+ */
+function forWallet(sources, wallet) {
+  return sources.map(({ filterFor, ...source }) => ({ ...source, filter: filterFor(wallet) }));
+}
 
 // The markets PositionManager actually supports for perps. bytes32("BTC") / bytes32("ETH")
 // are MARKET_BTC / MARKET_ETH on-chain. SOL/LTC appear in the frontend's CANDIDATE_MARKETS
@@ -85,21 +107,23 @@ export async function firstTradeTier1(address) {
   return { completed, reliable, checkedThroughBlock };
 }
 
+/** The one source that can prove — or disprove — a first trade. */
+export function firstTradeSources() {
+  const pm = positionManagerRead();
+  return [
+    {
+      contract: pm,
+      address: pm.address,
+      floor: deployBlocks.positionManager(),
+      label: "PositionManager",
+      filterFor: (wallet) => pm.filters.PositionOpened(wallet),
+    },
+  ];
+}
+
 /** first_trade, Tier 2: has this wallet EVER opened a position? `owner` is indexed. */
 export async function firstTradeTier2(address, opts) {
-  const pm = positionManagerRead();
-  return scanWithResume(
-    [
-      {
-        contract: pm,
-        filter: pm.filters.PositionOpened(address),
-        floor: deployBlocks.positionManager(),
-        address: pm.address,
-        label: "PositionManager",
-      },
-    ],
-    { ...opts, wallet: address },
-  );
+  return scanWithResume(forWallet(firstTradeSources(), address), { ...opts, wallet: address });
 }
 
 // How many of the newest market ids Tier 1 inspects. Live markets are always the newest
@@ -168,29 +192,30 @@ export async function firstPredictionTier1(address) {
  * convergence state "live factory fully walked, old factory barely started" is represented
  * exactly, and this quest returns a proven false only once BOTH have reached their floors.
  */
-export async function firstPredictionTier2(address, opts) {
+export function firstPredictionSources() {
   const factory = predictionFactoryRead();
   const oldFactory = predictionFactoryOldRead();
 
-  return scanWithResume(
-    [
-      {
-        contract: factory,
-        filter: factory.filters.BetPlaced(null, address),
-        floor: deployBlocks.predictionFactory(),
-        address: factory.address,
-        label: "prediction factory (8h, live)",
-      },
-      {
-        contract: oldFactory,
-        filter: oldFactory.filters.BetPlaced(null, address),
-        floor: deployBlocks.predictionFactoryOld(),
-        address: oldFactory.address,
-        label: "prediction factory (24h, draining)",
-      },
-    ],
-    { ...opts, wallet: address },
-  );
+  return [
+    {
+      contract: factory,
+      address: factory.address,
+      floor: deployBlocks.predictionFactory(),
+      label: "prediction factory (8h, live)",
+      filterFor: (wallet) => factory.filters.BetPlaced(null, wallet),
+    },
+    {
+      contract: oldFactory,
+      address: oldFactory.address,
+      floor: deployBlocks.predictionFactoryOld(),
+      label: "prediction factory (24h, draining)",
+      filterFor: (wallet) => oldFactory.filters.BetPlaced(null, wallet),
+    },
+  ];
+}
+
+export async function firstPredictionTier2(address, opts) {
+  return scanWithResume(forWallet(firstPredictionSources(), address), { ...opts, wallet: address });
 }
 
 /**
@@ -219,18 +244,19 @@ export async function provideLiquidityTier1(address) {
  * honest reading of "provide liquidity". Both are indexed, so switching is a one-line
  * change if that call ever goes the other way.
  */
-export async function provideLiquidityTier2(address, opts) {
+export function provideLiquiditySources() {
   const pool = liquidityPoolRead();
-  return scanWithResume(
-    [
-      {
-        contract: pool,
-        filter: pool.filters.Deposit(address),
-        floor: deployBlocks.liquidityPool(),
-        address: pool.address,
-        label: "LiquidityPool",
-      },
-    ],
-    { ...opts, wallet: address },
-  );
+  return [
+    {
+      contract: pool,
+      address: pool.address,
+      floor: deployBlocks.liquidityPool(),
+      label: "LiquidityPool",
+      filterFor: (wallet) => pool.filters.Deposit(wallet),
+    },
+  ];
+}
+
+export async function provideLiquidityTier2(address, opts) {
+  return scanWithResume(forWallet(provideLiquiditySources(), address), { ...opts, wallet: address });
 }
