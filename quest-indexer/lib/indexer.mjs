@@ -1,14 +1,31 @@
 // JOB A — the forward indexer.
 //
-// Reads each source's participation events from the blocks above its watermark and writes
-// one quest_daily row per (wallet, UTC day). That table is what turns `daily_active` from a
-// ~104-second backward scan into an O(1) row lookup.
+// Reads each source's participation events from the blocks above its watermark and writes:
+//
+//   1. one quest_daily row per (wallet, UTC day) — what turns `daily_active` from a
+//      ~104-second backward scan into an O(1) row lookup;
+//   2. one quest_completion row per (wallet, one-time quest) — a PositionOpened is proof
+//      that address traded, and recording it as it goes is what lets the backfill's
+//      coverage stop at the block this job started from instead of chasing a moving head.
+//
+// The second is the forward half of the union proof in 0005_quest_backfill.sql. Its
+// coverage is reported by `completion_from`, claimed once and never moved.
+//
+// IT HAS NO KILL SWITCH, unlike the settler, and that asymmetry is deliberate. Turning the
+// settler off costs settlement speed. Turning the completion write off and on again would
+// leave a hole inside [completion_from .. last_block] that nothing in the schema can
+// detect, and which the read path would read as a proven negative for every wallet whose
+// only activity fell in it. There is no safe way to expose that as a flag, so it is not one.
 //
 // ============================================================================
 // THE WRITE ORDER IS THE WHOLE SAFETY STORY. READ THIS BEFORE CHANGING ANYTHING.
 // ============================================================================
 //
 //     ROWS FIRST. WATERMARK ONLY ON SUCCESS. NEVER ADVANCE A RANGE THAT FAILED.
+//
+// "Rows" now means BOTH tables plus the completion_from claim. All of them land before the
+// watermark, for one reason: every one of them is a fact the watermark's advance would
+// otherwise claim to have recorded.
 //
 // PostgREST gives us two separate statements, so there is always an instant where one has
 // landed and the other has not. Which one goes first decides whether that instant is
@@ -48,6 +65,7 @@
 // freezing the PositionManager index (needless).
 
 import { allWalletsFilter, sourceAddress, walletFromLog } from "./sources.mjs";
+import { QUESTS_BY_SOURCE } from "./definitions.mjs";
 import { createBlockDayResolver } from "./blockDay.mjs";
 
 /** Trailing margin against reorgs. ~20 blocks ≈ 6s on Nitro. */
@@ -174,9 +192,20 @@ export async function runIndexer({
       // never heals.
       const dayByBlock = await days.resolve(logs, { fromBlock: range.from, toBlock: range.to });
 
+      // Which one-time quests a wallet seen on THIS source has thereby proven. Empty for a
+      // source no settleable quest names, in which case the completion write is skipped
+      // entirely rather than writing rows against a quest id nothing asks about.
+      const quests = QUESTS_BY_SOURCE[source.key] ?? [];
+
       // Dedupe to one row per (wallet, day). A busy trader emits many logs and needs one row,
       // and a smaller batch is a smaller blast radius if the write is rejected.
       const rows = new Map();
+      // ...and one per (wallet, quest), for the same reason. Both are built in this single
+      // pass so walletFromLog — which THROWS on anything it cannot resolve — runs once per
+      // log rather than twice, and so the two tables can never be built from different
+      // readings of the same log.
+      const completions = new Map();
+
       for (const log of logs) {
         const wallet = walletFromLog(source, log);
         const day = dayByBlock.get(log.blockNumber);
@@ -194,14 +223,47 @@ export async function runIndexer({
             firstSeenVia: source.eventName,
           });
         }
+
+        for (const quest of quests) {
+          const questKey = `${wallet}:${quest}`;
+          if (!completions.has(questKey)) {
+            completions.set(questKey, { chainId, wallet, quest, checkedThroughBlock: log.blockNumber, source: "indexer" });
+          }
+        }
       }
 
-      // ---- THE ORDER. Rows, then watermark, and only if the rows landed.
+      // ---- THE ORDER. Every fact first, then the watermark, and only if they all landed.
       await writer.writeDaily([...rows.values()]);
+      await writer.writeCompletions([...completions.values()]);
+
+      // The handoff claim goes BEFORE the watermark too. If it landed while the advance
+      // below failed, the recorded value still describes a range whose completions were
+      // genuinely written, because this line is only reached once they were. Claiming
+      // `range.from` rather than `range.to` is the point: the resume overlap means `from`
+      // sits BELOW the current watermark, so completion coverage starts at or under the
+      // block the daily index had already reached.
+      //
+      // SKIPPED ONCE THE COLUMN IS SET. The write is idempotent anyway — it is guarded on
+      // `completion_from is null` server-side, which is what actually enforces set-once —
+      // but issuing it every tick for every source would be ~5,700 no-op PATCHes a day.
+      // Reading the loaded state here is a bandwidth optimisation only; the guard is still
+      // the thing that makes it correct.
+      if (prior?.completionFrom == null) {
+        await writer.claimCompletionFrom(chainId, address, range.from);
+      }
+
       await writer.advance(chainId, address, range.to);
 
       wrote += rows.size;
-      report.push({ key: source.key, address, from: range.from, to: range.to, logs: logs.length, rows: rows.size });
+      report.push({
+        key: source.key,
+        address,
+        from: range.from,
+        to: range.to,
+        logs: logs.length,
+        rows: rows.size,
+        completions: completions.size,
+      });
     } catch (err) {
       // The watermark is untouched, so this range is re-read next run. Idempotent writes
       // make that free, and the unmoved watermark is what keeps `daily_active` honest in

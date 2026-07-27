@@ -90,3 +90,23 @@ export const SETTLEABLE_QUESTS = {
   first_prediction: ["predictionFactory", "predictionFactoryOld"],
   provide_liquidity: ["liquidityPool"],
 };
+
+/**
+ * The SAME relation read the other way: which quests does one source prove?
+ *
+ * The forward indexer and the backfill both work source-by-source — they hold a batch of
+ * logs from one contract and need to know which completions those logs justify. Deriving
+ * this from SETTLEABLE_QUESTS rather than writing it out is the whole point: two hand-kept
+ * tables of the same relation can disagree, and the direction they would disagree in is a
+ * quest whose source stops producing completions while the backfill still reports that
+ * source covered — a proven false for wallets that did the thing.
+ *
+ * Note first_prediction appears under BOTH factories. That is correct and is not a
+ * duplicate: a bet on either contract completes the quest on its own, so either source
+ * seeing a wallet is sufficient proof. It is only the NEGATIVE that needs both covered,
+ * and that requirement lives in the read path's derivation, not here.
+ */
+export const QUESTS_BY_SOURCE = Object.entries(SETTLEABLE_QUESTS).reduce((acc, [quest, sourceKeys]) => {
+  for (const key of sourceKeys) (acc[key] ??= []).push(quest);
+  return acc;
+}, {});

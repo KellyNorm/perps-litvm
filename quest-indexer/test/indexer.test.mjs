@@ -50,9 +50,13 @@ function log(blockNumber, wallet = WALLET) {
 function fakeWriter({ state = new Map(), fail = null } = {}) {
   const daily = [];
   const advances = [];
+  const completions = [];
+  const claims = [];
   return {
     daily,
     advances,
+    completions,
+    claims,
     async loadState() {
       if (fail === "loadState") throw new Error("loadState boom");
       return state;
@@ -61,6 +65,16 @@ function fakeWriter({ state = new Map(), fail = null } = {}) {
       if (fail === "writeDaily") throw new Error("writeDaily boom");
       daily.push(...rows);
       return rows.length;
+    },
+    async writeCompletions(rows) {
+      if (fail === "writeCompletions") throw new Error("writeCompletions boom");
+      completions.push(...rows);
+      return rows.length;
+    },
+    async claimCompletionFrom(chainId, sourceKey, block) {
+      if (fail === "claimCompletionFrom") throw new Error("claimCompletionFrom boom");
+      claims.push({ sourceKey, block });
+      return "claimed";
     },
     async advance(chainId, sourceKey, lastBlock) {
       if (fail === "advance") throw new Error("advance boom");
@@ -140,14 +154,20 @@ describe("write ordering", () => {
   test("writes rows BEFORE advancing the watermark", async () => {
     const order = [];
     const writer = {
-      async loadState() { return new Map([[PM, { lastBlock: 900_000, updatedAt: "" }]]); },
+      async loadState() { return new Map([[PM, { lastBlock: 900_000, updatedAt: "", completionFrom: null }]]); },
       async writeDaily(rows) { order.push(`rows:${rows.length}`); },
+      async writeCompletions(rows) { order.push(`completions:${rows.length}`); },
+      async claimCompletionFrom() { order.push("completion_from"); },
       async advance() { order.push("watermark"); },
     };
 
     await run({ writer, getLogs: async () => [log(900_100)] });
 
-    assert.deepEqual(order, ["rows:1", "watermark"], "the reverse order is the wrong-false window");
+    assert.deepEqual(
+      order,
+      ["rows:1", "completions:1", "completion_from", "watermark"],
+      "the watermark goes last; anything before it is a fact the watermark claims to have recorded",
+    );
   });
 
   // The one that matters most: if the rows did not land, the watermark must not claim they
@@ -211,6 +231,164 @@ describe("write ordering", () => {
 
     assert.equal(writer.daily.length, 0);
     assert.equal(writer.advances.length, 1, "an empty range is indexed, not skipped");
+  });
+});
+
+// ============================================================================
+// THE FORWARD HALF OF THE UNION PROOF (0005).
+// ============================================================================
+// Every test here is the same test as the ones above, asked of the second table: can
+// `completion_from` ever claim coverage that did not happen? Because the read path turns
+// "no quest_completion row, and completion_from proves we were watching" into a confirmed
+// false, and a completion_from that overstates its range is a wrong false.
+describe("completion writes", () => {
+  const state = () => new Map([[PM, { lastBlock: 900_000, updatedAt: "", completionFrom: null }]]);
+
+  test("a PositionOpened proves first_trade for that address", async () => {
+    const writer = fakeWriter({ state: state() });
+    await run({ writer, getLogs: async () => [log(900_100)] });
+
+    assert.deepEqual(writer.completions, [
+      { chainId: CHAIN, wallet: WALLET, quest: "first_trade", checkedThroughBlock: 900_100, source: "indexer" },
+    ]);
+  });
+
+  // The completion is per (wallet, quest) and the daily row is per (wallet, day). A busy
+  // trader is one of each, not one per log.
+  test("deduped per (wallet, quest) across many logs", async () => {
+    const writer = fakeWriter({ state: state() });
+    await run({ writer, getLogs: async () => [log(900_100), log(900_101), log(900_102)] });
+
+    assert.equal(writer.completions.length, 1);
+    assert.equal(writer.completions[0].checkedThroughBlock, 900_100, "the first sighting, stable across replays");
+  });
+
+  test("wallets are lower-cased, or the table CHECK rejects the whole batch", async () => {
+    const writer = fakeWriter({ state: state() });
+    await run({ writer, getLogs: async () => [log(900_100, "0xE9Dd9bFf0ad5254673daaA77397e84Fec2312292")] });
+
+    assert.equal(writer.completions[0].wallet, WALLET);
+  });
+
+  // Both factories prove first_prediction on their own — either one seeing a wallet is
+  // sufficient. It is only the NEGATIVE that needs both covered, and that lives in the read
+  // path's derivation, not here.
+  test("a source maps to every quest it can prove", async () => {
+    const writer = fakeWriter();
+    // The wallet sits in BOTH indexed slots so one fixture satisfies every descriptor:
+    // PositionOpened/Deposit read topic 1, BetPlaced reads topic 2 (marketId is indexed
+    // first). A log shaped for only one of them would make the others throw, and the run
+    // would report three quests for the wrong reason.
+    const anySource = (block) => {
+      const padded = ethers.utils.hexZeroPad(ethers.utils.getAddress(WALLET), 32);
+      return { blockNumber: block, topics: ["0x" + "aa".repeat(32), padded, padded] };
+    };
+
+    await runIndexer({
+      writer,
+      sources: SOURCES,
+      chainId: CHAIN,
+      head: 1_000_000,
+      getLogs: async () => [anySource(999_975)],
+      getBlock: getBlockAt(),
+      env: ENV,
+      conf: 20,
+      maxRange: 5_000,
+    });
+
+    assert.deepEqual(
+      writer.completions.map((c) => c.quest).sort(),
+      ["first_prediction", "first_prediction", "first_trade", "provide_liquidity"],
+      "both factories prove first_prediction independently",
+    );
+  });
+
+  test("an empty range writes no completions but still claims coverage of it", async () => {
+    const writer = fakeWriter({ state: state() });
+    await run({ writer, getLogs: async () => [] });
+
+    assert.deepEqual(writer.completions, []);
+    assert.equal(writer.claims.length, 1, "a range read and found empty is still a range we covered");
+  });
+
+  // The claim is range.from, not range.to: the resume overlap puts `from` BELOW the current
+  // watermark, so completion coverage starts at or under where the daily index already was.
+  // Claiming `to` would leave the overlap window unclaimed and unprovable.
+  test("claims completion_from at the BOTTOM of the range", async () => {
+    const writer = fakeWriter({ state: state() });
+    await run({ writer, getLogs: async () => [log(900_100)] });
+
+    assert.deepEqual(writer.claims, [{ sourceKey: PM, block: 899_981 }], "lastBlock - conf + 1, the overlap start");
+  });
+
+  // Set-once is enforced server-side by the `completion_from is null` filter; this skip is
+  // only about not issuing ~5,700 no-op PATCHes a day. The value must never be re-claimed
+  // at a HIGHER block, which is what the skip also happens to guarantee locally.
+  test("does not re-claim a completion_from that is already set", async () => {
+    const writer = fakeWriter({
+      state: new Map([[PM, { lastBlock: 900_000, updatedAt: "", completionFrom: 12_345 }]]),
+    });
+
+    await run({ writer, getLogs: async () => [log(900_100)] });
+
+    assert.deepEqual(writer.claims, [], "already proven; re-claiming is pure write traffic");
+    assert.equal(writer.completions.length, 1, "but the completions themselves still land");
+    assert.equal(writer.advances.length, 1);
+  });
+});
+
+// The watermark must not move over completions that did not land — the same rule as
+// quest_daily, and for a sharper reason: an unwritten completion under an advanced
+// watermark is exactly a wallet that traded being reported as never having traded.
+describe("completion writes cannot be skipped past", () => {
+  const state = () => new Map([[PM, { lastBlock: 900_000, updatedAt: "", completionFrom: null }]]);
+
+  test("a failed completion write leaves the watermark UNTOUCHED", async () => {
+    const writer = fakeWriter({ state: state(), fail: "writeCompletions" });
+
+    const out = await run({ writer, getLogs: async () => [log(900_100)] });
+
+    assert.deepEqual(writer.advances, [], "never advance over completions that did not land");
+    assert.deepEqual(writer.claims, [], "and never claim coverage of them either");
+    assert.equal(out.failed, 1);
+    assert.match(out.sources[0].error, /writeCompletions boom/);
+  });
+
+  test("a failed completion_from claim leaves the watermark UNTOUCHED", async () => {
+    const writer = fakeWriter({ state: state(), fail: "claimCompletionFrom" });
+
+    const out = await run({ writer, getLogs: async () => [log(900_100)] });
+
+    assert.deepEqual(writer.advances, []);
+    assert.equal(out.failed, 1);
+  });
+
+  // The reverse direction: if the range could not be READ, nothing downstream may claim it.
+  test("a getLogs failure claims no completion coverage", async () => {
+    const writer = fakeWriter({ state: state() });
+
+    await run({
+      writer,
+      getLogs: async () => {
+        throw new Error("rpc down");
+      },
+    });
+
+    assert.deepEqual(writer.completions, []);
+    assert.deepEqual(writer.claims, []);
+    assert.deepEqual(writer.advances, []);
+  });
+
+  // The idle path reads no blocks, so it has no new coverage to claim — it only refreshes
+  // updated_at. Claiming there would assert coverage of a range that was never fetched.
+  test("the idle path claims nothing", async () => {
+    const writer = fakeWriter({ state: new Map([[PM, { lastBlock: 999_990, updatedAt: "", completionFrom: null }]]) });
+
+    const out = await run({ writer, head: 1_000_000 });
+
+    assert.equal(out.sources[0].idle, true);
+    assert.deepEqual(writer.claims, [], "no blocks read means no coverage to claim");
+    assert.equal(writer.advances.length, 1, "but the timestamp is still refreshed");
   });
 });
 
