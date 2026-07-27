@@ -8,6 +8,8 @@
 // the platform will call, so it answers 200 INDETERMINATE rather than pretending to know.
 
 import {
+  dailyActiveTier1,
+  dailyActiveTier2,
   firstPredictionSources,
   firstPredictionTier1,
   firstPredictionTier2,
@@ -104,24 +106,29 @@ export const QUESTS = {
     tier2: null,
   },
 
-  // NOT SHIPPABLE AS A LIVE SCAN, and deliberately registered anyway.
+  // ANSWERED BY AN INDEX, NOT A SCAN — the only quest here where absence is an answer.
   //
-  // "Active in the last 24h" spans ~345,600 blocks. At the measured ~0.3ms/block that is
-  // ~104 seconds of eth_getLogs — over triple the function's 30s ceiling — and unlike the
-  // one-time quests it has no Tier 1 shortcut, because there is no current-state read that
-  // means "did something today".
+  // "Active in the last 24h" spans ~345,600 blocks: ~104 seconds of eth_getLogs against a
+  // 30s ceiling, with no current-state read that means "did something today". So it cannot
+  // be a live scan, and for a long time it answered INDETERMINATE every time rather than
+  // shipping a check that structurally could not complete.
   //
-  // So it answers INDETERMINATE every time, honestly, rather than shipping a check that
-  // structurally cannot complete and would hand out a stream of wrong falses. It needs the
-  // forward indexer (phase 2): rows written as events arrive turn this into an O(1) "is
-  // there a row for this wallet today" lookup instead of a backward walk.
+  // The quest-indexer service writes quest_daily as events arrive, which turns the question
+  // into an O(1) row lookup. That is a genuinely different risk profile from every other
+  // quest in this registry, and the tiers below are shaped around it:
+  //
+  //   tier1  PROVE the index is current (six fail-closed conditions), then look for a row.
+  //          A row is proof. No row is a hint — never, on its own, an answer.
+  //   tier2  walk [watermark+1, head], the blocks the index has not reached yet, so that a
+  //          `false` is honest as of now rather than as of the watermark.
+  //
+  // If the indexer dies, tier1 goes unreliable and this answers indeterminate/indexer_stale
+  // forever. That is the designed failure: a stale index costs availability, never truth.
   daily_active: {
     id: "daily_active",
     kind: QUEST_KIND.DAILY,
-    available: false,
-    unavailableReason: "needs_indexer",
-    tier1: null,
-    tier2: null,
+    tier1: dailyActiveTier1,
+    tier2: dailyActiveTier2,
   },
 };
 

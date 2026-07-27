@@ -398,25 +398,38 @@ describe("tier 1 → tier 2 escalation", () => {
   });
 });
 
+// daily_active used to live here as the one registered-but-unavailable quest. It is now
+// answered by the participation index (see dailyActive.test.js for its behaviour, which
+// needs injected storage to stay offline). The `available: false` PATH still exists for any
+// future quest that needs it, and the property these tests protect — a quest we cannot
+// answer says so, and that answer never hardens — has to stay covered.
 describe("unavailable quests", () => {
-  // daily_active cannot be a live scan: ~345,600 blocks ≈ 104s of getLogs against a 30s
-  // limit, with no Tier 1 shortcut. It answers honestly rather than fabricating falses.
-  test("daily_active answers 200 INDETERMINATE, not a false and not a 400", async () => {
-    const res = await call({ body: { address: ADDRESS, quest: "daily_active" } });
+  test("a registered-but-unavailable quest answers 200 INDETERMINATE, not a false and not a 400", async () => {
+    const quest = registerQuest("t_unavail", { available: false, unavailableReason: "needs_something" });
+
+    const res = await call({ body: { address: ADDRESS, quest } });
 
     assert.equal(res.statusCode, 200);
     assert.equal(res.body.completed, false);
     assert.equal(res.body.status, STATUS.INDETERMINATE);
     assert.equal(res.body.source, null);
-    assert.equal(res.body.reason, "needs_indexer");
+    assert.equal(res.body.reason, "needs_something");
   });
 
   test("an unavailable quest is never cached, so it cannot harden into a false", async () => {
-    await call({ body: { address: ADDRESS, quest: "daily_active" } });
-    const second = await call({ body: { address: ADDRESS, quest: "daily_active" } });
+    const quest = registerQuest("t_unavail2", { available: false, unavailableReason: "needs_something" });
+
+    await call({ body: { address: ADDRESS, quest } });
+    const second = await call({ body: { address: ADDRESS, quest } });
 
     assert.equal(second.body.source, null, "must not be served from cache");
     assert.equal(second.body.status, STATUS.INDETERMINATE);
+  });
+
+  // daily_active is a real registry entry again, so this only checks it is ROUTABLE — a
+  // valid id rather than a 400. What it answers is dailyActive.test.js's business.
+  test("daily_active is a valid quest id", () => {
+    assert.equal(normalizeQuestBody({ address: ADDRESS, quest: "daily_active" }).ok, true);
   });
 });
 

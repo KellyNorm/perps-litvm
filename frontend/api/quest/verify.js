@@ -30,11 +30,11 @@
 import { createLimiter, memoryDriver } from "../_lib/rateLimit.js";
 import { cacheKey, createCache, memoryCacheDriver, nullCacheDriver, utcDay } from "../_lib/quest/cache.js";
 import { createCursorStore, memoryCursorDriver, nullCursorDriver } from "../_lib/quest/cursor.js";
+import { createIndexerState, nullIndexerStateDriver } from "../_lib/quest/indexerState.js";
+import { supabaseIndexerStateDriver } from "../_lib/quest/supabaseIndexerState.js";
 import { supabaseCacheDriver } from "../_lib/quest/supabaseCache.js";
 import { supabaseCursorDriver } from "../_lib/quest/supabaseCursor.js";
 import { supabaseIndexProofDriver } from "../_lib/quest/supabaseIndexProof.js";
-import { supabaseIndexerStateDriver } from "../_lib/quest/supabaseIndexerState.js";
-import { createIndexerState } from "../_lib/quest/indexerState.js";
 import { PROOF, createIndexProof } from "../_lib/quest/indexProof.js";
 import { ConfigError, chainId } from "../_lib/quest/chain.js";
 import { QUEST_IDS, QUEST_KIND, SOURCE, STATUS, getQuest } from "../_lib/quest/quests.js";
@@ -148,6 +148,23 @@ function selectCursorDriver(mode) {
   return memoryCursorDriver();
 }
 
+// The participation index behind daily_active. Unlike the cache and the cursor, this one
+// has NO in-memory mode and no default driver: the index is written by a separate Railway
+// service into Supabase, so "not configured" genuinely means "there is no index" — which
+// must read as stale, not as an empty index. nullIndexerStateDriver() throws, and the
+// freshness policy turns that into stale via its read-failure condition.
+//
+// It is deliberately NOT gated on QUEST_CACHE/QUEST_CURSOR: those select where verdicts and
+// coverage live, which is an unrelated question. daily_active needs the index or it needs
+// to say so.
+let indexerState;
+function getIndexerState() {
+  if (!indexerState) {
+    indexerState = createIndexerState(supabaseIndexerStateDriver() ?? nullIndexerStateDriver());
+  }
+  return indexerState;
+}
+
 // The INDEX PROOF — the zero-chunk answer for a quest whose sources have been swept to the
 // floor. Third store, third variable, same pattern, and it is OFF unless it is explicitly
 // pointed at Supabase, because there is nothing else it could read: the proof is a join
@@ -188,13 +205,15 @@ function buildIndexProof(mode) {
 }
 
 /**
- * Test seam: drop all three cached stores so the next request rebuilds them from current
- * env. All three, not just the cache — they are configured by different vars and a test
- * that changes one would otherwise keep a store built from the previous environment.
+ * Test seam: drop all four cached stores so the next request rebuilds them from current
+ * env. All four, not just the cache — they are configured by different vars (and the
+ * participation index by none at all) and a test that changes one would otherwise keep a
+ * store built from the previous environment.
  */
 export function _resetCache() {
   cache = null;
   cursors = null;
+  indexerState = null;
   indexProof = undefined;
 }
 
@@ -343,7 +362,7 @@ export async function verifyQuest(definition, address) {
     return composeQuest(definition, address);
   }
 
-  const tier1 = await definition.tier1(address);
+  const tier1 = await definition.tier1(address, { indexerState: getIndexerState() });
 
   // A positive is proof and stops here — no scan needed.
   if (tier1.completed) {
@@ -363,7 +382,12 @@ export async function verifyQuest(definition, address) {
       status: STATUS.INDETERMINATE,
       source: SOURCE.TIER1,
       checkedThroughBlock: tier1.checkedThroughBlock,
-      reason: "tier1_unreliable",
+      // The tier names WHY when it can. daily_active's index read distinguishes
+      // `indexer_stale` (the index cannot be trusted) from `day_boundary` (the two notions
+      // of "today" may disagree right now) — different problems with different fixes, and
+      // both very different from a dropped chain read. Existing tiers set no `reason`, so
+      // they keep the generic code.
+      reason: tier1.reason ?? "tier1_unreliable",
     };
   }
 
@@ -400,6 +424,11 @@ export async function verifyQuest(definition, address) {
     chainId: chainId(),
     quest: definition.id,
     cursors: getCursors(),
+    // daily_active's tail scan needs to know where the index stopped, which only its own
+    // Tier 1 knows. Passing the whole result rather than plucking one field keeps this
+    // generic — the event-scanning tiers destructure only what they use and ignore it.
+    tier1,
+    indexerState: getIndexerState(),
   });
 
   if (scan.found) {
