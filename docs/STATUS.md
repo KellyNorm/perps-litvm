@@ -255,10 +255,74 @@ Listed in §4.
 | # | Item | Blocked on |
 |---|---|---|
 | 1 | **`provide_liquidity` on the zero-chunk path** | The LiquidityPool sweep reaching its floor. This is the **whole remaining scope of the quest work** — the other two one-time quests are already on it (§3). Check with `select source_key, covered_to - floor_block as remaining from quest_backfill where chain_id = 4441;`; `remaining = 0` on `0x4716a0c9…` is the green light. The change is one line in `frontend/api/_lib/quest/quests.js` — `indexSources: provideLiquiditySources` — the function is already exported from `checks.js` and `settlerParity.test.js` already covers it. Safe to add early in the sense that it cannot lie (an unfinished sweep fails `not_at_floor` and falls back to the scan), but it costs three Supabase reads per request to be told so. |
-| 2 | **Partner quest integration** | Not started, and **nothing is captured in this repo** — no partner name, endpoint contract, auth scheme, or quest-id mapping is written down anywhere. The API is built to be called by a partner platform; the integration itself is an undocumented conversation. **Capture the spec before building.** |
+| 2 | **Partner quest integration** | **Us** — the blocker they reported is fixed and unannounced. They integrated `first_trade`, hit a latency wall, and the participation index solved it; they have not re-tested. One message is owed. Full state in **§4.1** — read it before contacting them. |
 | 3 | **Tachy v2 / v3** | Not started, and likewise **no spec exists in the repo.** The only in-code trace is a forward-looking `V2 PATH` comment in `frontend/src/components/tachy/TachyAvatar.jsx`. The v1 system prompt says trading-by-chat is "coming soon", which implies v2 ≈ transactional Tachy — but that is an inference, not a spec. Write it down somewhere tracked before starting. |
 | 4 | **PositionManager EIP-170 headroom** | **BLOCKING for the next change to that contract.** 23,919 / 24,576 bytes — 657 bytes (~2.7%) of headroom, and `optimizer_runs = 1` is already spent, so the cheap lever is gone. The fix is `refactor/eip170-library-extraction` (move logic into `library` contracts, which `DELEGATECALL` and don't count toward runtime size); branch exists, **PARKED**. The failure shows up at *deploy* time, after the work is written. **Treat "am I adding to PositionManager?" as the trigger — run `forge build --sizes` before writing the feature.** It is money-path code, so per `CLAUDE.md` rule 3 it needs a written plan and an explicit go-ahead before any implementation. |
 | 5 | **Tachy Groq free-tier quota** | **A paid tier is a pre-promotion requirement, not an optimisation.** Free tier `llama-3.3-70b-versatile`: RPM 30 / **TPD 100,000**. A call costs ~1,430 prompt + 60–250 completion tokens, so TPM (12,000) binds first at ~7–8 req/min — `TACHY_RPM` defaults to 7. The hard ceiling is **~65 exchanges per day, key-global**, exhausted by one engaged user in a sitting. No per-IP limiter can enforce a key-global cap. Do not promote Tachy until this is paid. (Gemini is worse: 5 req/min global. Switching provider is one env var, `TACHY_PROVIDER`.) |
+
+### 4.1 The partner integration — exact state as of 2026-07-28
+
+The one pending item that is about a **relationship** rather than code, which is why it is
+written out rather than left as a table cell. Everything in this subsection came from the
+operator; nothing is inferred unless marked.
+
+**What they integrated.** `first_trade` only — "has this wallet opened a position". That is
+all they need right now. They have not asked for anything else.
+
+**How they call it.** A **synchronous, user-facing "Verify" button** with a **10-second client
+timeout**, needing **p95 under ~2s**. That constraint is the whole story of this integration:
+the endpoint's answer is correct at any latency, but theirs is a button a human is watching.
+
+**What they tested against.** 10 provably-real traders pulled from the LiteForge explorer —
+wallets that had demonstrably opened positions. A good test set, and an unforgiving one: every
+one of them is a *positive*, so any wallet returning `indeterminate` was visibly a failure.
+
+**What went wrong, and what fixed it.** Before the participation index, a `first_trade` answer
+for a wallet with no open position meant a per-wallet backward log scan — ~10s of `eth_getLogs`
+per poll and ~200 polls to converge, so their button either timed out or got an honest
+`indeterminate`. The backfill + zero-chunk read path (§3) turned that into an indexed lookup:
+**measured 0.7–1.4s**, first call. The problem they reported is solved.
+
+**They do not know that yet.** They have not re-tested since the fix.
+
+#### The message we owe them
+
+1. `first_trade` is fixed — sub-second to ~1.4s, no longer scan-bound. Re-run the 10-wallet test.
+2. Expect `source` to be `"cache"` or `"index"`. Both are correct and both are fast; `cache` is
+   a durable stored completion, `index` is a proof recomputed from coverage on that request.
+   They should treat them identically and **not** branch on `source` — it is a debugging field.
+3. Offer **`first_prediction`**, which is on the same fast path as of 2026-07-27. (*Inference,
+   not from the operator:* `both_products` is also available and costs nothing extra once both
+   parts are known, since it composes through the same cache-first path.)
+4. **Ask whether they re-poll on `indeterminate`.** This is the question that matters most and
+   it has never been answered. Our side is built so a negative is never fabricated — an
+   unprovable answer returns `indeterminate` rather than `false`. But if their client renders
+   `indeterminate` as "not completed" and never retries, that guarantee dies at their boundary
+   and a real trader gets denied a reward. **Ask explicitly; do not assume they retry.**
+
+#### The residual risk to state honestly when we contact them
+
+*Marked as inference — the operator did not raise this.* The fast path is not a guarantee of
+speed, only of correctness. If the index proof declines for any of its seven conditions — most
+plausibly `indexer_stale` if the Railway indexer is down or lagging — `first_trade` falls back
+to the Tier 2 scan, which budgets ~10s and can reach ~16–25s worst case against the function's
+30s ceiling. **That exceeds their 10s client timeout.** So the honest promise is "fast in the
+normal case, and never wrong", not "always under 2s". Either they tolerate an occasional
+timeout, or they retry, or we tell them to treat a timeout the same as `indeterminate` — which
+is the same question as item 4 above, and another reason to ask it.
+
+#### What we do NOT have — do not invent these
+
+- **No platform name.** Nothing in this repo or any commit identifies the partner.
+- **No contact.** No email, handle, or channel is recorded anywhere on our side.
+- **No written integration contract.** No agreed endpoint spec, auth scheme, quest-id mapping,
+  rate-limit allowance, or SLA. The API is built to be called by a partner platform; the terms
+  of that call have never been written down by us.
+
+The rate limiter is worth knowing before any conversation about volume: `QUEST_RPM` defaults to
+**10/min** and `QUEST_RPH` to **100/hour**, per-IP and per-instance
+(`frontend/api/quest/verify.js`). A partner batch-verifying from one server address would hit
+that. It has never been discussed with them.
 
 Also worth fixing, lower priority: get `prediction-keeper/` and `src/prediction/*.sol` under
 version control on `main` (§2); and surface the `indexer_stale` `detail` in the response
